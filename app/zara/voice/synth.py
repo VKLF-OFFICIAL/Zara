@@ -28,12 +28,22 @@ class EspeakSynth:
         return out
 
 
+def _patch_aiohttp_resolver():
+    try:
+        import aiohttp.resolver
+        import aiohttp.connector
+        aiohttp.connector.DefaultResolver = aiohttp.resolver.ThreadedResolver
+        aiohttp.AsyncResolver = aiohttp.resolver.ThreadedResolver
+    except Exception:
+        pass
+
+
 class EdgeSynth:
-    """Voz femenina natural en español vía Microsoft Edge TTS (requiere red)."""
+    """Voz femenina suave, dulce y natural vía Microsoft Edge TTS (requiere red)."""
 
     name = "edge"
 
-    def __init__(self, voice: str = "es-ES-ElviraNeural",
+    def __init__(self, voice: str = "es-MX-DaliaNeural",
                  rate: str = "+0%", pitch: str = "+0Hz"):
         self.voice = voice
         self.rate = rate
@@ -47,6 +57,7 @@ class EdgeSynth:
             return False
 
     def synthesize(self, text: str, out_path: Path) -> Path:
+        _patch_aiohttp_resolver()
         import edge_tts
         out = Path(out_path).with_suffix(".mp3")
 

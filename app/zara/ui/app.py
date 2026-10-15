@@ -48,7 +48,14 @@ class MicWorker(QtCore.QThread):
             return
         if result.get("ack"):
             self._sig.state.emit(State.SPEAKING.value)
-            self._b.speak("¿Sí, Señor VK?")
+            import random
+            ack_msg = random.choice([
+                "A su servicio, Señor VK.",
+                "¿Dígame, Señor VK?",
+                "A la escucha, Señor VK.",
+                "¿En qué puedo ayudarle, Señor VK?",
+            ])
+            self._b.speak(ack_msg)
             self._b.open_listen_window()
             return
         self._sig.user.emit(result["order"])

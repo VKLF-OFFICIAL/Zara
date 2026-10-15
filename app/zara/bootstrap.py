@@ -10,7 +10,7 @@ from .voice.synth import EdgeSynth, EspeakSynth, PiperSynth
 from .core import ZaraCore
 
 _CONFIG_DEFAULTS = {
-    "voz": "es-ES-ElviraNeural",
+    "voz": "es-MX-DaliaNeural",
     "cerebro_por_defecto": "",      # "" = primer disponible (Claude)
     "modelo_claude": "",            # "" = el de tu suscripción por defecto
     "cerebro_claude_modo": "agente",   # "agente" = control total | "consulta" = solo web+lectura

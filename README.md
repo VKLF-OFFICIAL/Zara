@@ -1,96 +1,120 @@
-# Zara — Asistente personal del Señor VK
+# ZARA v2.0 — Asistente Táctico de IA Estilo J.A.R.V.I.S.
+### Protocolo J.A.R.V.I.S. | Asistente de Alta Autonomía para el **Señor VK**
 
-Asistente por voz + esfera flotante, cerebros de IA intercambiables, memoria y un
-Guardián de seguridad. Todo vive en `/mnt/almacen/ZARA/` (enlace `~/Zara`).
+---
 
-## Cómo usarla
+## 1. Visión General de la Arquitectura
+**ZARA v2.0** es un asistente táctico autónomo diseñado con latencia ultrabaja, streaming por frases, tolerancia fonética al acento del sur de España (Granada/Andalucía) y ejecución silenciosa tipo *YOLO Seguro* sin confirmaciones constantes innecesarias.
 
-| Comando | Qué hace |
-|---|---|
-| `zara-enroll` | **Hágalo primero.** Inscribe su voz (lee 4 frases) para que solo le obedezca a usted. |
-| `zara` | Lanza Zara: esfera flotante (arriba a la derecha, arrastrable) + voz. Diga «Zara, …». |
-| `zara-chat` | Modo texto en la terminal (sin micrófono). |
+```
+                   ┌──────────────────────────────────┐
+                   │    Micrófono continuo 16kHz      │
+                   └─────────────────┬────────────────┘
+                                     │
+                             [Silero VAD v5]
+                     (700ms silencio, 350ms pad)
+                                     │
+                                     ▼
+                        [faster-whisper GPU/CPU]
+                    (initial_prompt fonético andaluz)
+                                     │
+                                     ▼
+                             [ZaraRouter <10ms]
+                     ┌───────────────┼───────────────┐
+                     ▼               ▼               ▼
+                 [Claude]         [Gemini]       [Ollama]
+                 (Código/Sec)     (Visión/Web)   (Offline)
+                     │
+                     ▼
+             [ReAct Loop Silencioso (hasta 8 pasos)]
+           run_shell | file_manager | os_control | inspect_screen
+                     │
+                     ▼ (Tokens en Streaming)
+           [Sentence Chunker (delimitador >= 35 chars)]
+                     │
+                     ▼
+         [Motor TTS In-Memory (Edge-TTS / Kokoro)]
+             (PCM en RAM decodificado con miniaudio)
+                     │
+                     ▼ (Barge-in: si habla el usuario >250ms, aborta)
+             [Salida de Audio + HUD Holográfico PySide6]
+```
 
-Zara arranca sola con la sesión (autostart de KDE ya instalado).
+---
 
-## Comandos de voz / texto
-Puede decir «Zara, …» de seguido, o «Zara» → (¿Sí, Señor VK?) → la orden.
-También responde a **«Hey Jarvis, …»** (detector neural, más fiable con música sonando).
-- **Conversar:** «Zara, ¿…?» — responde el cerebro activo (Claude puede consultar la web).
-- **Mirar la pantalla:** «mira la pantalla», «¿qué ves en la pantalla?», «lee la pantalla y dime qué error sale». Captura, la interpreta Claude y **borra la captura** al terminar.
-- **Tareas largas:** cuando una petición es una tarea («créame un script», «instala…»), Zara se pone con ella **en segundo plano**, sigue escuchando y **le avisa al terminar**.
-- **Cambiar cerebro:** «Zara, usa qwen» / «usa claude» / «usa zara».
-- **Recordar:** «Zara, recuerda que …».
-- **Abrir apps / webs:** «abre firefox», «abre el navegador», «abre la terminal», «abre vklf.es».
-- **Volumen:** «sube / baja el volumen», «pon el volumen al 40», «silencia», «quita el silencio».
-- **Música:** «reproduce música en Spotify», «pausa la música», «reanuda», «siguiente canción», «canción anterior».
-- **Cerrar apps:** «cierra spotify», «cierra el navegador» (siempre pide confirmación en el chat).
-- **Carpetas:** «abre la carpeta descargas / documentos / imágenes / música / vídeos / escritorio».
-- **Buscar:** «busca recetas de paella», «busca en YouTube música lofi».
-- **Hora y fecha:** «¿qué hora es?», «¿qué día es hoy?».
-- **Chat:** «abre el chat». **Callar:** botón ■ del chat o «Detener voz» en la bandeja.
-- **Ejecutar comando:** «Zara, ejecuta …» — el Guardián decide si pide confirmación.
+## 2. Subsistemas Principales
 
-## Interfaz
-- El orbe está siempre encima de todas las ventanas. Arrástrelo para moverlo; un clic abre el chat.
-- El chat se abre pegado al orbe y le sigue al moverlo (script de KWin `zara-panel`).
-- Si lanza `zara` estando ya abierta, solo se despliega el chat (instancia única).
-- Registro de funcionamiento: `registros/zara.log`.
+### Oído Neuronal y Captura (`core/ear.py`)
+- **Captura continua:** `sounddevice.InputStream` a 16.000 Hz, mono, float32 con cola thread-safe.
+- **VAD Neuronal:** **Silero VAD v5** con `min_silence_duration_ms=700` y `speech_pad_ms=350` para evitar cortes en pausas naturales.
+- **Detección de Interrupción (Barge-in):** Si el Señor VK habla durante $>250\text{ ms}$ mientras Zara responde, se detiene la reproducción instantáneamente y pasa a escucha.
+- **Transcripción sin sesgo de acento:** `faster-whisper` con `beam_size=5`, filtrado VAD e inyección de contexto fonético y jerga de hacking/sistemas (`initial_prompt`).
 
-## Configuración
-`config/zara.toml` — voz, modelo STT, umbral de reconocimiento, cerebro por defecto,
-micrófono, etc. `config/persona.md` — cómo habla Zara. `config/guardian.toml` — reglas
-de seguridad.
+### Voz Dulce y Fluida (`core/voice.py`)
+- **Streaming por frases (`SentenceChunker`):** Los tokens generados se agrupan hasta encontrar puntuación (`.`, `,`, `:`, `?`, `!`, `\n`) con al menos 35 caracteres y se envían de inmediato a la síntesis sin esperar la respuesta completa.
+- **Motor en memoria (Edge-TTS + miniaudio):** Síntesis con voz `es-ES-XimenaNeural` (`pitch=+2Hz`, `rate=+6%`) decodificada directamente en RAM en PCM float32, sin escribir archivos MP3 temporales en disco. Fallback a **Kokoro-82M ONNX** local.
 
-## Skills (capacidades a medida)
-Puede añadir capacidades **sin tocar el código**: cree un `.toml` en
-`config/skills/`. Tipos: `decir` (frase fija), `shell` (comando, pasa por el
-Guardián) y `prompt` (plantilla al cerebro). Ejemplo ya incluido: «¿cuál es mi
-IP pública?». Vea `config/skills/LEEME.md`.
+### Cerebro Híbrido y ReAct Autónomo (`core/brain.py` y `core/tools.py`)
+- **ZaraRouter (< 10 ms):** Conmutación ultrarrápida entre Claude 3.7 / Claude Code, Gemini 2.5 Flash y Ollama (`qwen2.5-coder:7b`). Fallback automático ante caídas de red.
+- **Filosofía YOLO Seguro:** Cero interrupciones para comandos diagnósticos, lectura/edición de ficheros, inspección de red o gestión de procesos.
+- **Guardarraíl Estricto:** Bloqueo exclusivo de operaciones catastróficas irreversibles (`rm -rf /`, `mkfs`, `Format-Volume`, `dd if=`).
 
-## MCP (herramientas extra para el agente)
-Copie `config/mcp.json.ejemplo` a `config/mcp.json` y declare sus servidores MCP.
-Zara se los pasa al cerebro **agente** (y solo esos), que gana así esas
-herramientas. Si el archivo no existe, no se usa MCP.
+### Interfaz Holográfica (`ui/hud.py`)
+- HUD transparente frameless en **PySide6** con reactividad a 60 FPS:
+  - `IDLE`: Cian tenue pulsante.
+  - `LISTENING`: Verde esmeralda reactivo al nivel RMS del micrófono.
+  - `THINKING / TOOL`: Ámbar/Violeta con visualización en vivo de comandos.
+  - `SPEAKING`: Onda sonora azul zafiro.
 
-## Activación por voz
-- **«Zara»** (reconocimiento fonético) y **«Hey Jarvis»** (modelo neural robusto a
-  ruido/música). Se elige en `config/zara.toml` → `motor_wake = "texto" | "neural"
-  | "ambos"` (por defecto `ambos`), `umbral_wake_neural` (0–1).
+---
 
-## Control del equipo con cualquier IA (manos)
-Zara puede **actuar en el sistema con el cerebro que tenga activo** —Claude, Gemini
-o un modelo local por Ollama—, no solo con el agente Claude. Cuando el cerebro
-necesita ejecutar algo, lo pide y Zara lo ejecuta **pasándolo por el Guardián**
-(que puede pedir confirmación o bloquearlo) y le devuelve el resultado. Así la
-seguridad no depende del modelo (un local sin censura también queda bajo el
-Guardián). Con Claude activo, las tareas grandes siguen yendo al agente Claude
-(control nativo). Se desactiva con `manos = false` en `config/zara.toml`.
+## 3. Despliegue y Uso
 
-## Sonido
-Zara habla por **la salida de audio activa del sistema en cada momento**
-(`salida_audio = ""`). Si cambia el altavoz/cascos por defecto, ella le sigue sin
-reiniciar. Puede fijar una salida concreta poniendo su nombre en `salida_audio`.
+### En Windows 10/11
+```powershell
+# 1. Diagnóstico completo de subsistemas (Audio, VAD, Shell, HUD)
+.\setup_and_run.ps1 -Check
 
-## Seguridad (Guardián)
-Clasifica toda acción en SAFE / CONFIRM / CRITICAL / BLOCKED. Lo crítico exige copia de
-seguridad + doble confirmación; lo prohibido no se hace nunca. Independiente del cerebro.
+# 2. Iniciar ZARA v2.0 completa con HUD holográfico
+.\setup_and_run.ps1
+# O simplemente haciendo doble clic en zara.cmd
 
-## Capacidades del cerebro Claude (modo agente)
-Por defecto Claude actúa como **agente con control del equipo**: lee y escribe archivos,
-ejecuta comandos, programa, automatiza e investiga, con las mismas herramientas que Claude Code.
-Trabaja en `claude_directorio` (por defecto su carpeta personal). Para solo conversar y
-consultar, ponga `cerebro_claude_modo = "consulta"` en `config/zara.toml`.
-Aviso: en modo agente el Guardián de Zara no inspecciona lo que hace Claude por dentro;
-es su propio Claude Code con permisos completos. Las órdenes directas de Zara
-(«ejecuta…», «cierra…») sí pasan por el Guardián.
+# 3. Modo consola / terminal (sin HUD gráfico)
+.\setup_and_run.ps1 -Cli
+# O ejecutando zara-chat.cmd
+```
 
-## Velocidad y agente
-Para que responda rápido, la charla usa **Claude haiku** (~2,5 s). Cuando la petición es una
-**tarea** («créame un script», «instala…», «arregla…», «modo agente»), Zara pasa sola al cerebro
-**«agente»** (control total del equipo), avisa de que se pone con ello y puede tardar. Puede forzar
-con «usa agente» / «usa claude».
+### En Linux (Kali Linux / Fedora / Debian)
+```bash
+# 1. Conceder permisos de ejecución al lanzador
+chmod +x setup_and_run.sh
 
-## Cerebros
-Claude (suscripción), Gemini (requiere instalar su CLI y login), y locales por Ollama
-(qwen3.8-27b-obliterated, zara, llama3.2, etc.). El activo se cambia por voz o en el panel.
+# 2. Diagnóstico de subsistemas
+./setup_and_run.sh --check
+
+# 3. Iniciar ZARA v2.0
+./setup_and_run.sh
+
+# 4. Modo CLI
+./setup_and_run.sh --cli
+```
+
+---
+
+## 4. Configuración (`.env`)
+Edite el archivo `.env` para personalizar API Keys o motores:
+```env
+# Claves de IA (Opcionales, fallback automático a Ollama local)
+GEMINI_API_KEY=""
+ANTHROPIC_API_KEY=""
+
+# Configuración de Ollama Local
+OLLAMA_HOST="http://localhost:11434"
+OLLAMA_MODEL="qwen2.5-coder:7b"
+
+# Voz y Síntesis
+ZARA_TTS_ENGINE="edge"
+ZARA_EDGE_VOICE="es-ES-XimenaNeural"
+ZARA_EDGE_RATE="+6%"
+ZARA_EDGE_PITCH="+2Hz"
+```

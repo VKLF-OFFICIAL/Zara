@@ -1,7 +1,14 @@
-from __future__ import annotations
+import os
 import shutil
 import subprocess
+import sys
+from pathlib import Path
 from ..errors import BrainError
+
+if sys.platform == "win32":
+    _DEFAULT_SANDBOX = str(Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "zara" / "espacio")
+else:
+    _DEFAULT_SANDBOX = "/mnt/almacen/ZARA/espacio"
 
 
 class _CliBrain:
@@ -44,7 +51,7 @@ class ClaudeBrain(_CliBrain):
     name = "claude"
 
     # Carpeta aislada del modo consulta (solo lectura ahí).
-    SANDBOX = "/mnt/almacen/ZARA/espacio/claude-sandbox"
+    SANDBOX = str(Path(_DEFAULT_SANDBOX) / "claude-sandbox")
     # Modo consulta: web + lectura, sin tocar nada.
     _CONSULTA_TOOLS = "WebFetch,WebSearch,Read"
 
@@ -97,7 +104,7 @@ class GeminiBrain(_CliBrain):
 
     # Carpeta aislada: Gemini CLI es agéntico; lo encerramos para que no toque
     # archivos del sistema. La seguridad real la impone el Guardián aparte.
-    _SANDBOX = "/mnt/almacen/ZARA/espacio/gemini-sandbox"
+    _SANDBOX = str(Path(_DEFAULT_SANDBOX) / "gemini-sandbox")
 
     def __init__(self, system: str = "", timeout: int = 300, cwd: str | None = None):
         super().__init__(system=system, timeout=timeout, cwd=cwd or self._SANDBOX)

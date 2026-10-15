@@ -146,3 +146,21 @@ def test_screen_look_not_triggered_without_screen_word():
     for t in ["mira esto", "lee el documento", "describe la foto"]:
         it = parse_intent(t)
         assert it is None or it.kind != "screen_look", t
+
+
+@pytest.mark.parametrize("text,kind", [
+    ("¿puedes subir el volumen?", "volume_up"),
+    ("¿podrías bajar el volumen?", "volume_down"),
+    ("por favor pon algo de música", "media_play"),
+    ("¿puedes pausar la música?", "media_pause"),
+    ("¿me puedes decir qué hora es?", "time"),
+    ("toma un pantallazo", "screenshot"),
+    ("toma una captura de pantalla", "screenshot"),
+    ("desactiva el sonido", "mute"),
+    ("activa el sonido", "unmute"),
+    ("quiero escuchar música", "media_play"),
+])
+def test_polite_and_conversational_phrases(text, kind):
+    it = parse_intent(text)
+    assert it is not None and it.kind == kind, (text, it)
+

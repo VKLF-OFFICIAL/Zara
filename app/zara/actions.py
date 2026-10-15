@@ -190,6 +190,8 @@ def media(kind: str) -> str:
 _ALIASES = {
     "navegador": ["xdg-open", "https://www.google.com"],
     "internet": ["xdg-open", "https://www.google.com"],
+    "youtube": ["xdg-open", "https://www.youtube.com"],
+    "google": ["xdg-open", "https://www.google.com"],
     "terminal": ["konsole"], "consola": ["konsole"],
     "archivos": ["dolphin"], "explorador de archivos": ["dolphin"],
     "carpeta personal": ["dolphin"], "gestor de archivos": ["dolphin"],
@@ -201,6 +203,8 @@ _ALIASES = {
 _WIN_ALIASES = {
     "navegador": ["cmd.exe", "/c", "start", "https://www.google.com"],
     "internet": ["cmd.exe", "/c", "start", "https://www.google.com"],
+    "youtube": ["cmd.exe", "/c", "start", "https://www.youtube.com"],
+    "google": ["cmd.exe", "/c", "start", "https://www.google.com"],
     "terminal": ["wt.exe"], "consola": ["powershell.exe"],
     "archivos": ["explorer.exe"], "explorador de archivos": ["explorer.exe"],
     "carpeta personal": ["explorer.exe"], "gestor de archivos": ["explorer.exe"],

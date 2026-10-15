@@ -19,28 +19,38 @@ def _norm(text: str) -> str:
 
 
 _STOP = {"para", "para ya", "calla", "callate", "silencio", "basta", "deten la voz",
-         "deja de hablar", "stop"}
+         "deja de hablar", "stop", "shh", "shhh"}
+
+_POLITE_LEAD = re.compile(
+    r"^(?:por favor\s+)?"
+    r"(?:(?:me\s+)?(?:puedes|podrias|podrías|quisiera|quiero|te importaria|te importaría)\s+"
+    r"(?:hacer\s+el\s+favor\s+de\s+|decirme\s+|decir\s+|ayudarme\s+a\s+|ponerme\s+|abrirme\s+)?|"
+    r"hacer\s+el\s+favor\s+de\s+)?"
+    r"(?:por favor\s+)?",
+    re.IGNORECASE,
+)
+_POLITE_TAIL = re.compile(r"\s+(?:por favor|muchas gracias|gracias)$", re.IGNORECASE)
 
 _RULES: list[tuple[str, str]] = [
-    ("show_panel", r"^(abre|muestra|ensena|despliega) (el |la )?(panel|chat|conversacion)$"),
-    ("volume_up", r"^(sube|aumenta) (el |un poco el )?(volumen|sonido)|^mas volumen"),
-    ("volume_down", r"^(baja|reduce|disminuye) (el |un poco el )?(volumen|sonido)|^menos volumen"),
+    ("show_panel", r"^(abre|abrir|muestra|mostrar|ensena|ensenar|despliega|desplegar) (el |la )?(panel|chat|conversacion)$"),
+    ("volume_up", r"^(sube|subir|aumenta|aumentar) (el |un poco el )?(volumen|sonido)|^mas volumen"),
+    ("volume_down", r"^(baja|bajar|reduce|reducir|disminuye|disminuir) (el |un poco el )?(volumen|sonido)|^menos volumen"),
     ("set_volume", r"volumen (al|a|en) (\d{1,3})"),
-    ("unmute", r"^(quita|desactiva) el silencio|^activa el sonido|^desmutea"),
-    ("mute", r"^(silencia|mutea)( el sonido| el audio| todo)?$"),
-    ("media_pause", r"^(pausa|para|deten|detén)( la)? (musica|cancion|reproduccion)|^pausa$"),
-    ("media_play", r"^(reanuda|continua|reproduce|pon)( la)? (musica|cancion)|^(reanuda|play)$"),
+    ("unmute", r"^(quita|quitar|desactiva|desactivar) el silencio|^(activa|activar) (el )?(sonido|audio)|^desmutea|^desmutear"),
+    ("mute", r"^(silencia|silenciar|mutea|mutear)( el sonido| el audio| todo)?$|^(desactiva|desactivar|quita|quitar) (el )?(sonido|audio)$"),
+    ("media_pause", r"^(pausa|pausar|para|parar|deten|detener|detén|quita|quitar|apaga|apagar)( la)? (musica|cancion|reproduccion)|^pausa$"),
+    ("media_play", r"^(reanuda|reanudar|continua|continuar|reproduce|reproducir|pon|poner|inicia|iniciar|toca|tocar|escucha|escuchar)( la| algo de| un poco de)? (musica|cancion|tema)|^(reanuda|play)$"),
     ("media_next", r"^(siguiente|proxima) (cancion|tema|pista)|^pasa (de )?(cancion|tema)"),
     ("media_prev", r"(cancion|tema|pista) anterior|^vuelve a la (cancion )?anterior"),
-    ("time", r"^(que hora es|dime la hora|que hora tenemos)"),
-    ("date", r"^(que dia es( hoy)?|que fecha es( hoy)?|dime la fecha)"),
-    ("status", r"^(estado|status)( del sistema| del equipo)?$|"
+    ("time", r"^(que hora es|dime la hora|que hora tenemos|dime que hora tenemos|la hora)"),
+    ("date", r"^(que dia es( hoy)?|que fecha es( hoy)?|dime la fecha|en que dia estamos|que dia tenemos)"),
+    ("status", r"^(estado|status|informe|diagnostico|telemetria)( del sistema| del equipo)?$|"
                r"^como (esta|estas|va|andas|andamos|vas|te encuentras)"
                r"( el equipo| el sistema| todo| por ahi)?$"),
     ("help", r"^(que puedes hacer|que sabes hacer|ayuda|que ordenes hay|"
              r"comandos|en que me puedes ayudar|que mas puedes hacer|que haces)$"),
-    ("lock", r"^bloquea(r)?( el equipo| la pantalla| la sesion| el ordenador)?$"),
-    ("screenshot", r"^(haz(me)?|saca(me)?|toma) (una )?captura( de pantalla)?$|"
+    ("lock", r"^(bloquea|bloquear)( el equipo| la pantalla| la sesion| el ordenador)?$"),
+    ("screenshot", r"^(haz(me)?|hacer(me)?|saca(me)?|sacar(me)?|toma|tomar) (una? )?(captura|pantallazo)( de pantalla)?$|"
                    r"^(captura|pantallazo)( de pantalla)?$"),
 ]
 
@@ -65,7 +75,7 @@ _SCREEN_RE = re.compile(
 
 _MUSIC_APPS = "spotify|vlc|rhythmbox|elisa|audacious|amberol"
 _PLAY_APP_RE = re.compile(
-    r"^(?:le |la )?(?:reproduce|reproduzca|produce|pon|toca)\s+"
+    r"^(?:le |la )?(?:reproduce|reproduzca|reproducir|produce|pon|pone|poner|ponme|con|toca|tocar|escucha|escuchar)\s+"
     r"(?:(?:la |algo de |un poco de )?musica\s+)?(?:en |con )?(" + _MUSIC_APPS + r")$")
 _FOLDER_RE = re.compile(
     r"^(?:abre|muestra|ensena)\s+(?:la |mi |mis |el )?(?:carpeta\s+(?:de\s+)?(?:mis\s+)?)?"
@@ -77,10 +87,7 @@ _OPEN_RE = re.compile(r"^(?:abre|abrir|lanza|inicia|arranca)\s+(?:el\s+|la\s+|lo
 _RUN_RE = re.compile(r"^(?:ejecuta|corre)(?:\s+el\s+comando)?\s+(.+?)\s*$", re.I)
 
 
-def parse_intent(text: str) -> Intent | None:
-    """Reconoce órdenes directas que Zara resuelve sin consultar al cerebro."""
-    raw = (text or "").strip()
-    n = _norm(raw)
+def _match_direct(n: str, raw: str) -> Intent | None:
     if not n:
         return None
     if n in _STOP:
@@ -137,4 +144,30 @@ def parse_intent(text: str) -> Intent | None:
     m = _RUN_RE.match(raw)
     if m:
         return Intent("run", m.group(1).strip())
+    return None
+
+
+def parse_intent(text: str) -> Intent | None:
+    """Reconoce órdenes directas que Zara resuelve sin consultar al cerebro."""
+    raw = (text or "").strip()
+    n = _norm(raw)
+    if not n:
+        return None
+
+    # 1. Probar coincidencia directa
+    it = _match_direct(n, raw)
+    if it is not None:
+        return it
+
+    # 2. Desenvolver cortesías coloquiales («¿me puedes abrir...?», «podrías subir...», etc.)
+    stripped_n = _POLITE_LEAD.sub("", n).strip()
+    stripped_n = _POLITE_TAIL.sub("", stripped_n).strip()
+    if stripped_n and stripped_n != n:
+        stripped_raw = re.sub(r"^[¿¡\s]+", "", raw)
+        stripped_raw = _POLITE_LEAD.sub("", stripped_raw).strip()
+        stripped_raw = _POLITE_TAIL.sub("", stripped_raw).strip()
+        it = _match_direct(stripped_n, stripped_raw)
+        if it is not None:
+            return it
+
     return None

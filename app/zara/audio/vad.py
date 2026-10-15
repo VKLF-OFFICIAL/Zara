@@ -12,11 +12,11 @@ class EnergyVad:
     Conserva un búfer circular de pre-roll para no cortar la consonante inicial.
     """
 
-    def __init__(self, threshold: float = 0.015, min_speech_frames: int = 8,
-                 min_silence_frames: int = 25, max_speech_frames: int = 750,
+    def __init__(self, threshold: float = 0.015, min_speech_frames: int = 6,
+                 min_silence_frames: int = 28, max_speech_frames: int = 750,
                  preroll_frames: int = 15):
-        # Con frames de 20 ms: 8 = 160 ms de habla mínima, 25 = 0,5 s de pausa
-        # para cerrar la frase, 750 = 15 s de locución máxima, 15 = 300 ms de pre-roll.
+        # Con frames de 20 ms: 6 = 120 ms de habla mínima, 28 = 0,56 s de pausa
+        # para cerrar la frase sin cortar pausas naturales, 750 = 15 s máximo, 15 = 300 ms pre-roll.
         self.threshold = threshold
         self.min_speech = min_speech_frames
         self.min_silence = min_silence_frames

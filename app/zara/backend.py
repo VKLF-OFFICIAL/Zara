@@ -2,6 +2,7 @@ from __future__ import annotations
 import logging
 import re
 import subprocess
+import sys
 import threading
 import time
 from collections import deque
@@ -44,8 +45,10 @@ _HELP = (
 )
 
 _CONFIG_DEFAULTS = {
-    "voz": "es-ES-ElviraNeural",
+    "voz": "es-MX-DaliaNeural",
     "modelo_stt": "small",
+    "stt_beam_size": 3,
+    "pedir_confirmacion": False,  # False = JARVIS autónomo: obedece y ejecuta directamente
     "umbral_voz": 0.72,
     "cerebro_por_defecto": "",
     "dispositivo_microfono": None,
@@ -69,15 +72,17 @@ _CONFIG_DEFAULTS = {
 class ConfirmBridge:
     """Puente de confirmación entre el hilo de trabajo y el panel (UI)."""
 
-    def __init__(self):
+    def __init__(self, enabled: bool = False):
         self._ev = threading.Event()
         self._result = False
+        self.enabled = enabled
         self.request_cb = None  # callable(mensaje:str) -> None (lo pone la app)
 
     def ask(self, message: str, timeout: float = 30.0) -> bool:
+        if not self.enabled or self.request_cb is None:
+            return True
         self._ev.clear()
-        if self.request_cb:
-            self.request_cb(message)
+        self.request_cb(message)
         got = self._ev.wait(timeout)
         return self._result if got else False
 
@@ -91,7 +96,8 @@ class Backend:
         self.paths = paths or ZaraPaths.resolve()
         setup_logging(self.paths.registros)
         self.cfg = load_toml(self.paths.config / "zara.toml", _CONFIG_DEFAULTS)
-        self.confirm = ConfirmBridge()
+        self._pedir_confirmacion = bool(self.cfg.get("pedir_confirmacion", False))
+        self.confirm = ConfirmBridge(enabled=self._pedir_confirmacion)
         self._ready = False
         self.core = None
         self.mic = None
@@ -220,7 +226,10 @@ class Backend:
         if self._ready:
             return
         self.ensure_ready_text()
-        self._stt = Transcriber(model_size=self.cfg["modelo_stt"])
+        self._stt = Transcriber(
+            model_size=self.cfg.get("modelo_stt", "small"),
+            beam_size=int(self.cfg.get("stt_beam_size", 3)),
+        )
         ref = self.paths.ssd_voz / "huella_vk.npy"
         self._verifier = SpeakerVerifier(ref, threshold=float(self.cfg["umbral_voz"]))
         if not self._verifier.is_enrolled():
@@ -260,14 +269,13 @@ class Backend:
             m = Microphone(device=self._device())
             amb = m.record_seconds(1.2)
             floor = float(np.sqrt(np.mean(amb.astype(np.float64) ** 2)))
-            # Umbral por encima del ruido, pero sin dispararse con música de
-            # fondo: tope más bajo para no exigir gritar.
-            thr = max(0.012, min(0.09, floor * 1.6 + 0.01))
+            # Umbral sensible por encima del ruido, adaptado para hablar cómodo sin gritar.
+            thr = max(0.008, min(0.055, floor * 1.35 + 0.006))
             log.info("ruido de fondo RMS=%.4f → umbral VAD=%.4f", floor, thr)
             return thr
         except Exception:
             log.exception("calibración fallida; umbral por defecto")
-            return 0.03
+            return 0.018
 
     # --- escucha ----------------------------------------------------------
     def handle_utterance(self, audio: np.ndarray) -> dict | None:
@@ -323,15 +331,8 @@ class Backend:
             self._gate.open()
 
     def _transcribe_for_wake(self, audio) -> str:
-        """Transcribe sesgando hacia «Zara»; si así no aparece, prueba sin sesgo.
-
-        Medido con voces masculinas: sin sesgo Whisper oye «Sara», «Sada» o
-        inventa «¡Suscríbete!»; con hotwords acierta casi siempre, pero a veces
-        se come la palabra entera, y ahí la pasada sin sesgo sí la conserva.
-        """
-        # Una sola pasada con sesgo a «Zara» (rápida). El reconocimiento
-        # fonético de has_wake ya tolera «Sara», «Vara», etc.
-        return self._stt.transcribe_array(audio, hotwords="Zara")
+        """Transcribe con faster-whisper usando normalización AGC, beam search y vocabulario de Zara."""
+        return self._stt.transcribe_array(audio)
 
     # --- respuesta --------------------------------------------------------
     def respond(self, text: str, verified: bool = True) -> dict:
@@ -628,7 +629,7 @@ class Backend:
 
     def _power(self, what: str) -> dict:
         verbo = {"poweroff": "apagar", "reboot": "reiniciar", "suspend": "suspender"}[what]
-        if what != "suspend":
+        if what != "suspend" and self.confirm.enabled:
             if not self.confirm.ask(f"¿Seguro que quiere {verbo} el equipo, Señor VK?"):
                 return {"reply": "De acuerdo, no lo hago, Señor VK.", "brain": "guardián"}
         if sys.platform == "win32":
@@ -646,7 +647,7 @@ class Backend:
         return {"reply": f"A la orden, Señor VK. Voy a {verbo} el equipo.", "brain": "acción"}
 
     def _close_app(self, name: str) -> dict:
-        """Cierra una aplicación por su nombre, siempre tras confirmación."""
+        """Cierra una aplicación por su nombre directamente."""
         procs = actions.find_app_processes(name)
         if not procs:
             return {"reply": f"No veo abierta ninguna aplicación «{name}», Señor VK.",
@@ -654,8 +655,9 @@ class Backend:
         nombres = ", ".join(sorted({c for _, c in procs}))
         act = Action(kind="process", description=f"cerrar {name}",
                      command=f"cerrar {nombres}")
-        self._guardian.classify(act)  # queda auditado
-        if not self.confirm.ask(f"¿Cierro {nombres}? Se perderá lo que no esté guardado."):
+        if self._guardian:
+            self._guardian.classify(act)  # queda auditado
+        if self.confirm.enabled and not self.confirm.ask(f"¿Cierro {nombres}? Se perderá lo que no esté guardado."):
             return {"reply": "De acuerdo, no la cierro, Señor VK.", "brain": "guardián"}
         n = actions.terminate(procs)
         return {"reply": f"Hecho, Señor VK: he cerrado {nombres}." if n else
@@ -672,14 +674,15 @@ class Backend:
         decision = self._guardian.classify(act)
         if decision.is_blocked:
             return ("blocked", decision.reason or "acción no permitida")
-        if decision.requires_confirmation or force_confirm:
+        if self.confirm.enabled and (decision.requires_confirmation or force_confirm):
             nivel = "crítica" if decision.level is Level.CRITICAL else "delicada"
             if not self.confirm.ask(f"Acción {nivel}: «{cmd}». ¿Confirma, Señor VK?"):
                 return ("cancelled", "")
-            if decision.requires_confirmation:
-                try:
-                    self._guardian.prepare(decision)
-                except Exception as exc:  # noqa: BLE001
+        if decision.requires_confirmation:
+            try:
+                self._guardian.prepare(decision)
+            except Exception as exc:  # noqa: BLE001
+                if self.confirm.enabled:
                     return ("cancelled", f"no pude preparar copia de seguridad ({exc})")
         try:
             out = subprocess.run(cmd, shell=True, capture_output=True, text=True,

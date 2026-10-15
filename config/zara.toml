@@ -1,11 +1,13 @@
 # Configuración de Zara. Edite y reinicie Zara para aplicar.
 
-voz = "es-ES-ElviraNeural"       # es-ES-ElviraNeural | es-ES-XimenaNeural
+voz = "es-MX-DaliaNeural"       # es-MX-DaliaNeural (dulce y suave) | es-ES-XimenaNeural
 modelo_stt = "small"              # tiny|base|small|medium (CPU: small recomendado)
+stt_beam_size = 3                 # 1 (rápido) | 3 (máxima precisión JARVIS sin confusiones)
 umbral_voz = 0.72                 # 0..1 — más alto = más estricto al reconocerle
 cerebro_por_defecto = ""          # "" = Claude; o "zara:latest", "qwen...", "gemini"
 dispositivo_microfono = ""        # "" = por defecto; o nombre/índice del micro
 verificar_voz = true              # solo obedece al Señor VK si hay huella inscrita
+pedir_confirmacion = false          # false = Modo JARVIS autónomo: obedece y ejecuta directamente sin pedir permiso
 modo_conversacion = false         # true = tras cada respuesta sigue sin repetir «Zara» (puede realimentarse con altavoces)
 ventana_escucha = 10.0            # segundos para dar la orden tras decir «Zara» a secas
 modelo_claude = ""                # "" = el de tu suscripción; o "haiku"/"sonnet"/"opus"

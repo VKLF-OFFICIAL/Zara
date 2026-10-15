@@ -1,0 +1,327 @@
+"""Subsistema de Voz y Síntesis (ZARA v2.0).
+
+Streaming por frases (Sentence Chunking), TTS dual (Kokoro-ONNX local + EdgeTTS en RAM),
+cero escritura en disco para latencia mínima y capacidad de interrupción inmediata (Barge-in).
+"""
+
+from __future__ import annotations
+import asyncio
+import io
+import logging
+import queue
+import re
+import threading
+import time
+from pathlib import Path
+from typing import AsyncGenerator, Callable, Generator, List, Optional
+import numpy as np
+import sounddevice as sd
+
+from config import (
+    EDGE_PITCH,
+    EDGE_RATE,
+    EDGE_VOICE,
+    KOKORO_SPEED,
+    KOKORO_VOICE,
+    MODELS_DIR,
+    TTS_PRIMARY_ENGINE,
+)
+
+log = logging.getLogger("zara.voice")
+
+
+def clean_text_for_speech(text: str) -> str:
+    """Elimina markdown pesado, asteriscos, código y caracteres impronunciables."""
+    # Eliminar bloques de código markdown
+    t = re.sub(r"```[\s\S]*?```", " código omitido en voz. ", text)
+    # Eliminar código en línea
+    t = re.sub(r"`([^`]+)`", r"\1", t)
+    # Eliminar asteriscos de negrita/cursiva y almohadillas
+    t = re.sub(r"[*#_~>]+", " ", t)
+    # Eliminar URLs largas
+    t = re.sub(r"https?://\S+", " enlace ", t)
+    # Reemplazar saltos de línea por pausas
+    t = re.sub(r"\n+", ". ", t)
+    # Limpiar espacios múltiples
+    t = re.sub(r"\s+", " ", t).strip()
+    return t
+
+
+class SentenceChunker:
+    """Acumulador de streaming de tokens que emite frases en cuanto alcanzan
+
+    un delimitador válido y una longitud mínima (35 caracteres).
+    """
+
+    DELIMITERS = re.compile(r"([.!?:;\n]+)")
+
+    def __init__(self, min_length: int = 35):
+        self.min_length = min_length
+        self._buffer = ""
+
+    def push(self, token: str) -> List[str]:
+        """Añade un fragmento de texto y devuelve una lista de frases listas."""
+        self._buffer += token
+        ready: List[str] = []
+
+        while True:
+            # Buscar el primer delimitador en el buffer
+            match = self.DELIMITERS.search(self._buffer)
+            if not match:
+                break
+
+            end_idx = match.end()
+            candidate = self._buffer[:end_idx].strip()
+
+            if len(candidate) >= self.min_length:
+                cleaned = clean_text_for_speech(candidate)
+                if cleaned:
+                    ready.append(cleaned)
+                self._buffer = self._buffer[end_idx:].lstrip()
+            else:
+                # Si es muy corto (ej: "Sra."), buscar el siguiente delimitador
+                next_match = self.DELIMITERS.search(self._buffer[end_idx:])
+                if next_match:
+                    new_end = end_idx + next_match.end()
+                    cand2 = self._buffer[:new_end].strip()
+                    cleaned = clean_text_for_speech(cand2)
+                    if cleaned:
+                        ready.append(cleaned)
+                    self._buffer = self._buffer[new_end:].lstrip()
+                else:
+                    break
+
+        return ready
+
+    def flush(self) -> List[str]:
+        """Vacía el contenido restante al terminar la generación del LLM."""
+        ready: List[str] = []
+        rem = clean_text_for_speech(self._buffer.strip())
+        if rem:
+            ready.append(rem)
+        self._buffer = ""
+        return ready
+
+
+class KokoroEngine:
+    """Motor TTS primario local ultrarrápido con Kokoro-ONNX."""
+
+    def __init__(self):
+        self._kokoro = None
+        self._available = False
+        self._init()
+
+    def _init(self) -> None:
+        try:
+            from kokoro_onnx import Kokoro
+            model_path = MODELS_DIR / "kokoro" / "kokoro-v0_19.onnx"
+            voices_path = MODELS_DIR / "kokoro" / "voices.bin"
+
+            if model_path.is_file() and voices_path.is_file():
+                self._kokoro = Kokoro(str(model_path), str(voices_path))
+                self._available = True
+                log.info("Kokoro-ONNX cargado exitosamente.")
+            else:
+                log.info("Archivos de modelo Kokoro no encontrados en %s. Fallback a EdgeTTS.", model_path.parent)
+        except Exception as exc:
+            log.warning("No se pudo iniciar Kokoro-ONNX (%s). Fallback a EdgeTTS.", exc)
+
+    def available(self) -> bool:
+        return self._available
+
+    def synthesize(self, text: str) -> Optional[tuple[np.ndarray, int]]:
+        if not self._available or not self._kokoro:
+            return None
+        try:
+            samples, sr = self._kokoro.create(
+                text,
+                voice=KOKORO_VOICE,
+                speed=KOKORO_SPEED,
+                lang="es",
+            )
+            return samples.astype(np.float32), sr
+        except Exception as exc:
+            log.warning("Kokoro falló sintetizando '%s': %s", text[:30], exc)
+            return None
+
+
+class EdgeTTSEngine:
+    """Motor TTS alternativo de alta expresividad y cero latencia en RAM."""
+
+    def __init__(self):
+        self.voice = EDGE_VOICE
+        self.rate = EDGE_RATE
+        self.pitch = EDGE_PITCH
+
+    def synthesize(self, text: str) -> Optional[tuple[np.ndarray, int]]:
+        """Sintetiza texto en memoria y decodifica a PCM con miniaudio (cero archivos en disco)."""
+        import edge_tts
+        import miniaudio
+
+        async def _fetch():
+            comm = edge_tts.Communicate(text, self.voice, rate=self.rate, pitch=self.pitch)
+            buf = bytearray()
+            async for chunk in comm.stream():
+                if chunk["type"] == "audio":
+                    buf.extend(chunk["data"])
+            return bytes(buf)
+
+        try:
+            # Ejecutar en bucle asíncrono seguro
+            try:
+                loop = asyncio.get_event_loop()
+                if loop.is_running():
+                    mp3_bytes = asyncio.run_coroutine_threadsafe(_fetch(), loop).result(timeout=15.0)
+                else:
+                    mp3_bytes = loop.run_until_complete(_fetch())
+            except RuntimeError:
+                mp3_bytes = asyncio.run(_fetch())
+
+            if not mp3_bytes:
+                return None
+
+            # Decodificar MP3 en RAM directamente a PCM float32
+            decoded = miniaudio.decode(mp3_bytes, nchannels=1, sample_rate=24000)
+            samples = np.frombuffer(decoded.samples, dtype=np.int16).astype(np.float32) / 32768.0
+            return samples, decoded.sample_rate
+
+        except Exception as exc:
+            log.exception("Fallo en la síntesis con EdgeTTS: %s", exc)
+            return None
+
+
+class VoiceSynthesizer:
+    """Gestor de voz de Zara con reproducción en streaming y cancelación Barge-in."""
+
+    def __init__(self, on_state_change: Optional[Callable[[bool], None]] = None):
+        self.on_state_change = on_state_change
+
+        self._kokoro = KokoroEngine()
+        self._edge = EdgeTTSEngine()
+
+        self._tts_queue: queue.Queue[Optional[str]] = queue.Queue()
+        self._stop_event = threading.Event()
+        self._is_speaking = False
+        self._lock = threading.Lock()
+
+        self._worker_thread = threading.Thread(target=self._playback_worker, daemon=True)
+        self._worker_thread.start()
+
+    def is_speaking(self) -> bool:
+        with self._lock:
+            return self._is_speaking
+
+    def stop(self) -> None:
+        """Interrupción inmediata (Barge-in): detiene el audio y vacía la cola."""
+        try:
+            sd.stop()
+        except Exception:
+            pass
+
+        # Vaciar cola de frases pendientes
+        while not self._tts_queue.empty():
+            try:
+                self._tts_queue.get_nowait()
+            except queue.Empty:
+                break
+
+        with self._lock:
+            if self._is_speaking:
+                self._is_speaking = False
+                if self.on_state_change:
+                    try:
+                        self.on_state_change(False)
+                    except Exception:
+                        pass
+        log.info("Reproducción de voz abortada por Barge-in.")
+
+    def say(self, text: str) -> None:
+        """Encola una frase completa para ser sintetizada."""
+        clean = clean_text_for_speech(text)
+        if clean:
+            self._tts_queue.put(clean)
+
+    def feed_token_stream(self, token_generator: Generator[str, None, None]) -> None:
+        """Procesa un generador síncrono de tokens del LLM usando SentenceChunker."""
+        chunker = SentenceChunker(min_length=35)
+        for token in token_generator:
+            if self._stop_event.is_set():
+                break
+            for sentence in chunker.push(token):
+                self._tts_queue.put(sentence)
+
+        for sentence in chunker.flush():
+            self._tts_queue.put(sentence)
+
+    async def feed_async_token_stream(self, async_generator: AsyncGenerator[str, None]) -> None:
+        """Procesa un generador asíncrono de tokens del LLM usando SentenceChunker."""
+        chunker = SentenceChunker(min_length=35)
+        async for token in async_generator:
+            if self._stop_event.is_set():
+                break
+            for sentence in chunker.push(token):
+                self._tts_queue.put(sentence)
+
+        for sentence in chunker.flush():
+            self._tts_queue.put(sentence)
+
+    def _synthesize_audio(self, text: str) -> Optional[tuple[np.ndarray, int]]:
+        """Intenta sintetizar con Kokoro si está habilitado; de lo contrario EdgeTTS."""
+        if TTS_PRIMARY_ENGINE == "kokoro" and self._kokoro.available():
+            res = self._kokoro.synthesize(text)
+            if res is not None:
+                return res
+
+        return self._edge.synthesize(text)
+
+    def _playback_worker(self) -> None:
+        """Hilo trabajador que toma frases de la cola, sintetiza y reproduce."""
+        while not self._stop_event.is_set():
+            try:
+                text = self._tts_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            if text is None:
+                continue
+
+            audio_data = self._synthesize_audio(text)
+            if audio_data is None:
+                continue
+
+            samples, sr = audio_data
+
+            with self._lock:
+                self._is_speaking = True
+                if self.on_state_change:
+                    try:
+                        self.on_state_change(True)
+                    except Exception:
+                        pass
+
+            try:
+                sd.play(samples, samplerate=sr)
+                # Esperar a que termine de sonar, comprobando periódicamente si hubo Barge-in
+                while sd.get_stream() and sd.get_stream().active:
+                    if not self._is_speaking or self._stop_event.is_set():
+                        sd.stop()
+                        break
+                    time.sleep(0.02)
+            except Exception as exc:
+                log.warning("Error durante la reproducción en sounddevice: %s", exc)
+            finally:
+                with self._lock:
+                    if self._tts_queue.empty():
+                        self._is_speaking = False
+                        if self.on_state_change:
+                            try:
+                                self.on_state_change(False)
+                            except Exception:
+                                pass
+
+    def shutdown(self) -> None:
+        """Cierre ordenado del motor de voz."""
+        self.stop()
+        self._stop_event.set()
+        if self._worker_thread.is_alive():
+            self._worker_thread.join(timeout=1.0)
