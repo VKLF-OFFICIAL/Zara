@@ -5,6 +5,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import unicodedata
 from datetime import datetime
 from pathlib import Path
@@ -21,8 +22,13 @@ def _run(cmd: list[str], timeout: int = 5) -> subprocess.CompletedProcess:
 
 
 def _detach(cmd: list[str]) -> None:
-    subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                     start_new_session=True)
+    if sys.platform == "win32":
+        flags = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         creationflags=flags)
+    else:
+        subprocess.Popen(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                         start_new_session=True)
 
 
 # --- hora y fecha ---------------------------------------------------------
@@ -52,6 +58,42 @@ def _volume_pct(sink: str) -> int | None:
 
 def volume(kind: str, value: str | None = None, sink: str | None = None) -> str:
     """Controla el volumen de la salida indicada (o la predeterminada)."""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            VK_VOLUME_MUTE = 0xAD
+            VK_VOLUME_DOWN = 0xAE
+            VK_VOLUME_UP = 0xAF
+
+            def _press(vk: int):
+                ctypes.windll.user32.keybd_event(vk, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(vk, 0, 2, 0)
+
+            if kind == "volume_up":
+                for _ in range(5):
+                    _press(VK_VOLUME_UP)
+                return "Subiendo el volumen, Señor VK."
+            if kind == "volume_down":
+                for _ in range(5):
+                    _press(VK_VOLUME_DOWN)
+                return "Bajando el volumen, Señor VK."
+            if kind == "mute":
+                _press(VK_VOLUME_MUTE)
+                return "Sonido silenciado, Señor VK."
+            if kind == "unmute":
+                _press(VK_VOLUME_MUTE)
+                return "Sonido reactivado, Señor VK."
+            if kind == "set_volume":
+                target = max(0, min(100, int(value or 50)))
+                for _ in range(50):
+                    _press(VK_VOLUME_DOWN)
+                for _ in range(target // 2):
+                    _press(VK_VOLUME_UP)
+                return f"Volumen ajustado al {target} %, Señor VK."
+            return "Hecho, Señor VK."
+        except Exception as exc:
+            return f"No pude cambiar el volumen, Señor VK ({exc})."
+
     if not shutil.which("pactl"):
         return "No encuentro el control de audio (pactl), Señor VK."
     sink = sink or _DEFAULT_SINK
@@ -74,7 +116,7 @@ def volume(kind: str, value: str | None = None, sink: str | None = None) -> str:
     return f"Volumen al {pct} %, Señor VK." if pct is not None else "Hecho, Señor VK."
 
 
-# --- música (MPRIS por D-Bus) ---------------------------------------------
+# --- música (MPRIS por D-Bus en Linux, teclas multimedia en Windows) -------
 def _mpris_players() -> list[str]:
     out = _run(["dbus-send", "--session", "--print-reply", "--dest=org.freedesktop.DBus",
                 "/org/freedesktop/DBus", "org.freedesktop.DBus.ListNames"]).stdout
@@ -95,6 +137,30 @@ def _mpris_call(name: str, method: str) -> None:
 
 
 def media(kind: str) -> str:
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            VK_MEDIA_NEXT_TRACK = 0xB0
+            VK_MEDIA_PREV_TRACK = 0xB1
+            VK_MEDIA_PLAY_PAUSE = 0xB3
+
+            def _press(vk: int):
+                ctypes.windll.user32.keybd_event(vk, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(vk, 0, 2, 0)
+
+            if kind in ("media_pause", "media_play"):
+                _press(VK_MEDIA_PLAY_PAUSE)
+                return "Música en pausa, Señor VK." if kind == "media_pause" else "Reanudo la música, Señor VK."
+            if kind == "media_next":
+                _press(VK_MEDIA_NEXT_TRACK)
+                return "Siguiente canción, Señor VK."
+            if kind == "media_prev":
+                _press(VK_MEDIA_PREV_TRACK)
+                return "Canción anterior, Señor VK."
+            return "Hecho, Señor VK."
+        except Exception as exc:
+            return f"No pude controlar la música, Señor VK ({exc})."
+
     try:
         players = _mpris_players()
     except Exception:
@@ -132,6 +198,18 @@ _ALIASES = {
     "editor de texto": ["kate"], "notas": ["kate"],
 }
 
+_WIN_ALIASES = {
+    "navegador": ["cmd.exe", "/c", "start", "https://www.google.com"],
+    "internet": ["cmd.exe", "/c", "start", "https://www.google.com"],
+    "terminal": ["wt.exe"], "consola": ["powershell.exe"],
+    "archivos": ["explorer.exe"], "explorador de archivos": ["explorer.exe"],
+    "carpeta personal": ["explorer.exe"], "gestor de archivos": ["explorer.exe"],
+    "calculadora": ["calc.exe"], "ajustes": ["cmd.exe", "/c", "start", "ms-settings:"],
+    "configuracion": ["cmd.exe", "/c", "start", "ms-settings:"],
+    "configuracion del sistema": ["cmd.exe", "/c", "start", "ms-settings:"],
+    "editor de texto": ["notepad.exe"], "notas": ["notepad.exe"],
+}
+
 _DESKTOP_DIRS = [
     Path.home() / ".local/share/applications",
     Path("/usr/share/applications"),
@@ -144,6 +222,22 @@ _DESKTOP_DIRS = [
 def _norm(s: str) -> str:
     s = unicodedata.normalize("NFKD", s.lower())
     return "".join(c for c in s if not unicodedata.combining(c)).strip()
+
+
+def find_windows_shortcut(target: str) -> Path | None:
+    t = _norm(target)
+    dirs = [
+        Path(os.environ.get("APPDATA", "")) / "Microsoft/Windows/Start Menu/Programs",
+        Path(os.environ.get("ProgramData", "")) / "Microsoft/Windows/Start Menu/Programs",
+    ]
+    for d in dirs:
+        if not d.is_dir():
+            continue
+        for lnk in d.rglob("*.lnk"):
+            stem = _norm(lnk.stem)
+            if stem == t or t in stem:
+                return lnk
+    return None
 
 
 def find_desktop_entry(target: str, dirs: list[Path] | None = None) -> Path | None:
@@ -174,6 +268,23 @@ def open_app(target: str) -> str:
     if not t:
         return "¿Qué desea que abra, Señor VK?"
     try:
+        if sys.platform == "win32":
+            if t in _WIN_ALIASES:
+                _detach(_WIN_ALIASES[t])
+                return f"Abriendo {target}, Señor VK."
+            if shutil.which(t) or shutil.which(f"{t}.exe"):
+                exe = t if shutil.which(t) else f"{t}.exe"
+                _detach([exe])
+                return f"Abriendo {target}, Señor VK."
+            lnk = find_windows_shortcut(t)
+            if lnk is not None:
+                os.startfile(str(lnk))
+                return f"Abriendo {target}, Señor VK."
+            if re.fullmatch(r"[a-z0-9-]+(\.[a-z0-9-]+)+(/\S*)?", t):
+                os.startfile(f"https://{t}")
+                return f"Abriendo {t} en el navegador, Señor VK."
+            return f"No encuentro ninguna aplicación llamada «{target}», Señor VK."
+
         if t in _ALIASES and shutil.which(_ALIASES[t][0]):
             _detach(_ALIASES[t])
             return f"Abriendo {target}, Señor VK."
@@ -202,8 +313,16 @@ def _find_player(app: str) -> str | None:
 
 
 def play_in_app(app: str, wait_s: float = 10.0) -> str:
-    """Abre la app de música si hace falta y le da al play (MPRIS)."""
+    """Abre la app de música si hace falta y le da al play (MPRIS en Linux / Media key en Windows)."""
     import time
+    if sys.platform == "win32":
+        msg = open_app(app)
+        if msg.startswith("No "):
+            return msg
+        time.sleep(1.0)
+        media("media_play")
+        return f"Reproduciendo música en {app.capitalize()}, Señor VK."
+
     player = _find_player(app)
     if player is None:
         msg = open_app(app)
@@ -237,6 +356,9 @@ def folder_path(name: str, home: Path | None = None) -> Path | None:
     if key == "personal":
         return home
     if key == "zara":
+        if sys.platform == "win32":
+            p = home / "Zara"
+            return p if p.is_dir() else None
         p = Path("/mnt/almacen/ZARA")
         return p if p.is_dir() else None
     for cand in _FOLDERS.get(key, []):
@@ -249,7 +371,13 @@ def open_folder(name: str) -> str:
     p = folder_path(name)
     if p is None:
         return f"No encuentro la carpeta «{name}», Señor VK."
-    _detach(["xdg-open", str(p)])
+    if sys.platform == "win32":
+        try:
+            os.startfile(str(p))
+        except Exception as exc:
+            return f"No pude abrir la carpeta {name}: {exc}"
+    else:
+        _detach(["xdg-open", str(p)])
     return f"Abriendo {p.name or 'su carpeta personal'}, Señor VK."
 
 
@@ -261,23 +389,57 @@ def search_url(engine: str, query: str) -> str:
 
 
 def web_search(engine: str, query: str) -> str:
-    _detach(["xdg-open", search_url(engine, query)])
+    url = search_url(engine, query)
+    if sys.platform == "win32":
+        try:
+            os.startfile(url)
+        except Exception:
+            subprocess.Popen(["cmd.exe", "/c", "start", "", url], shell=True)
+    else:
+        _detach(["xdg-open", url])
     donde = "YouTube" if engine == "youtube" else "Google"
     return f"Buscando «{query}» en {donde}, Señor VK."
 
 
 # --- cerrar aplicaciones (siempre con confirmación, desde el backend) ---------
 _CLOSE_ALIASES = {
-    "navegador": ["firefox", "opera", "chrome", "chromium", "brave", "vivaldi"],
-    "terminal": ["konsole"], "archivos": ["dolphin"], "musica": ["spotify"],
+    "navegador": ["firefox", "opera", "chrome", "chromium", "brave", "vivaldi", "msedge"],
+    "terminal": ["konsole", "windowsterminal", "powershell", "cmd"],
+    "archivos": ["dolphin", "explorer"], "musica": ["spotify"],
 }
 
 
 def find_app_processes(name: str) -> list[tuple[int, str]]:
-    """Procesos cuyo nombre (comm) coincide con la app pedida."""
+    """Procesos cuyo nombre coincide con la app pedida."""
     wanted = _CLOSE_ALIASES.get(_norm(name), [_norm(name)])
     found = []
-    out = _run(["ps", "-u", str(os.getuid()), "-o", "pid=,comm="]).stdout
+    if sys.platform == "win32":
+        try:
+            res = subprocess.run(["tasklist", "/fo", "csv", "/nh"], capture_output=True, text=True, errors="ignore")
+            import csv, io
+            reader = csv.reader(io.StringIO(res.stdout))
+            for row in reader:
+                if len(row) >= 2:
+                    image, pid_str = row[0], row[1]
+                    clean_img = image.lower()
+                    if clean_img.endswith(".exe"):
+                        clean_img = clean_img[:-4]
+                    try:
+                        pid = int(pid_str)
+                    except ValueError:
+                        continue
+                    if pid == os.getpid():
+                        continue
+                    if any(clean_img == w or clean_img.startswith(w) for w in wanted):
+                        found.append((pid, image))
+        except Exception:
+            pass
+        return found
+
+    try:
+        out = _run(["ps", "-u", str(os.getuid()), "-o", "pid=,comm="]).stdout
+    except Exception:
+        out = ""
     for line in out.splitlines():
         parts = line.split(None, 1)
         if len(parts) != 2:

@@ -64,8 +64,15 @@ class SpeakerVerifier:
             self._ref = np.load(self.ref_path)
         return self._ref
 
-    def verify(self, audio16k: np.ndarray) -> tuple[bool, float]:
+    def verify(self, audio16k: np.ndarray, threshold: float | None = None) -> tuple[bool, float]:
         if not self.is_enrolled():
             raise FileNotFoundError("No hay huella de voz; haga la inscripción primero")
+        dur = len(audio16k) / 16000
         score = cosine(self._embed(audio16k), self._load_ref())
-        return decide(score, self.threshold), score
+        target_thr = threshold if threshold is not None else self.threshold
+        # En locuciones breves (< 1.2 s), el embedding tiene varianza más alta;
+        # adaptamos el umbral gradualmente para no rechazar falsamente al usuario.
+        if dur < 1.2:
+            target_thr = max(0.55, target_thr - (1.2 - dur) * 0.15)
+        return decide(score, target_thr), score
+

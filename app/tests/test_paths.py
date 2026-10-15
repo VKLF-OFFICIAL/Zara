@@ -19,3 +19,11 @@ def test_resolve_raises_when_not_mounted(fake_env):
                           sentinel=fake_env["sentinel"])
     # Nunca debe crear el root si no hay montaje
     assert not fake_env["root"].exists()
+
+
+def test_resolve_cross_platform_defaults(tmp_path, monkeypatch):
+    monkeypatch.setenv("ZARA_ROOT", str(tmp_path / "ZaraTest"))
+    p = ZaraPaths.resolve()
+    assert p.root == tmp_path / "ZaraTest"
+    assert (p.root / "config").is_dir()
+

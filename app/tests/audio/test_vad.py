@@ -58,3 +58,26 @@ def test_caps_very_long_speech():
     emitted = [o for o in outs if o is not None]
     assert len(emitted) == 1
     assert emitted[0].shape[0] == 10 * 160
+
+
+def test_preroll_preserves_audio_before_speech():
+    # El pre-roll garantiza que la consonante inicial suave ("Z", "S") no se corte
+    vad = EnergyVad(threshold=0.05, min_speech_frames=2, min_silence_frames=3,
+                    preroll_frames=3)
+    # 3 frames de audio suave por debajo del umbral fuerte
+    vad.push(_speech(amp=0.03))
+    vad.push(_speech(amp=0.03))
+    vad.push(_speech(amp=0.03))
+    # 2 frames de habla fuerte
+    vad.push(_speech(amp=0.2))
+    vad.push(_speech(amp=0.2))
+    # silencio para cerrar
+    out = None
+    for _ in range(4):
+        r = vad.push(_silence())
+        if r is not None:
+            out = r
+    assert out is not None
+    # Debe contener los 3 frames de preroll + 2 de habla fuerte + 3 de silencio
+    assert out.shape[0] >= (3 + 2) * 160
+

@@ -15,13 +15,14 @@ _JARVIS_TOKEN = re.compile(r"^(?:j|y|ch|sh)ar?vi[sz]?$")
 # «Zara»→«Para») activa, pero «para mañana quiero…» no.
 _WEAK_TOKEN = re.compile(r"^(?:p|b|c|m|l|j|t|d|g|r|n|f|h)ara$|^clara$|^bada$|^pada$")
 # Rellenos admitidos antes de la wake word.
-_FILLERS = ("oye", "hey", "ok", "vale")
+_FILLERS = ("oye", "hey", "ok", "vale", "buenas", "buenos dias", "buenas tardes", "buenas noches", "hola", "por favor", "a ver")
 
 _WAKE_RE = re.compile(
     r"^\W*(?:(?:" + "|".join(_FILLERS) + r")\W+)?"
     r"(\w+)[\s,:;.!¡]*",
     re.IGNORECASE,
 )
+
 
 # Descompone el inicio: relleno opcional, 1ª palabra, separadores tras ella
 # (coma/pausa) y el resto. Sirve para saber si un mishear débil es un vocativo.

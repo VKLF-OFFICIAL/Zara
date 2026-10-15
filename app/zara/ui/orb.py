@@ -13,6 +13,8 @@ RED = QtGui.QColor("#FF4040")
 BG = QtGui.QColor("#07080C")
 
 AVATAR_CANDIDATES = [
+    str(Path(__file__).resolve().parent.parent.parent.parent / "config" / "avatar.jpg"),
+    str(Path.home() / "Zara" / "config" / "avatar.jpg"),
     "/mnt/almacen/ZARA/config/avatar.jpg",
     "/home/vklf/Imágenes/Eduhg.jpg",
 ]

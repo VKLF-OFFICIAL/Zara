@@ -23,3 +23,15 @@ def test_greeting_by_time():
     assert "Buenas tardes" in greeting(datetime(2026, 10, 14, 16, 0))
     assert "Buenas noches" in greeting(datetime(2026, 10, 14, 23, 0))
     assert "Señor VK" in greeting(datetime(2026, 10, 14, 9, 0))
+
+
+from zara.system import status_report
+
+
+def test_status_report_live():
+    res = status_report()
+    assert "Señor VK" in res
+    assert "CPU" in res
+    assert "Memoria" in res
+    assert "Disco" in res
+

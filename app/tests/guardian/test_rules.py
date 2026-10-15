@@ -42,14 +42,19 @@ def test_write_outside_root_is_at_least_confirm(rs):
 
 
 def test_symlink_escaping_espacio_not_safe(rs, tmp_path):
+    import pytest
     r, espacio = rs
     outside = tmp_path / "fuera"
     outside.mkdir()
     link = espacio / "escape"
-    link.symlink_to(outside)
+    try:
+        link.symlink_to(outside)
+    except OSError:
+        pytest.skip("El sistema operativo no permite crear enlaces simbólicos sin privilegios elevados")
     lvl, _, _ = r.classify(Action(kind="file_write", description="x",
                                   paths=(link / "x.txt",)))
     assert lvl >= Level.CONFIRM
+
 
 
 def test_unknown_command_defaults_to_confirm(rs):

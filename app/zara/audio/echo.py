@@ -21,9 +21,18 @@ def _content_tokens(text: str) -> set[str]:
 
 def is_echo(heard: str, spoken_history, threshold: float = 0.6) -> bool:
     """True si lo oído coincide en buena parte con algo que Zara acaba de decir."""
+    norm_heard = normalize(heard)
+    if not norm_heard:
+        return False
+    # Respuestas de confirmación válidas: solo son eco si Zara las acaba de pronunciar
+    if norm_heard in ("si", "no", "confirmo", "cancelo"):
+        for spoken in spoken_history:
+            if norm_heard in normalize(spoken).split():
+                return True
+        return False
     h = _content_tokens(heard)
     if not h:
-        return True  # solo relleno (p. ej. «Señor VK»): no es una orden real
+        return True  # solo relleno de tratamiento (p. ej. «Señor VK»): no es orden
     for spoken in spoken_history:
         s = _content_tokens(spoken)
         if not s:
@@ -32,3 +41,4 @@ def is_echo(heard: str, spoken_history, threshold: float = 0.6) -> bool:
         if overlap >= threshold:
             return True
     return False
+

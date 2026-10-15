@@ -11,7 +11,8 @@ def test_say_date_spanish():
 
 
 def _desk(d, name, body):
-    (d / name).write_text("[Desktop Entry]\nType=Application\n" + body)
+    (d / name).write_text("[Desktop Entry]\nType=Application\n" + body, encoding="utf-8")
+
 
 
 def test_find_desktop_entry_by_name(tmp_path):
@@ -48,3 +49,21 @@ def test_search_url_encodes_query():
         "https://www.google.com/search?q=paella+valenciana"
     assert search_url("youtube", "lofi & chill") == \
         "https://www.youtube.com/results?search_query=lofi+%26+chill"
+
+
+from zara.actions import volume, media
+
+
+def test_volume_actions():
+    res_up = volume("volume_up")
+    assert isinstance(res_up, str) and ("volumen" in res_up.lower() or "hecho" in res_up.lower() or "pactl" in res_up.lower())
+    res_down = volume("volume_down")
+    assert isinstance(res_down, str)
+    res_mute = volume("mute")
+    assert isinstance(res_mute, str) and ("silenciado" in res_mute.lower() or "hecho" in res_mute.lower() or "pactl" in res_mute.lower())
+
+
+def test_media_actions():
+    res = media("media_play")
+    assert isinstance(res, str)
+

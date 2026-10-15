@@ -39,3 +39,13 @@ def test_command_mentioning_senor_is_not_echo():
 def test_pure_filler_is_discarded():
     # «Señor VK» a secas no es una orden: se descarta.
     assert is_echo("Señor VK", ["cualquier cosa"])
+
+
+def test_confirmation_responses_are_not_echo():
+    # Respuestas de confirmación no se descartan a menos que Zara las acabara de decir
+    spoken = ["Acción delicada: ¿Confirma, Señor VK?"]
+    assert not is_echo("sí", spoken)
+    assert not is_echo("no", spoken)
+    assert not is_echo("confirmo", spoken)
+    assert not is_echo("cancelo", spoken)
+

@@ -294,16 +294,24 @@ class Backend:
         log.info("oído: %r -> %s", text, kind)
         if kind is None:
             return None
+        if kind == "ack":
+            if self.cfg.get("verificar_voz") and self._verifier.is_enrolled():
+                ok, score = self._verifier.verify(audio)
+                log.info("verificación de wake («Zara»): ok=%s score=%.3f", ok, score)
+                if not ok and score < 0.50:
+                    return {"denied": True}
+            self.chime()
+            return {"ack": True}
+
         if self.cfg.get("verificar_voz") and self._verifier.is_enrolled():
             ok, score = self._verifier.verify(audio)
             log.info("verificación de voz: ok=%s score=%.3f", ok, score)
             if not ok:
                 return {"denied": True}
         self.chime()
-        if kind == "ack":
-            return {"ack": True}
         res = self.respond(order)
         return {"order": order, "reply": res["reply"], "ui": res.get("ui")}
+
 
     def open_listen_window(self, after_reply: bool = False):
         """Abre la ventana de escucha sin «Zara» una vez Zara ha terminado de hablar.
@@ -508,6 +516,13 @@ class Backend:
                 "brain": "acción"}
 
     def _lock_session(self) -> dict:
+        if sys.platform == "win32":
+            try:
+                import ctypes
+                ctypes.windll.user32.LockWorkStation()
+                return {"reply": "Bloqueando la sesión, Señor VK.", "brain": "acción"}
+            except Exception as exc:
+                return {"reply": f"No pude bloquear la sesión, Señor VK ({exc}).", "brain": "acción"}
         import shutil as _sh
         if _sh.which("loginctl"):
             subprocess.run(["loginctl", "lock-session"], stdin=subprocess.DEVNULL)
@@ -521,8 +536,26 @@ class Backend:
     def _screenshot(self) -> dict:
         import shutil as _sh
         from datetime import datetime
-        dest = Path.home() / "Imágenes" / f"captura-{datetime.now():%Y%m%d-%H%M%S}.png"
+        pics = Path.home() / ("Pictures" if sys.platform == "win32" else "Imágenes")
+        dest = pics / f"captura-{datetime.now():%Y%m%d-%H%M%S}.png"
         dest.parent.mkdir(parents=True, exist_ok=True)
+        if sys.platform == "win32":
+            try:
+                from PIL import ImageGrab
+                img = ImageGrab.grab()
+                img.save(dest)
+            except Exception:
+                ps = (f"Add-Type -AssemblyName System.Windows.Forms,System.Drawing; "
+                      f"$b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; "
+                      f"$bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height; "
+                      f"$g = [System.Drawing.Graphics]::FromImage($bmp); "
+                      f"$g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size); "
+                      f"$bmp.Save('{dest.as_posix()}'); $g.Dispose(); $bmp.Dispose()")
+                subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True)
+            if dest.exists():
+                return {"reply": "Captura guardada en Imágenes, Señor VK.", "brain": "acción"}
+            return {"reply": "No he podido hacer la captura, Señor VK.", "brain": "acción"}
+
         if _sh.which("spectacle"):
             subprocess.run(["spectacle", "-b", "-n", "-f", "-o", str(dest)],
                            stdin=subprocess.DEVNULL, capture_output=True)
@@ -539,17 +572,32 @@ class Backend:
         import shutil as _sh
         from datetime import datetime
         from .brain.cli import ClaudeBrain
-        if not _sh.which("spectacle"):
-            return {"reply": "No encuentro con qué mirar la pantalla, Señor VK.",
-                    "brain": "acción"}
         sandbox = Path(ClaudeBrain.SANDBOX)
         try:
             sandbox.mkdir(parents=True, exist_ok=True)
         except OSError:
             pass
         shot = sandbox / f"pantalla-{datetime.now():%H%M%S-%f}.png"
-        subprocess.run(["spectacle", "-b", "-n", "-f", "-o", str(shot)],
-                       stdin=subprocess.DEVNULL, capture_output=True)
+        if sys.platform == "win32":
+            try:
+                from PIL import ImageGrab
+                img = ImageGrab.grab()
+                img.save(shot)
+            except Exception:
+                ps = (f"Add-Type -AssemblyName System.Windows.Forms,System.Drawing; "
+                      f"$b = [System.Windows.Forms.Screen]::PrimaryScreen.Bounds; "
+                      f"$bmp = New-Object System.Drawing.Bitmap $b.Width, $b.Height; "
+                      f"$g = [System.Drawing.Graphics]::FromImage($bmp); "
+                      f"$g.CopyFromScreen($b.Location, [System.Drawing.Point]::Empty, $b.Size); "
+                      f"$bmp.Save('{shot.as_posix()}'); $g.Dispose(); $bmp.Dispose()")
+                subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True)
+        elif _sh.which("spectacle"):
+            subprocess.run(["spectacle", "-b", "-n", "-f", "-o", str(shot)],
+                           stdin=subprocess.DEVNULL, capture_output=True)
+        else:
+            return {"reply": "No encuentro con qué mirar la pantalla, Señor VK.",
+                    "brain": "acción"}
+
         if not shot.exists():
             return {"reply": "No he podido capturar la pantalla, Señor VK.",
                     "brain": "acción"}
@@ -583,6 +631,14 @@ class Backend:
         if what != "suspend":
             if not self.confirm.ask(f"¿Seguro que quiere {verbo} el equipo, Señor VK?"):
                 return {"reply": "De acuerdo, no lo hago, Señor VK.", "brain": "guardián"}
+        if sys.platform == "win32":
+            cmd = {
+                "poweroff": ["shutdown.exe", "/s", "/t", "0"],
+                "reboot": ["shutdown.exe", "/r", "/t", "0"],
+                "suspend": ["rundll32.exe", "powrprof.dll,SetSuspendState", "Sleep"],
+            }[what]
+            subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
+            return {"reply": f"A la orden, Señor VK. Voy a {verbo} el equipo.", "brain": "acción"}
         cmd = {"poweroff": ["systemctl", "poweroff"],
                "reboot": ["systemctl", "reboot"],
                "suspend": ["systemctl", "suspend"]}[what]
@@ -643,6 +699,8 @@ class Backend:
             return {"reply": f"Cancelado, Señor VK{extra}.", "brain": "guardián"}
         if status == "error":
             return {"reply": f"Falló el comando: {res}", "brain": "acción"}
+        if "\n" not in res and len(res) <= 80:
+            return {"reply": f"Hecho, Señor VK: {res}.", "brain": "acción"}
         return {"reply": f"Hecho, Señor VK.\n```\n{res[:1500]}\n```", "brain": "acción"}
 
     def _hands_runner(self, brain, prompt: str, context: str) -> str:
@@ -699,14 +757,17 @@ class Backend:
                 _out, err = self._player.communicate()
                 if self._player.returncode not in (0, -15):
                     if err:
-                        log.warning("el reproductor falló: %s",
+                        log.warning("el reproductor falló (rc=%s): %s",
+                                    self._player.returncode,
                                     err.decode(errors="ignore")[:200])
-                    if sink:  # la salida fijada falló → reintenta en la por defecto
+                    if sink:
                         log.info("reintento de voz en la salida por defecto del sistema")
                         self._player = subprocess.Popen(
                             player_cmd(wav, None), stdin=subprocess.DEVNULL,
                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                         self._player.communicate()
+                    if self._player.returncode not in (0, -15):
+                        self._play_sounddevice_fallback(wav)
             except Exception:
                 log.exception("no se pudo reproducir la voz")
             finally:
@@ -716,13 +777,33 @@ class Backend:
                         f.unlink(missing_ok=True)
                     except OSError:
                         pass
-                time.sleep(0.6)  # deja apagarse el eco antes de volver a escuchar
+                time.sleep(0.15)  # deja apagarse el eco antes de volver a escuchar
                 if self.mic is not None:
                     self.mic.muted.clear()
 
     def _sink(self) -> str | None:
         s = self.cfg.get("salida_audio")
         return s or None
+
+    def _play_sounddevice_fallback(self, wav_path: str | Path) -> bool:
+        """Fallback directo con sounddevice (PortAudio) cuando fallan los reproductores del sistema."""
+        try:
+            import wave
+            import sounddevice as sd
+            with wave.open(str(wav_path), "rb") as wf:
+                sr = wf.getframerate()
+                nchannels = wf.getnchannels()
+                frames = wf.readframes(wf.getnframes())
+                dtype = np.int16 if wf.getsampwidth() == 2 else np.uint8
+                data = np.frombuffer(frames, dtype=dtype)
+                if nchannels > 1:
+                    data = data.reshape(-1, nchannels)
+                sd.play(data, sr)
+                sd.wait()
+                return True
+        except Exception as exc:
+            log.warning("fallback sounddevice no disponible: %s", exc)
+            return False
 
     def stop_speaking(self):
         p = self._player
