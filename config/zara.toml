@@ -1,0 +1,18 @@
+# Configuración de Zara. Edite y reinicie Zara para aplicar.
+
+voz = "es-ES-ElviraNeural"       # es-ES-ElviraNeural | es-ES-XimenaNeural
+modelo_stt = "small"              # tiny|base|small|medium (CPU: small recomendado)
+umbral_voz = 0.72                 # 0..1 — más alto = más estricto al reconocerle
+cerebro_por_defecto = ""          # "" = Claude; o "zara:latest", "qwen...", "gemini"
+dispositivo_microfono = ""        # "" = por defecto; o nombre/índice del micro
+verificar_voz = true              # solo obedece al Señor VK si hay huella inscrita
+modo_conversacion = false         # true = tras cada respuesta sigue sin repetir «Zara» (puede realimentarse con altavoces)
+ventana_escucha = 10.0            # segundos para dar la orden tras decir «Zara» a secas
+modelo_claude = ""                # "" = el de tu suscripción; o "haiku"/"sonnet"/"opus"
+salida_audio = ""   # "" = sigue la salida por defecto del sistema (recomendado); o un sink fijo (p.ej. "alsa_output.pci-0000_00_1f.3.analog-stereo")
+cerebro_claude_modo = "agente"    # "agente" = Claude con control total del equipo | "consulta" = solo web+lectura
+claude_directorio = ""            # "" = su carpeta personal; carpeta de trabajo del agente
+motor_voz = "edge"                # "edge" (natural, red) | "piper" (local instantánea, offline) | "espeak"
+voz_piper = "/mnt/almacen/IA/piper-voices/es_ES-sharvard-medium.onnx"
+manos = true                      # cualquier cerebro (Claude, Gemini o local) puede actuar en el sistema vía Guardián
+manos_max_pasos = 4               # vueltas máximas del bucle acción→resultado del cerebro

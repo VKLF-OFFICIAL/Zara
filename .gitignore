@@ -1,0 +1,22 @@
+# Datos privados y de ejecución (NUNCA se suben):
+# logs con conversaciones transcritas y auditoría, memoria personal,
+# recordatorios, copias de seguridad, carpetas de trabajo y audio generado.
+registros/
+memoria/
+tareas/
+copias/
+espacio/
+voz/
+config/chime.wav
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Varios
+*.log
+.DS_Store

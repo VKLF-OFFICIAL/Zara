@@ -1,0 +1,11 @@
+[project]
+name = "zara"
+version = "0.1.0"
+requires-python = ">=3.12,<3.13"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.setuptools]
+packages = ["zara", "zara.guardian"]

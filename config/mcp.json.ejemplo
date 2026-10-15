@@ -1,0 +1,20 @@
+// Hub MCP para el cerebro AGENTE de Zara.
+//
+// Copie este archivo a  config/mcp.json  (sin «.ejemplo») y ponga sus
+// servidores MCP. Zara se lo pasa al agente con --mcp-config --strict-mcp-config,
+// de modo que el agente gana esas herramientas (y SOLO esas, no las del
+// Claude Code del sistema). Si el archivo no existe, no se usa MCP.
+//
+// Formato idéntico al de Claude Code:
+{
+  "mcpServers": {
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem", "/mnt/almacen"]
+    },
+    "fetch": {
+      "command": "uvx",
+      "args": ["mcp-server-fetch"]
+    }
+  }
+}

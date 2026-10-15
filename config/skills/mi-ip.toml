@@ -1,0 +1,6 @@
+# Skill de ejemplo (real y funcional): «Zara, ¿cuál es mi IP pública?»
+nombre = "mi ip pública"
+frases = ["cual es mi ip", "mi ip publica", "que ip tengo"]
+tipo = "shell"
+comando = "curl -s ifconfig.me"
+confirmar = false

@@ -1,0 +1,26 @@
+# Reglas del Guardián de Zara. Orden de severidad: blocked > critical > confirm > safe.
+# Los patrones son expresiones regulares (regex) aplicadas al comando o a las rutas.
+
+blocked = [
+  '\bmkfs\b', '\bdd\s+if=',
+  '\brm\s+-rf\s+/\s*(\*|$)',
+  '\brm\s+-rf\s+/(bin|boot|dev|etc|lib|lib64|proc|root|sbin|sys|usr|var|home)(/|\b)',
+  '\brm\s+-rf\s+~(/|\s|$)',
+  '/etc/fstab', '/boot(/|\b)', ':\(\)\s*\{', '\bshutdown\b', '\breboot\b',
+]
+
+critical = [
+  '\bsudo\b', '\bsu\b', '\bchown\b\s+-R', '\bchmod\b\s+-R',
+  'git\s+push\s+.*--force', '\bpasswd\b', '\buserdel\b', '\bvisudo\b',
+  '\.ssh/', '\.gnupg/', 'credential', 'id_rsa', 'id_ed25519',
+]
+
+confirm = [
+  '\bpip\s+install\b', '\buv\s+pip\s+install\b', '\bdnf\b', '\bapt\b',
+  '\bsystemctl\b', '\bkill\b', '\bpkill\b', '\bcurl\b.*-o', '\bwget\b',
+]
+
+safe = [
+  '^\s*ls\b', '^\s*cat\b', '^\s*grep\b', '^\s*find\b', '^\s*echo\b',
+  '^\s*pactl\b', '^\s*playerctl\b', '^\s*xdg-open\b',
+]
