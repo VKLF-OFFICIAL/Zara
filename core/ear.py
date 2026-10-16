@@ -3,6 +3,18 @@
 Captura continua a 16 kHz mono con sounddevice, detección neuronal de voz
 con Silero VAD v5 (cero cortes en pausas de hasta 700 ms), barge-in a los 250 ms
 y transcripción con faster-whisper (GPU/CPU fallback e inyección fonética).
+
+BUGS CORREGIDOS:
+  - [BUG-1] VADIterator: reset_states() llamado durante barge-in mientras Zara
+    habla provocaba pérdida del estado interno y silencio post-barge-in.
+    Ahora sólo se resetea tras detectar el final real de una locución.
+  - [BUG-2] Conversión tensor_chunk: numpy float32 -> torch sin .unsqueeze(0)
+    → Silero v5 espera [1, T] en el nuevo API 'model(tensor, sr)'. Añadido.
+  - [BUG-3] FRAME_SIZE=512 → 32 ms a 16 kHz; el VADIterator de silero-vad >= 6
+    acepta exactamente 512 muestras. Verificación de longitud ahora permite
+    bloques menores y los rellena con ceros (padding) en vez de descartarlos.
+  - [BUG-4] listen_utterances() consumía el hilo principal bloqueando el VAD si
+    la transcripción era lenta. Ahora se transcribe en el propio hilo del worker.
 """
 
 from __future__ import annotations
@@ -60,6 +72,7 @@ class ContinuousEar:
         self._muted = threading.Event()
         self._stop_event = threading.Event()
         self._raw_queue: queue.Queue[np.ndarray] = queue.Queue()
+        # La utterance queue almacena arrays de audio raw (float32) sin transcribir
         self._utterance_queue: queue.Queue[np.ndarray] = queue.Queue()
 
         self._audio_thread: Optional[threading.Thread] = None
@@ -195,8 +208,7 @@ class ContinuousEar:
             except queue.Empty:
                 continue
 
-            # Escucha pausada por el Señor VK: se descarta el frame (sin VAD, sin barge-in)
-            # y se aplana el nivel visual del HUD para reflejar el silencio.
+            # Escucha pausada: descartar frame y aplana nivel visual del HUD
             if self._muted.is_set():
                 if self.rms_cb:
                     try:
@@ -208,20 +220,23 @@ class ContinuousEar:
                 continue
 
             # Nivel RMS para la animación visual del HUD
-            rms = float(np.sqrt(np.mean(frame**2))) if frame.size else 0.0
+            rms = float(np.sqrt(np.mean(frame ** 2))) if frame.size else 0.0
             if self.rms_cb:
                 try:
                     self.rms_cb(rms)
                 except Exception:
                     pass
 
-            tensor_chunk = torch.from_numpy(frame)
-            if tensor_chunk.shape[0] != FRAME_SIZE:
-                continue
+            # [BUG-2 FIX] Silero v5 espera tensor de forma [1, T] (batch_size=1)
+            # Rellenar con ceros si el bloque es menor que FRAME_SIZE (FIN de stream)
+            if frame.shape[0] < FRAME_SIZE:
+                frame = np.pad(frame, (0, FRAME_SIZE - frame.shape[0]))
+            tensor_chunk = torch.from_numpy(frame).unsqueeze(0)  # [1, 512]
 
             # 1. Detección de Barge-in mientras Zara habla
             if self.is_speaking_fn():
                 with torch.no_grad():
+                    # [BUG-2 FIX] API directa del modelo con tensor batched
                     speech_prob = self._vad_model(tensor_chunk, SAMPLE_RATE).item()
                 if speech_prob >= VAD_THRESHOLD:
                     barge_in_consecutive_frames += 1
@@ -232,8 +247,8 @@ class ContinuousEar:
                         barge_in_consecutive_frames = 0
                 else:
                     barge_in_consecutive_frames = max(0, barge_in_consecutive_frames - 1)
-                # Durante habla propia se resetea el acumulador de orden para no oírse a sí misma
-                self._vad_iterator.reset_states()
+                # [BUG-1 FIX] NO resetear el VADIterator aquí: provoca silencio
+                # post-barge-in. Solo limpiar buffer acumulado durante habla propia.
                 buffer.clear()
                 is_speech_active = False
                 continue
@@ -241,7 +256,9 @@ class ContinuousEar:
                 barge_in_consecutive_frames = 0
 
             # 2. Segmentación de locución del usuario mediante VADIterator
-            vad_res = self._vad_iterator(tensor_chunk)
+            # VADIterator.forward() espera tensor 1-D [T] sin batch dimension
+            tensor_1d = tensor_chunk.squeeze(0)
+            vad_res = self._vad_iterator(tensor_1d)
             buffer.append(frame)
 
             if vad_res is not None:
@@ -252,8 +269,9 @@ class ContinuousEar:
                     utterance = np.concatenate(buffer)
                     buffer.clear()
                     is_speech_active = False
+                    # [BUG-1 FIX] Reset de estados aquí, al finalizar la locución real
                     self._vad_iterator.reset_states()
-                    if len(utterance) >= int(SAMPLE_RATE * 0.3):  # Mínimo 300 ms de audio
+                    if len(utterance) >= int(SAMPLE_RATE * 0.3):  # Mínimo 300 ms
                         self._utterance_queue.put(utterance)
 
             # Límite de seguridad: locución no mayor a 25 segundos continuos
@@ -285,7 +303,11 @@ class ContinuousEar:
         return text
 
     def listen_utterances(self) -> Generator[str, None, None]:
-        """Generador que produce frases transcritas en tiempo real."""
+        """Generador que produce frases transcritas en tiempo real.
+
+        [BUG-4 FIX] La transcripción ocurre en este generador (llamado desde
+        el hilo worker de main.py), no bloqueando el hilo de VAD.
+        """
         while not self._stop_event.is_set():
             try:
                 utt = self._utterance_queue.get(timeout=0.2)

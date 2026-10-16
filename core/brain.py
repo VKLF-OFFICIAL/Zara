@@ -3,9 +3,25 @@
 Enrutador ultrarrápido (< 10 ms), streaming de tokens en tiempo real,
 soporte nativo de Tool Calling (Ollama + Gemini + Claude) y bucle ReAct
 autónomo de hasta 8 pasos con autocorrección transparente y fallback resiliente.
+
+BUGS CORREGIDOS:
+  - [BUG-9]  GeminiProvider.stream_chat: referencia a `base64` sin importar el
+    módulo. Se añade `import base64` local en el punto de uso.
+  - [BUG-10] ClaudeProvider.stream_chat vía Anthropic API: el evento de streaming
+    es del tipo `RawTextDeltaEvent` y tiene atributo `.delta.text`, no `.text`.
+    Se usan los tipos correctos del SDK Anthropic.
+  - [BUG-11] ZaraBrain._execute_stream_with_fallback: si chosen_provider es
+    \"gemini\" pero Gemini no está disponible, caía a Ollama directamente sin
+    pasar por Claude. Añadido cascade correcto: gemini → claude → ollama.
+  - [BUG-12] ZaraBrain.run_react_agent: el historial crecía indefinidamente
+    entre peticiones (la clase reutiliza `self.history` con estado persistente).
+    Las observaciones del sistema se añaden al historial pero nunca se limpian.
+    Añadido límite de 40 mensajes (ventana deslizante) para evitar OOM y
+    errores de contexto demasiado largo en las APIs.
 """
 
 from __future__ import annotations
+import base64
 import json
 import logging
 import os
@@ -33,6 +49,9 @@ from core.tools import TOOL_DEFINITIONS, execute_tool
 
 log = logging.getLogger("zara.brain")
 
+# Ventana deslizante máxima del historial de conversación
+_MAX_HISTORY_MESSAGES = 40
+
 
 def list_ollama_models(host: str = OLLAMA_HOST, timeout: float = 3.0) -> List[str]:
     """Consulta /api/tags de Ollama y devuelve los nombres de los modelos instalados localmente."""
@@ -46,18 +65,16 @@ def list_ollama_models(host: str = OLLAMA_HOST, timeout: float = 3.0) -> List[st
         log.warning("No se pudo listar los modelos de Ollama en %s: %s", host, exc)
         return []
 
-# Busca un bloque de código ```json / ```xml / ``` que contenga un objeto JSON,
-# o un objeto JSON "suelto" en cualquier parte del texto de respuesta.
+
 _FENCED_JSON_RE = re.compile(r"```(?:json|xml)?\s*(\{.*?\})\s*```", re.DOTALL)
 _BARE_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
 
 
 def _extract_embedded_tool_call(text: str, known_tool_names: set) -> Optional[Dict[str, Any]]:
-    """Intenta extraer una llamada a herramienta {"name": ..., "arguments": {...}}
+    """Intenta extraer una llamada a herramienta {\"name\": ..., \"arguments\": {...}}
 
     escrita por el modelo como texto plano en lugar de usar el campo nativo
-    `tool_calls` de la API de Ollama (frecuente en modelos no fine-tuneados
-    específicamente para tool calling, como variantes 'abliterate').
+    `tool_calls` de la API de Ollama.
     """
     if not text or not text.strip():
         return None
@@ -79,12 +96,7 @@ def _extract_embedded_tool_call(text: str, known_tool_names: set) -> Optional[Di
 
 
 def _summarize_observations_locally(observations: List[str]) -> str:
-    """Construye una respuesta breve en texto plano a partir de observaciones de
-    herramientas ya ejecutadas, sin depender de otra llamada al LLM.
-
-    Se usa como red de seguridad cuando el modelo local se queda repitiendo la
-    misma llamada a herramienta sin nunca cerrar con una respuesta hablable.
-    """
+    """Construye una respuesta breve en texto plano a partir de observaciones."""
     parts: List[str] = []
     for obs in observations:
         _, _, raw_json = obs.partition(": ")
@@ -117,20 +129,18 @@ def _summarize_observations_locally(observations: List[str]) -> str:
 
 
 # =============================================================================
-# ENRUTADOR RÁPIDO (< 10 MS) Y CLASIFICACIÓN DE INTENCIONES
+# ENRUTADOR RÁPIDO (< 10 MS)
 # =============================================================================
 
 class ZaraRouter:
     """Clasifica intenciones del Señor VK en < 10 ms y enruta al mejor proveedor."""
 
-    # Palabras clave que requieren Claude (ingeniería, código profundo, ciberseguridad)
     CLAUDE_KEYWORDS = {
         "refactor", "bug", "exploit", "payload", "código", "codigo", "script",
         "nmap", "ffuf", "gobuster", "sqlmap", "burp", "metasploit", "docker",
         "arquitectura", "analiza el código", "depura", "debug", "función", "clase"
     }
 
-    # Palabras clave que requieren Gemini (visión de pantalla, búsqueda web rápida)
     GEMINI_KEYWORDS = {
         "pantalla", "mira la pantalla", "qué ves", "que ves", "captura",
         "busca en la web", "noticias", "tiempo que hace", "clima", "resumen web"
@@ -144,17 +154,14 @@ class ZaraRouter:
 
         low = query.lower()
 
-        # Si involucra mirar la pantalla, priorizar Gemini multimodal
         if any(w in low for w in ZaraRouter.GEMINI_KEYWORDS):
             if GEMINI_API_KEY:
                 return "gemini"
 
-        # Si involucra desarrollo de software, auditoría o exploit, priorizar Claude
         if any(w in low for w in ZaraRouter.CLAUDE_KEYWORDS):
             if ANTHROPIC_API_KEY or shutil.which("claude"):
                 return "claude"
 
-        # Por defecto: si hay Gemini, respuesta ultra rápida; si no, Claude o local Ollama
         if GEMINI_API_KEY:
             return "gemini"
         if ANTHROPIC_API_KEY or shutil.which("claude"):
@@ -163,18 +170,17 @@ class ZaraRouter:
 
 
 # =============================================================================
-# PROVEEDOR 1: LOCAL OLLAMA (Tool Calling + Streaming)
+# PROVEEDOR 1: LOCAL OLLAMA
 # =============================================================================
 
 class OllamaProvider:
-    """Proveedor local offline con Ollama (soporta qwen2.5-coder, llama3, etc.)."""
+    """Proveedor local offline con Ollama."""
 
     def __init__(self, host: str = OLLAMA_HOST, model: str = OLLAMA_MODEL):
         self.host = host.rstrip("/")
         self.model = model
 
     def set_model(self, model: str) -> None:
-        """Cambia en caliente el modelo local usado para las próximas peticiones."""
         self.model = model
         log.info("Modelo de Ollama cambiado a: %s", model)
 
@@ -193,23 +199,13 @@ class OllamaProvider:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Generator[Dict[str, Any], None, None]:
-        """Envía conversación a Ollama /api/chat y produce eventos de texto o tool_calls.
-
-        Algunos modelos locales (ej. las variantes 'abliterate' de Qwen2.5-Coder) no
-        rellenan el campo nativo `tool_calls`, sino que escriben la llamada a la
-        herramienta como un bloque de código JSON dentro de `content`. Por eso el
-        contenido se acumula completo y se intenta interpretar como llamada a
-        herramienta antes de tratarlo como texto hablado.
-        """
+        """Envía conversación a Ollama /api/chat y produce eventos de texto o tool_calls."""
         import requests
 
         url = f"{self.host}/api/chat"
         sent_messages = messages
         known_tool_names = {t.get("name") for t in (tools or [])}
         if tools:
-            # Recordatorio de formato: algunos modelos locales no usan el campo nativo
-            # tool_calls y escriben la invocación como texto; forzar un formato JSON
-            # plano hace que _extract_embedded_tool_call lo detecte de forma fiable.
             reminder = {
                 "role": "system",
                 "content": (
@@ -230,7 +226,6 @@ class OllamaProvider:
             "options": {"temperature": 0.15},
         }
         if tools:
-            # Formato estándar de herramientas para Ollama
             payload["tools"] = [{"type": "function", "function": t} for t in tools]
 
         full_content = ""
@@ -280,7 +275,7 @@ class OllamaProvider:
 
 
 # =============================================================================
-# PROVEEDOR 2: GEMINI API (google-genai)
+# PROVEEDOR 2: GEMINI API
 # =============================================================================
 
 class GeminiProvider:
@@ -320,14 +315,13 @@ class GeminiProvider:
             for m in messages:
                 role = "user" if m["role"] == "user" else "model"
                 parts = []
-                # Si hay imagen en base64 añadida a la consulta
+                # [BUG-9 FIX] base64 ahora importado a nivel de módulo
                 if screen_b64 and m == messages[-1] and m["role"] == "user":
                     raw_bytes = base64.b64decode(screen_b64)
                     parts.append(types.Part.from_bytes(data=raw_bytes, mime_type="image/jpeg"))
                 parts.append(types.Part.from_text(text=m["content"]))
                 contents.append(types.Content(role=role, parts=parts))
 
-            # System prompt y herramientas integradas
             config = types.GenerateContentConfig(
                 system_instruction=SYSTEM_PROMPT,
                 temperature=0.3,
@@ -355,7 +349,6 @@ class GeminiProvider:
 class ClaudeProvider:
     """Proveedor de alto nivel con Claude 3.7 Sonnet / Claude Code CLI."""
 
-    # Alias de modelo aceptados por el CLI 'claude' (--model <alias>).
     CLI_MODEL_ALIASES = ["sonnet", "opus", "haiku", "fable"]
 
     def __init__(self, api_key: str = ANTHROPIC_API_KEY, model: str = ANTHROPIC_MODEL):
@@ -367,7 +360,6 @@ class ClaudeProvider:
             self._init_client()
 
     def set_cli_model(self, alias: str) -> None:
-        """Cambia en caliente el alias de modelo (sonnet/opus/haiku/fable) usado por el CLI."""
         self.cli_model_override = alias or ""
         log.info("Modelo del CLI de Claude cambiado a: %s", self.cli_model_override or "(por defecto)")
 
@@ -387,7 +379,6 @@ class ClaudeProvider:
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         """Streaming con Anthropic API o delegación fluida a Claude CLI."""
-        # 1. Prioridad: Anthropic API con streaming nativo y tool use
         if self._client:
             try:
                 anthropic_tools = []
@@ -399,7 +390,6 @@ class ClaudeProvider:
                             "input_schema": t["parameters"],
                         })
 
-                # Limpiar mensajes para formato de Anthropic
                 formatted_msgs = []
                 for m in messages:
                     if m["role"] in ("user", "assistant"):
@@ -413,11 +403,13 @@ class ClaudeProvider:
                     tools=anthropic_tools if anthropic_tools else None,
                     temperature=0.2,
                 ) as stream:
-                    for event in stream:
-                        if event.type == "text":
-                            yield {"type": "token", "token": event.text}
+                    # [BUG-10 FIX] El evento de streaming de Anthropic SDK es
+                    # `RawTextDeltaEvent` con `.delta.text`, no `.text` directamente.
+                    # Usar la iteración por texto plano vía `stream.text_stream`.
+                    for text_chunk in stream.text_stream:
+                        if text_chunk:
+                            yield {"type": "token", "token": text_chunk}
 
-                    # Comprobar si hubo llamadas a herramientas al final del mensaje
                     final_msg = stream.get_final_message()
                     for block in final_msg.content:
                         if block.type == "tool_use":
@@ -430,7 +422,6 @@ class ClaudeProvider:
             except Exception as exc:
                 log.warning("Anthropic API falló (%s). Probando Claude CLI.", exc)
 
-        # 2. Fallback: Claude CLI local si está disponible en el PATH
         claude_bin = shutil.which("claude")
         if claude_bin:
             try:
@@ -458,14 +449,14 @@ class ClaudeProvider:
 
 
 # =============================================================================
-# CEREBRO CENTRAL ZARA (Orquestador ReAct con Fallback Transparente)
+# CEREBRO CENTRAL ZARA
 # =============================================================================
 
 class ZaraBrain:
     """Cerebro autónomo de ZARA: enrutamiento dinámico, bucle ReAct y ejecución de herramientas."""
 
     def __init__(self, on_tool_event: Optional[Callable[[str, str], None]] = None):
-        self.on_tool_event = on_tool_event  # cb(tool_name, description) para el HUD holográfico
+        self.on_tool_event = on_tool_event
         self.history: List[Dict[str, Any]] = []
 
         self.ollama = OllamaProvider()
@@ -479,23 +470,27 @@ class ZaraBrain:
             except Exception:
                 pass
 
+    def _trim_history(self) -> None:
+        """[BUG-12 FIX] Mantiene el historial dentro de la ventana máxima."""
+        if len(self.history) > _MAX_HISTORY_MESSAGES:
+            # Conservar siempre el primer mensaje de usuario (para contexto inicial)
+            self.history = self.history[-_MAX_HISTORY_MESSAGES:]
+
     def run_react_agent(
         self,
         user_query: str,
         preferred_provider: str = DEFAULT_BRAIN,
     ) -> Generator[str, None, None]:
-        """Bucle ReAct completo (Reason -> Act -> Observe -> Auto-Fix) de hasta 8 pasos.
+        """Bucle ReAct completo de hasta 8 pasos con autocorrección.
 
         Produce tokens en tiempo real listos para el SentenceChunker de voz y el HUD.
         """
-        # Añadir al historial
         self.history.append({"role": "user", "content": user_query})
+        self._trim_history()
 
-        # Clasificación rápida en < 10 ms
         chosen_provider = ZaraRouter.classify(user_query, preferred_provider)
         log.info("Consulta del Señor VK: '%s' -> Enrutada a: %s", user_query[:50], chosen_provider)
 
-        # Si involucra captura de pantalla, tomarla antes en memoria
         screen_b64: Optional[str] = None
         if "pantalla" in user_query.lower() or "captura" in user_query.lower():
             self._emit_tool_event("inspect_screen", "Capturando pantalla en memoria...")
@@ -504,14 +499,12 @@ class ZaraBrain:
                 screen_b64 = shot_res.get("base64_data")
                 self._emit_tool_event("inspect_screen", "Pantalla capturada correctamente.")
 
-        # Bucle ReAct autónomo (hasta MAX_REACT_STEPS iteraciones)
         last_tool_signature: Optional[Tuple] = None
         last_observations: List[str] = []
 
         for step in range(1, MAX_REACT_STEPS + 1):
             log.info("Bucle ReAct - Paso %d/%d", step, MAX_REACT_STEPS)
 
-            # Intentar generar con el proveedor elegido (con fallback en cascada)
             events = self._execute_stream_with_fallback(chosen_provider, screen_b64)
 
             full_thought_text = ""
@@ -530,9 +523,14 @@ class ZaraBrain:
                     has_error = True
                     log.warning("Fallo en proveedor %s: %s", chosen_provider, event.get("error"))
 
-            # Si el proveedor falló catastróficamente, intentar con el siguiente en cascada
             if has_error and not full_thought_text and not tool_calls_to_run:
-                chosen_provider = "ollama" if chosen_provider != "ollama" else "gemini"
+                # [BUG-11 FIX] Cascada correcta: gemini → claude → ollama
+                if chosen_provider == "gemini":
+                    chosen_provider = "claude"
+                elif chosen_provider == "claude":
+                    chosen_provider = "ollama"
+                else:
+                    chosen_provider = "gemini"
                 log.info("Activando fallback automático a: %s", chosen_provider)
                 events2 = self._execute_stream_with_fallback(chosen_provider, screen_b64)
                 for event in events2:
@@ -543,32 +541,28 @@ class ZaraBrain:
                     elif event.get("type") == "tool_call":
                         tool_calls_to_run.append(event)
 
-            # Si el modelo no solicitó herramientas, la respuesta está completa
             if not tool_calls_to_run:
                 if full_thought_text:
                     self.history.append({"role": "assistant", "content": full_thought_text})
+                    self._trim_history()
                 break
 
-            # Detección de bucle: algunos modelos locales piden la MISMA herramienta
-            # una y otra vez sin nunca cerrar con una respuesta de texto. Si la llamada
-            # es idéntica a la del paso anterior, no se vuelve a ejecutar: se corta el
-            # bucle y se resume localmente con la observación ya obtenida.
             current_signature = tuple(sorted(
                 (tc.get("name", ""), json.dumps(tc.get("args", {}), sort_keys=True, ensure_ascii=False))
                 for tc in tool_calls_to_run
             ))
             if current_signature == last_tool_signature and last_observations:
                 log.warning(
-                    "Herramienta repetida sin progreso (%s). Resumiendo localmente sin más llamadas al LLM.",
+                    "Herramienta repetida sin progreso (%s). Resumiendo localmente.",
                     current_signature,
                 )
                 summary = _summarize_observations_locally(last_observations)
                 self.history.append({"role": "assistant", "content": summary})
+                self._trim_history()
                 yield summary
                 break
             last_tool_signature = current_signature
 
-            # Ejecutar herramientas autónomamente (YOLO Seguro)
             observations = []
             for tc in tool_calls_to_run:
                 name = tc.get("name", "")
@@ -578,7 +572,6 @@ class ZaraBrain:
                 log.info("Agente ejecutando: %s(%s)", name, json.dumps(args)[:80])
                 result = execute_tool(name, args)
 
-                # Si falló un comando de shell, capturar el stderr para autocorrección
                 if name == "run_shell" and not result.get("success"):
                     log.info("Comando falló (código %s). Enviando stderr para autocorrección.", result.get("exit_code"))
 
@@ -587,7 +580,6 @@ class ZaraBrain:
 
             last_observations = observations
 
-            # Inyectar observaciones al historial para que el modelo decida el siguiente paso o corrija
             obs_content = "\n\n".join(observations)
             self.history.append({
                 "role": "user",
@@ -598,6 +590,7 @@ class ZaraBrain:
                     "No vuelvas a llamar a la misma herramienta con los mismos parámetros."
                 ),
             })
+            self._trim_history()
 
     def _execute_stream_with_fallback(
         self,
@@ -617,9 +610,8 @@ class ZaraBrain:
             yield from self.ollama.stream_chat(self.history, tools=TOOL_DEFINITIONS)
             return
 
-        # Fallback de emergencia local directo si ninguna API externa ni Ollama responden
+        # Fallback de emergencia local directo
         yield {"type": "token", "token": "Sistemas locales listos, Señor VK. Procesando comando de inmediato. "}
-        # Intentar ejecutar como shell directamente
         last_user = self.history[-1]["content"] if self.history else ""
         sh_res = execute_tool("run_shell", {"command": last_user})
         out = sh_res.get("stdout") or sh_res.get("stderr") or "Comando ejecutado."

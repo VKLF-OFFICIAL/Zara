@@ -2,6 +2,20 @@
 
 Streaming por frases (Sentence Chunking), TTS dual (Kokoro-ONNX local + EdgeTTS en RAM),
 cero escritura en disco para latencia mínima y capacidad de interrupción inmediata (Barge-in).
+
+BUGS CORREGIDOS:
+  - [BUG-5] EdgeTTSEngine: uso incorrecto de asyncio.get_event_loop() en Python >=3.10
+    lanza DeprecationWarning y en hilos secundarios lanza RuntimeError. Reemplazado
+    por asyncio.new_event_loop() con gestión explícita del bucle.
+  - [BUG-6] _playback_worker: sd.get_stream() lanza RuntimeError si sounddevice
+    no tiene stream activo aún. Protegido con try/except.
+  - [BUG-7] VoiceSynthesizer.stop() vaciaba la cola de TTS pero NO establecía
+    _is_speaking=False antes de que el worker notara el cambio, provocando que el
+    HUD se quedara en estado SPEAKING tras un barge-in. Corregido: la actualización
+    del estado ocurre atómicamente antes de vaciar la cola.
+  - [BUG-8] SentenceChunker: el bucle interno en push() podía entrar en bucle
+    infinito si el buffer nunca decrece (ej. texto sin delimitadores con coma
+    que forman candidato largo). Añadido guard de progreso.
 """
 
 from __future__ import annotations
@@ -64,8 +78,9 @@ class SentenceChunker:
         self._buffer += token
         ready: List[str] = []
 
+        # [BUG-8 FIX] Track buffer length before each iteration to detect no-progress
         while True:
-            # Buscar el primer delimitador en el buffer
+            prev_len = len(self._buffer)
             match = self.DELIMITERS.search(self._buffer)
             if not match:
                 break
@@ -90,6 +105,10 @@ class SentenceChunker:
                     self._buffer = self._buffer[new_end:].lstrip()
                 else:
                     break
+
+            # [BUG-8 FIX] Guard: si el buffer no decreció, romper para evitar bucle infinito
+            if len(self._buffer) >= prev_len:
+                break
 
         return ready
 
@@ -167,15 +186,14 @@ class EdgeTTSEngine:
             return bytes(buf)
 
         try:
-            # Ejecutar en bucle asíncrono seguro
+            # [BUG-5 FIX] Crear siempre un nuevo event loop aislado para este hilo.
+            # asyncio.get_event_loop() está deprecado en Python >=3.10 en hilos
+            # que no son el principal y lanza RuntimeError en algunos entornos.
+            loop = asyncio.new_event_loop()
             try:
-                loop = asyncio.get_event_loop()
-                if loop.is_running():
-                    mp3_bytes = asyncio.run_coroutine_threadsafe(_fetch(), loop).result(timeout=15.0)
-                else:
-                    mp3_bytes = loop.run_until_complete(_fetch())
-            except RuntimeError:
-                mp3_bytes = asyncio.run(_fetch())
+                mp3_bytes = loop.run_until_complete(_fetch())
+            finally:
+                loop.close()
 
             if not mp3_bytes:
                 return None
@@ -212,7 +230,22 @@ class VoiceSynthesizer:
             return self._is_speaking
 
     def stop(self) -> None:
-        """Interrupción inmediata (Barge-in): detiene el audio y vacía la cola."""
+        """Interrupción inmediata (Barge-in): detiene el audio y vacía la cola.
+
+        [BUG-7 FIX] Actualizar _is_speaking=False ANTES de llamar sd.stop() y
+        vaciar la cola, para que el worker no emita on_state_change(False)
+        redundantemente después de que nosotros ya lo hemos hecho.
+        """
+        with self._lock:
+            if self._is_speaking:
+                self._is_speaking = False
+                if self.on_state_change:
+                    try:
+                        self.on_state_change(False)
+                    except Exception:
+                        pass
+
+        # Detener reproducción actual
         try:
             sd.stop()
         except Exception:
@@ -225,14 +258,6 @@ class VoiceSynthesizer:
             except queue.Empty:
                 break
 
-        with self._lock:
-            if self._is_speaking:
-                self._is_speaking = False
-                if self.on_state_change:
-                    try:
-                        self.on_state_change(False)
-                    except Exception:
-                        pass
         log.info("Reproducción de voz abortada por Barge-in.")
 
     def say(self, text: str) -> None:
@@ -301,10 +326,17 @@ class VoiceSynthesizer:
 
             try:
                 sd.play(samples, samplerate=sr)
-                # Esperar a que termine de sonar, comprobando periódicamente si hubo Barge-in
-                while sd.get_stream() and sd.get_stream().active:
+                # [BUG-6 FIX] sd.get_stream() lanza RuntimeError si no hay stream;
+                # usar sd.wait() con intervalo de polling manual es más seguro.
+                while True:
                     if not self._is_speaking or self._stop_event.is_set():
                         sd.stop()
+                        break
+                    try:
+                        stream = sd.get_stream()
+                        if stream is None or not stream.active:
+                            break
+                    except RuntimeError:
                         break
                     time.sleep(0.02)
             except Exception as exc:
