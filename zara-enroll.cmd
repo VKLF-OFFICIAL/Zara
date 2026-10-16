@@ -1,3 +1,3 @@
 @echo off
-cd /d "%~dp0app"
-uv run --python 3.12 python -m zara.enroll
+cd /d "%~dp0"
+powershell -NoProfile -ExecutionPolicy Bypass -File "%~dp0setup_and_run.ps1" -Enroll %*

@@ -8,4 +8,5 @@ testpaths = ["tests"]
 pythonpath = ["."]
 
 [tool.setuptools]
-packages = ["zara", "zara.guardian"]
+packages = ["zara", "zara.audio", "zara.brain", "zara.guardian",
+            "zara.memory", "zara.voice", "zara.ui"]

@@ -1,11 +1,12 @@
 from __future__ import annotations
 import json
+import os
 import urllib.request
 from .registry import BrainRegistry
-from .ollama import OllamaBrain
+from .native import NativeGemini, NativeAnthropic, NativeOllama
 from .cli import ClaudeBrain, GeminiBrain
 
-_HOST = "http://localhost:11434"
+_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
 
 
 def _ollama_models(host: str = _HOST) -> list[str]:
@@ -19,28 +20,35 @@ def _ollama_models(host: str = _HOST) -> list[str]:
 
 def build_registry(persona: str = "", host: str = _HOST,
                    claude_model: str | None = None,
-                   claude_mode: str = "consulta",
+                   claude_mode: str = "agente",
                    claude_workdir: str | None = None,
-                   mcp_config: str | None = None) -> BrainRegistry:
-    """Crea el registro de cerebros: Claude y Gemini + locales Ollama.
+                   mcp_config: str | None = None,
+                   cli_fallback: bool = False) -> BrainRegistry:
+    """Crea el registro de cerebros. Por defecto, SOLO adaptadores NATIVOS en
+    memoria (SDK, Tool Calling): no hay ninguna dependencia de subproceso a los
+    CLI de consola de Claude/Gemini.
 
-    El orden determina el activo por defecto (primer disponible): Claude primero.
-    Gemini solo aparece si es utilizable (ver GeminiBrain.available).
+    Orden (define el activo por defecto = primer disponible):
+      1. Gemini nativo (google-genai)  — respuesta instantánea y enrutamiento.
+      2. Claude nativo (AsyncAnthropic).
+      3. Ollama nativo (/api/chat con herramientas) por cada modelo local.
+
+    `cli_fallback=True` (opcional, desactivado por defecto) añade al final el
+    agente Claude CLI y, si procede, el Gemini CLI, como RED DE SEGURIDAD para
+    equipos sin claves de API. Nunca se usa si hay un nativo disponible.
     """
-    # Dos Claude: «claude» rápido (consulta con haiku, por defecto) y «agente»
-    # (control total, modelo potente). Zara pasa al agente automáticamente
-    # cuando la petición es una tarea.
-    fast = ClaudeBrain(system=persona, model=claude_model or "haiku", mode="consulta")
-    brains = [fast]
-    agente = ClaudeBrain(system=persona, model=claude_model, mode="agente",
-                         workdir=claude_workdir, mcp_config=mcp_config)
-    agente.name = "agente"
-    brains.append(agente)
-    gemini = GeminiBrain(system=persona)
-    if gemini.available():
-        brains.append(gemini)
+    brains: list = [NativeGemini(system=persona), NativeAnthropic(system=persona)]
     for name in _ollama_models(host):
-        # Inyectamos SIEMPRE la persona de Zara como system (sobrescribe la del
-        # modelfile) para que la identidad sea coherente en todos los cerebros.
-        brains.append(OllamaBrain(name, system=persona, host=host))
+        brains.append(NativeOllama(name, system=persona, host=host))
+
+    if cli_fallback:
+        agente = ClaudeBrain(system=persona, model=claude_model, mode="agente",
+                             workdir=claude_workdir, mcp_config=mcp_config)
+        agente.name = "agente"
+        brains.append(agente)
+        gemini_cli = GeminiBrain(system=persona)
+        if gemini_cli.available():
+            gemini_cli.name = "gemini-cli"
+            brains.append(gemini_cli)
+
     return BrainRegistry(brains)

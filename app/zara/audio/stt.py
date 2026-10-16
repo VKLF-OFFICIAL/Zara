@@ -49,15 +49,30 @@ _HALLUCINATIONS = (
     "hasta la próxima", "hasta la proxima"
 )
 
+# initial_prompt rico en FONÉTICA DEL SUR DE ESPAÑA (Granada/Andalucía) para que
+# Whisper no falle aunque el Señor VK hable rápido, aspire o elida las «s» finales
+# («lo comando», «do minuto», «pa» por «para», «ehtao» por «estado»...), más el
+# vocabulario técnico de administración de sistemas y pentesting.
 _DEFAULT_PROMPT = (
-    "Zara, asistente virtual inteligente y leal para el Señor VK, inspirada en JARVIS. "
-    "Comandos de voz: música en Spotify, volumen, silenciar, abrir aplicaciones, "
-    "navegador web, terminal, capturas de pantalla, estado del equipo, recordatorios y consultas."
+    "Conversación técnica en español de Andalucía (Granada) con el Señor VK. "
+    "El hablante aspira o elide las eses finales y habla rápido, pero se escribe "
+    "en español estándar correcto. Nombres y términos frecuentes: "
+    "Zara, Señor, Señor VK, VK, VKLF, Jarvis. "
+    "Terminal, bash, shell, sudo, systemctl, servicio, daemon, dnf, apt, pip, uv, "
+    "git, commit, push, pull, rama, docker, contenedor, imagen, kubectl, ssh, "
+    "nmap, ffuf, gobuster, dirb, nikto, sqlmap, hydra, hashcat, john, metasploit, "
+    "msfconsole, burp suite, wireshark, payload, exploit, shell inversa, puerto, "
+    "escaneo, directorio, fichero, archivo, proceso, kernel, Fedora, Kali, KDE, "
+    "Plasma, Wayland, Ollama, Claude, Gemini, Python, repositorio, script. "
+    "Comandos de voz: pon música en Spotify, sube o baja el volumen, silencia, "
+    "abre el navegador, haz una captura, estado del equipo, pon un recordatorio."
 )
 
 _DEFAULT_HOTWORDS = (
-    "Zara Señor VK Jarvis Spotify YouTube Chrome Firefox volumen música "
-    "pantalla captura terminal silencio reproduce pausa abre cierra"
+    "Zara Señor VK VKLF Jarvis terminal bash sudo systemctl dnf apt pip uv git "
+    "docker ssh nmap ffuf gobuster sqlmap hydra hashcat metasploit payload exploit "
+    "puerto directorio Fedora Kali KDE Ollama Claude Gemini Spotify YouTube Firefox "
+    "volumen música pantalla captura silencio reproduce pausa abre cierra"
 )
 
 
@@ -67,14 +82,18 @@ class Transcriber:
     def __init__(self, model_size: str = "small", language: str = "es",
                  device: str = "cpu", compute_type: str = "int8",
                  download_root: str = _MODEL_DIR,
-                 beam_size: int = 3, best_of: int = 3,
+                 beam_size: int = 2, best_of: int = 2,
+                 cpu_threads: int = 8, num_workers: int = 1,
                  initial_prompt: str | None = None,
                  hotwords: str | None = None):
         self.model_size = model_size
         self.language = language
         self._device = device
+        # CPU de 12 núcleos sin GPU: int8 + 8 hilos es el punto dulce de latencia.
         self._compute_type = compute_type
         self._download_root = download_root
+        self._cpu_threads = cpu_threads
+        self._num_workers = num_workers
         self.beam_size = beam_size
         self.best_of = best_of
         self.initial_prompt = initial_prompt or _DEFAULT_PROMPT
@@ -84,10 +103,14 @@ class Transcriber:
     def _ensure(self):
         if self._model is None:
             from faster_whisper import WhisperModel
+            kwargs = {}
+            if self._device == "cpu":
+                kwargs["cpu_threads"] = self._cpu_threads
+                kwargs["num_workers"] = self._num_workers
             self._model = WhisperModel(
                 self.model_size, device=self._device,
                 compute_type=self._compute_type,
-                download_root=self._download_root,
+                download_root=self._download_root, **kwargs,
             )
         return self._model
 

@@ -1,26 +1,67 @@
 # Reglas del Guardián de Zara. Orden de severidad: blocked > critical > confirm > safe.
 # Los patrones son expresiones regulares (regex) aplicadas al comando o a las rutas.
+#
+# FILOSOFÍA (Señor VK: administrador de sistemas y pentester):
+#   Zara trabaja en modo JARVIS autónomo. NO interrumpe pidiendo confirmación para
+#   la administración cotidiana del equipo. Solo tres niveles importan de verdad:
+#     • safe    → ejecución directa y silenciosa (el 99% del trabajo diario).
+#     • confirm → solo lo que puede perder datos fuera del espacio de trabajo.
+#     • blocked → catastrófico e irreversible. Jamás se ejecuta.
+#   El nivel "critical" se reserva para credenciales/claves (exige copia + registro).
 
+# -- BLOQUEADO: destrucción catastrófica e irreversible. Nunca se ejecuta. -----
 blocked = [
-  '\bmkfs\b', '\bdd\s+if=',
-  '\brm\s+-rf\s+/\s*(\*|$)',
-  '\brm\s+-rf\s+/(bin|boot|dev|etc|lib|lib64|proc|root|sbin|sys|usr|var|home)(/|\b)',
-  '\brm\s+-rf\s+~(/|\s|$)',
-  '/etc/fstab', '/boot(/|\b)', ':\(\)\s*\{', '\bshutdown\b', '\breboot\b',
+  '\bmkfs(\.\w+)?\b',
+  '\bdd\s+if=.*\bof=/dev/(sd|nvme|vd|mmcblk|disk)',
+  '\brm\s+-rf?\s+/\s*(\*|$)',
+  '\brm\s+-rf?\s+/(bin|boot|dev|etc|lib|lib64|proc|root|sbin|sys|usr|var|home)(/|/\*)?\s*($|;|&|\|)',
+  '\brm\s+-rf?\s+~(/\*)?\s*($|;|&|\|)',
+  '\brm\s+-rf?\s+\$HOME(/\*)?\s*($|;|&|\|)',
+  '>\s*/dev/(sd|nvme|vd|mmcblk)',
+  '/etc/fstab', '\bwipefs\b',
+  ':\(\)\s*\{\s*:\|:&\s*\};:',   # fork bomb clásica
+  '\bchmod\s+-R\s+000\s+/',
 ]
 
+# -- CRÍTICO: credenciales, claves y cuentas. Exige copia de seguridad previa. -
+# (No es sudo: el Señor VK ES administrador; sudo es trabajo normal → safe.)
 critical = [
-  '\bsudo\b', '\bsu\b', '\bchown\b\s+-R', '\bchmod\b\s+-R',
-  'git\s+push\s+.*--force', '\bpasswd\b', '\buserdel\b', '\bvisudo\b',
-  '\.ssh/', '\.gnupg/', 'credential', 'id_rsa', 'id_ed25519',
+  '\bpasswd\b', '\buserdel\b', '\bvisudo\b', '\bgpasswd\b',
+  '\.ssh/(id_|authorized_keys)', '\.gnupg/', 'id_rsa', 'id_ed25519',
+  '\bshred\b', '\bcryptsetup\b.*(luksFormat|erase)',
 ]
 
+# -- CONFIRMAR: borrados recursivos fuera del espacio y cambios de sesión. ------
+# Solo lo que puede destruir datos del Señor VK fuera de la carpeta de trabajo.
 confirm = [
-  '\bpip\s+install\b', '\buv\s+pip\s+install\b', '\bdnf\b', '\bapt\b',
-  '\bsystemctl\b', '\bkill\b', '\bpkill\b', '\bcurl\b.*-o', '\bwget\b',
+  '\brm\s+-rf?\b(?!.*(/mnt/almacen/ZARA|/tmp|\.cache|\bnode_modules\b|\b__pycache__\b|\.venv\b))',
+  '\bshutdown\b', '\breboot\b', '\bhalt\b', '\bpoweroff\b',
+  '\bgit\s+push\s+.*--force\b',
+  '\bchown\s+-R\s+/', '\bchmod\s+-R\s+/',
 ]
 
+# -- SEGURO: administración cotidiana. Ejecución directa y silenciosa. ----------
+# El Señor VK es sysadmin/pentester: esto es su trabajo diario, no se pregunta.
 safe = [
-  '^\s*ls\b', '^\s*cat\b', '^\s*grep\b', '^\s*find\b', '^\s*echo\b',
-  '^\s*pactl\b', '^\s*playerctl\b', '^\s*xdg-open\b',
+  # Lectura y diagnóstico global
+  '^\s*(ls|cat|bat|head|tail|less|grep|rg|find|fd|echo|pwd|whoami|id|uname|date|uptime)\b',
+  '^\s*(df|du|free|top|htop|ps|lsof|ss|netstat|ip|iw|dig|nslookup|host|ping|traceroute|lsblk|lscpu|lsusb|lspci|sensors)\b',
+  '^\s*(stat|file|which|whereis|type|env|printenv|history|tree|wc|sort|uniq|cut|awk|sed|jq|xxd|md5sum|sha256sum)\b',
+  '^\s*(journalctl|dmesg|systemd-analyze|loginctl)\b',
+  # Gestión de servicios y paquetes (es administrador)
+  '\bsudo\b',
+  '\bsystemctl\b', '\bservice\b',
+  '\b(dnf|yum|apt|apt-get|rpm|flatpak|snap|pacman)\b',
+  '\b(pip|pip3|uv|pipx|npm|pnpm|yarn|cargo|go)\b',
+  # Control de versiones y red (uso normal)
+  '\bgit\b', '\bcurl\b', '\bwget\b', '\bssh\b', '\bscp\b', '\brsync\b',
+  # Procesos y contenedores
+  '\b(kill|pkill|killall|nice|renice)\b',
+  '\b(docker|docker-compose|podman|kubectl)\b',
+  # Escritorio / multimedia KDE
+  '^\s*(pactl|wpctl|playerctl|pw-play|paplay|xdg-open|gtk-launch|notify-send|spectacle|kdialog|qdbus|qdbus-qt6|xclip|wl-copy|wl-paste|loginctl)\b',
+  # Herramientas de pentesting autorizadas del Señor VK
+  '^\s*(nmap|ffuf|gobuster|dirb|nikto|sqlmap|hydra|john|hashcat|masscan|whatweb|wpscan|amass|subfinder|httpx|nuclei|msfconsole|searchsploit)\b',
+  # Scripts y ejecución dentro del espacio de trabajo
+  '/mnt/almacen/ZARA/espacio',
 ]
