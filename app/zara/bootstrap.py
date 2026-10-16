@@ -2,7 +2,7 @@ from __future__ import annotations
 from pathlib import Path
 
 from .paths import ZaraPaths
-from .config import load_toml
+from .config import load_toml, load_env
 from .brain.factory import build_registry
 from .memory.store import MemoryStore
 from .voice.speaker import Voice
@@ -27,6 +27,7 @@ def load_persona(paths: ZaraPaths) -> str:
 
 
 def build_core(paths: ZaraPaths | None = None, speak: bool | None = None) -> ZaraCore:
+    load_env()  # claves de API de los cerebros nativos (.env del repo)
     paths = paths or ZaraPaths.resolve()
     cfg = load_toml(paths.config / "zara.toml", _CONFIG_DEFAULTS)
     persona = load_persona(paths)

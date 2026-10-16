@@ -7,6 +7,7 @@
 param(
     [switch]$Check,
     [switch]$Cli,
+    [switch]$Enroll,
     [switch]$Install,
     [Parameter(ValueFromRemainingArguments = $true)]
     [string[]]$RemainingArgs
@@ -48,9 +49,10 @@ if (-not $PythonExe) {
 $RunArgs = @("$ScriptDir\setup_and_run.py")
 if ($Check) { $RunArgs += "--check" }
 if ($Cli) { $RunArgs += "--cli" }
+if ($Enroll) { $RunArgs += "--enroll" }
 if ($Install) { $RunArgs += "--install" }
 if ($RemainingArgs) { $RunArgs += $RemainingArgs }
 
-Write-Host "[*] Iniciando ZARA v2.0 vía PowerShell..." -ForegroundColor Cyan
+Write-Host "[*] Iniciando ZARA vía PowerShell..." -ForegroundColor Cyan
 & $PythonExe $RunArgs
 exit $LASTEXITCODE

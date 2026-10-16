@@ -28,6 +28,27 @@ _REPLACEMENTS = [
 ]
 
 
+def clean_for_speech(text: str) -> str:
+    """Limpia una frase para TTS SIN truncar ni añadir nota de panel.
+
+    Elimina todo rastro de Markdown, bloques y código en línea, URLs y símbolos
+    impronunciables, y normaliza unidades. Es el saneador que usa el streaming
+    por frases antes de enviar cada fragmento al motor de voz.
+    """
+    t = text or ""
+    t = re.sub(r"```.*?(```|$)", " ", t, flags=re.S)        # bloques de código
+    t = re.sub(r"`([^`]+)`", r"\1", t)                       # código en línea
+    t = re.sub(r"\[([^\]]+)\]\([^)]+\)", r"\1", t)           # [texto](url)
+    t = re.sub(r"https?://\S+", "el enlace", t)              # URLs
+    t = re.sub(r"^\s{0,3}#{1,6}\s*", "", t, flags=re.M)      # encabezados
+    t = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s+", "", t, flags=re.M)  # viñetas
+    t = t.replace("&", " y ").replace("<", " menor que ").replace(">", " mayor que ")
+    t = re.sub(r"[*_`#|~]", "", t)                           # símbolos sueltos
+    for pattern, replacement in _REPLACEMENTS:
+        t = re.sub(pattern, replacement, t, flags=re.IGNORECASE)
+    return re.sub(r"\s+", " ", t).strip()
+
+
 def speech_text(reply: str, max_chars: int = 420) -> str:
     """Convierte una respuesta (posible markdown) en texto apto para la voz.
 

@@ -1,20 +1,40 @@
 # Configuración de Zara. Edite y reinicie Zara para aplicar.
 
-voz = "es-MX-DaliaNeural"       # es-MX-DaliaNeural (dulce y suave) | es-ES-XimenaNeural
-modelo_stt = "small"              # tiny|base|small|medium (CPU: small recomendado)
-stt_beam_size = 3                 # 1 (rápido) | 3 (máxima precisión JARVIS sin confusiones)
-umbral_voz = 0.72                 # 0..1 — más alto = más estricto al reconocerle
-cerebro_por_defecto = ""          # "" = Claude; o "zara:latest", "qwen...", "gemini"
-dispositivo_microfono = ""        # "" = por defecto; o nombre/índice del micro
-verificar_voz = true              # solo obedece al Señor VK si hay huella inscrita
-pedir_confirmacion = false          # false = Modo JARVIS autónomo: obedece y ejecuta directamente sin pedir permiso
-modo_conversacion = false         # true = tras cada respuesta sigue sin repetir «Zara» (puede realimentarse con altavoces)
-ventana_escucha = 10.0            # segundos para dar la orden tras decir «Zara» a secas
-modelo_claude = ""                # "" = el de tu suscripción; o "haiku"/"sonnet"/"opus"
-salida_audio = ""   # "" = sigue la salida por defecto del sistema (recomendado); o un sink fijo (p.ej. "alsa_output.pci-0000_00_1f.3.analog-stereo")
-cerebro_claude_modo = "agente"    # "agente" = Claude con control total del equipo | "consulta" = solo web+lectura
-claude_directorio = ""            # "" = su carpeta personal; carpeta de trabajo del agente
-motor_voz = "edge"                # "edge" (natural, red) | "piper" (local instantánea, offline) | "espeak"
+# --- Voz (TTS) ---
+voz = "es-ES-XimenaNeural"        # femenina suave y natural | es-MX-DaliaNeural | es-CO-SalomeNeural
+motor_voz = "edge"                # "edge" (natural, red) | "kokoro" (local ONNX) | "piper" (local) | "espeak"
+edge_rate = "+6%"                 # prosodia sutil: un pelín más ágil
+edge_pitch = "+2Hz"               # tono ligeramente más cálido
 voz_piper = "/mnt/almacen/IA/piper-voices/es_ES-sharvard-medium.onnx"
-manos = true                      # cualquier cerebro (Claude, Gemini o local) puede actuar en el sistema vía Guardián
-manos_max_pasos = 4               # vueltas máximas del bucle acción→resultado del cerebro
+kokoro_modelo = ""                # ruta a kokoro-v0_19.onnx (fallback local instantáneo)
+kokoro_voces = ""                 # ruta a voices.bin
+kokoro_voz = "ef_dora"
+
+# --- Oído (STT + VAD) ---
+modelo_stt = "small"              # tiny|base|small|medium|large-v3-turbo (CPU: small o large-v3-turbo)
+stt_beam_size = 2                 # 1 (más rápido) | 2 (equilibrio JARVIS) | 5 (máxima precisión)
+stt_cpu_threads = 8               # CPU de 12 núcleos sin GPU: 8 hilos es el punto dulce
+vad = "silero"                    # "silero" (neuronal, robusto con acento andaluz) | "energia"
+vad_umbral = 0.5                  # 0..1 sensibilidad del VAD neuronal
+vad_silencio_ms = 600             # silencio para cerrar la frase (no corta pausas naturales)
+vad_margen_ms = 350               # relleno para no amputar consonantes iniciales/finales
+vad_barge_in_ms = 250             # voz continua del Señor VK para interrumpir a Zara
+umbral_voz = 0.72                 # 0..1 — estrictez al reconocer la huella del Señor VK
+verificar_voz = true              # solo obedece al Señor VK si hay huella inscrita
+
+# --- Cerebros ---
+cerebro_por_defecto = ""          # "" = primer disponible; o "gemini", "claude", "qwen...", "agente"
+modelo_claude = ""                # "" = el de tu suscripción; o "haiku"/"sonnet"/"opus"
+cerebro_claude_modo = "agente"    # "agente" = control total (CLI fallback) | "consulta" = solo web+lectura
+claude_directorio = ""            # "" = su carpeta personal; carpeta de trabajo del agente CLI
+
+# --- Comportamiento (modo JARVIS autónomo) ---
+pedir_confirmacion = false        # false = obedece y ejecuta directo, sin pedir permiso
+manos = true                      # cualquier cerebro puede actuar en el sistema vía Guardián
+manos_max_pasos = 10              # vueltas del bucle ReAct con autocorrección (estilo Claude Code)
+modo_conversacion = false         # true = tras cada respuesta sigue sin repetir «Zara»
+ventana_escucha = 10.0            # segundos para dar la orden tras decir «Zara» a secas
+
+# --- Audio / sistema ---
+dispositivo_microfono = ""        # "" = por defecto; o nombre/índice del micro
+salida_audio = ""                 # "" = salida por defecto del sistema; o un sink fijo

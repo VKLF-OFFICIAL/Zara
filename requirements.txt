@@ -1,30 +1,38 @@
-# Núcleo de Audio y VAD
+# ============================================================
+#  ZARA — dependencias unificadas (paquete app/zara)
+#  CPU sin GPU NVIDIA · Python 3.12 · Fedora/KDE y Windows 11
+# ============================================================
+
+# --- Oído: captura, VAD neuronal y STT ---
 sounddevice>=0.5.0
 soundfile>=0.13.0
 numpy>=1.26.0
-silero-vad>=6.0.0
-torch>=2.2.0
-faster-whisper>=1.0.0
+silero-vad>=5.1.0          # VAD v5 neuronal (acento andaluz, barge-in)
+torch>=2.2.0               # backend de Silero (CPU)
+faster-whisper>=1.0.0      # STT en CPU (int8, cpu_threads)
 ctranslate2>=4.0.0
-miniaudio>=1.60.0
+openwakeword>=0.6.0        # wake word neural «hey jarvis» (opcional)
+resemblyzer>=0.1.4         # verificación de huella de voz del Señor VK
 
-# Síntesis de Voz (TTS)
-edge-tts>=7.0.0
-kokoro-onnx>=0.6.0
+# --- Voz: síntesis en memoria (streaming) ---
+edge-tts>=7.0.0            # voz es-ES-XimenaNeural (natural, red)
+miniaudio>=1.60.0          # decodifica MP3 a PCM en RAM (sin archivos)
+kokoro-onnx>=0.4.0         # fallback local instantáneo (opcional)
 onnxruntime>=1.20.0
+# piper-tts>=1.2.0         # fallback local alternativo (opcional)
 
-# Cerebros LLM y Multimodal
-google-genai>=2.0.0
-anthropic>=1.0.0
+# --- Cerebros nativos (SDK en memoria, sin subprocesos CLI) ---
+google-genai>=0.3.0        # Gemini 2.5 Flash / Pro
+anthropic>=0.40.0          # AsyncAnthropic (Claude 3.5 Haiku / 3.7 Sonnet)
 httpx>=0.28.0
 aiohttp>=3.10.0
 
-# Herramientas del Sistema y Pantalla
+# --- Herramientas del sistema y pantalla ---
 psutil>=6.0.0
 mss>=10.0.0
+pillow>=10.0.0
 pycaw>=20240206; sys_platform == 'win32'
 comtypes>=1.4.0; sys_platform == 'win32'
 
-# Interfaz Holográfica HUD
+# --- Interfaz holográfica HUD ---
 PySide6>=6.8.0
-websockets>=14.0.0
