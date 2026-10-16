@@ -389,6 +389,173 @@ def os_control(action: str, target: str = "", value: str = "") -> Dict[str, Any]
                 return {"success": True, "message": "Texto copiado al portapapeles."}
             return {"success": False, "error": "No hay herramienta de portapapeles disponible."}
 
+        elif action in ("system_stats", "system_telemetry", "telemetry"):
+            import platform as _platform
+            import time as _time
+
+            boot = psutil.boot_time()
+            uptime_hrs = round((_time.time() - boot) / 3600, 1)
+            cpu_pct = psutil.cpu_percent(interval=0.05)
+            cpu_count = psutil.cpu_count(logical=True)
+            ram = psutil.virtual_memory()
+            disk = psutil.disk_usage("C:" if sys.platform == "win32" else "/")
+            batt = psutil.sensors_battery()
+
+            battery_info = None
+            if batt:
+                battery_info = {
+                    "percent": batt.percent,
+                    "plugged": batt.power_plugged,
+                }
+
+            free_gb = round(disk.free / (1024 ** 3), 1)
+            free_ram_mb = round(ram.available / (1024 ** 2))
+            batt_msg = f", Batería al {batt.percent}%" if batt else ""
+
+            return {
+                "success": True,
+                "telemetry": {
+                    "os": _platform.platform(),
+                    "cpu_percent": cpu_pct,
+                    "cpu_cores": cpu_count,
+                    "ram_percent": ram.percent,
+                    "ram_used_mb": round((ram.total - ram.available) / (1024 ** 2)),
+                    "ram_free_mb": free_ram_mb,
+                    "disk_free_gb": free_gb,
+                    "disk_percent": disk.percent,
+                    "uptime_hours": uptime_hrs,
+                    "battery": battery_info,
+                },
+                "message": (
+                    f"Telemetría táctica: CPU al {cpu_pct}%, RAM al {ram.percent}% ({free_ram_mb} MB libres), "
+                    f"Disco al {disk.percent}% ({free_gb} GB disponibles), equipo encendido hace {uptime_hrs} horas{batt_msg}."
+                ),
+            }
+
+        elif action in ("network_info", "network_check", "ip"):
+            import socket as _socket
+            import time as _time
+
+            hostname = _socket.gethostname()
+            try:
+                s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+                s.connect(("1.1.1.1", 80))
+                local_ip = s.getsockname()[0]
+                s.close()
+            except Exception:
+                local_ip = _socket.gethostbyname(hostname)
+
+            t0 = _time.time()
+            ping_ms = None
+            try:
+                s = _socket.create_connection(("1.1.1.1", 53), timeout=1.5)
+                s.close()
+                ping_ms = round((_time.time() - t0) * 1000, 1)
+            except Exception:
+                pass
+
+            lat_text = f"{ping_ms} milisegundos" if ping_ms is not None else "no disponible"
+            return {
+                "success": True,
+                "network": {
+                    "hostname": hostname,
+                    "local_ip": local_ip,
+                    "latency_ms": ping_ms,
+                    "internet_ok": ping_ms is not None,
+                },
+                "message": (
+                    f"Diagnóstico de red: Host '{hostname}', IP local {local_ip}, "
+                    f"latencia a internet {lat_text}."
+                ),
+            }
+
+        elif action in ("media_play_pause", "play_pause", "play", "pause"):
+            if sys.platform == "win32":
+                import ctypes
+                ctypes.windll.user32.keybd_event(0xB3, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(0xB3, 0, 2, 0)
+                return {"success": True, "message": "Comando Play/Pause multimedia enviado."}
+            else:
+                if shutil.which("playerctl"):
+                    subprocess.run(["playerctl", "play-pause"], capture_output=True)
+                elif shutil.which("xdotool"):
+                    subprocess.run(["xdotool", "key", "XF86AudioPlay"], capture_output=True)
+                return {"success": True, "message": "Play/Pause multimedia activado."}
+
+        elif action in ("media_next", "next_track"):
+            if sys.platform == "win32":
+                import ctypes
+                ctypes.windll.user32.keybd_event(0xB0, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(0xB0, 0, 2, 0)
+                return {"success": True, "message": "Pista siguiente multimedia enviada."}
+            else:
+                if shutil.which("playerctl"):
+                    subprocess.run(["playerctl", "next"], capture_output=True)
+                elif shutil.which("xdotool"):
+                    subprocess.run(["xdotool", "key", "XF86AudioNext"], capture_output=True)
+                return {"success": True, "message": "Pista siguiente enviada."}
+
+        elif action in ("media_prev", "prev_track"):
+            if sys.platform == "win32":
+                import ctypes
+                ctypes.windll.user32.keybd_event(0xB1, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(0xB1, 0, 2, 0)
+                return {"success": True, "message": "Pista anterior multimedia enviada."}
+            else:
+                if shutil.which("playerctl"):
+                    subprocess.run(["playerctl", "previous"], capture_output=True)
+                elif shutil.which("xdotool"):
+                    subprocess.run(["xdotool", "key", "XF86AudioPrev"], capture_output=True)
+                return {"success": True, "message": "Pista anterior enviada."}
+
+        elif action in ("show_desktop", "minimize_all"):
+            if sys.platform == "win32":
+                import ctypes
+                # Win+D
+                ctypes.windll.user32.keybd_event(0x5B, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(0x44, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(0x44, 0, 2, 0)
+                ctypes.windll.user32.keybd_event(0x5B, 0, 2, 0)
+                return {"success": True, "message": "Escritorio mostrado y ventanas minimizadas."}
+            else:
+                if shutil.which("xdotool"):
+                    subprocess.run(["xdotool", "key", "super+d"], capture_output=True)
+                elif shutil.which("wmctrl"):
+                    subprocess.run(["wmctrl", "-k", "on"], capture_output=True)
+                return {"success": True, "message": "Escritorio mostrado."}
+
+        elif action in ("lock_screen", "lock"):
+            if sys.platform == "win32":
+                import ctypes
+                ctypes.windll.user32.LockWorkStation()
+                return {"success": True, "message": "Estación de trabajo bloqueada por seguridad."}
+            else:
+                if shutil.which("loginctl"):
+                    subprocess.run(["loginctl", "lock-session"], capture_output=True)
+                elif shutil.which("xdg-screensaver"):
+                    subprocess.run(["xdg-screensaver", "lock"], capture_output=True)
+                return {"success": True, "message": "Sesión bloqueada."}
+
+        elif action == "notify":
+            msg_text = value or target or "Notificación táctica de Zara"
+            if sys.platform == "win32":
+                ps_script = (
+                    f"[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null;"
+                    f"$template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText01);"
+                    f"$template.GetElementsByTagName('text')[0].AppendChild($template.CreateTextNode('{msg_text}')) > $null;"
+                    f"$toast = [Windows.UI.Notifications.ToastNotification]::new($template);"
+                    f"[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('ZARA Tactical AI').Show($toast);"
+                )
+                subprocess.Popen(
+                    ["powershell.exe", "-NoProfile", "-Command", ps_script],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                return {"success": True, "message": f"Notificación en pantalla enviada: '{msg_text}'."}
+            else:
+                if shutil.which("notify-send"):
+                    subprocess.Popen(["notify-send", "ZARA", msg_text], stdin=subprocess.DEVNULL)
+                return {"success": True, "message": f"Notificación en pantalla enviada: '{msg_text}'."}
+
         else:
             return {"success": False, "error": f"Acción de SO desconocida '{action}'."}
 
@@ -601,16 +768,22 @@ TOOL_DEFINITIONS = [
     },
     {
         "name": "os_control",
-        "description": "Control del sistema operativo: abrir/cerrar aplicaciones, volumen, listar procesos y portapapeles.",
+        "description": "Control táctico del sistema operativo: abrir/cerrar aplicaciones, telemetría de CPU/RAM/disco (system_stats), diagnóstico de red e IP (network_info), reproducción multimedia (media_play_pause, media_next, media_prev), control de volumen (set_volume, mute, unmute), minimizar ventanas (show_desktop), bloquear pantalla (lock_screen), notificaciones nativas (notify) y portapapeles.",
         "parameters": {
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["open_app", "close_app", "list_processes", "set_volume", "mute", "unmute", "read_clipboard", "write_clipboard"],
+                    "enum": [
+                        "open_app", "close_app", "list_processes", "system_stats",
+                        "network_info", "media_play_pause", "media_next", "media_prev",
+                        "show_desktop", "lock_screen", "notify", "set_volume",
+                        "mute", "unmute", "read_clipboard", "write_clipboard"
+                    ],
+                    "description": "Acción interactiva del sistema operativo a ejecutar.",
                 },
                 "target": {"type": "string", "description": "Nombre de la app, proceso o URL a abrir/cerrar."},
-                "value": {"type": "string", "description": "Valor auxiliar (ej: nivel de volumen del 0 al 100, texto para portapapeles)."},
+                "value": {"type": "string", "description": "Valor auxiliar (ej: nivel de volumen del 0 al 100, texto para portapapeles o mensaje de notificación)."},
             },
             "required": ["action"],
         },

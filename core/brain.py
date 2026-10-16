@@ -153,6 +153,18 @@ class ZaraRouter:
         "oye", "hey", "ey", "dime", "zara", "hola zara",
     }
 
+    # Palabras clave de control del sistema: NUNCA deben tratarse como conversación vacía.
+    SYSTEM_COMMAND_KEYWORDS = {
+        "ip", "red", "wifi", "ping", "latencia", "ram", "cpu", "disco", "batería", "bateria",
+        "telemetría", "telemetria", "sistema", "procesos", "proceso", "volumen", "sonido",
+        "silencio", "mute", "unmute", "música", "musica", "canción", "cancion", "play", "pause",
+        "pausa", "siguiente", "anterior", "pantalla", "escritorio", "ventana", "ventanas",
+        "bloquea", "bloquear", "minimiza", "minimizar", "notifica", "notificación", "notificacion",
+        "portapapeles", "copia", "pega", "abre", "abrir", "cierra", "cerrar", "mata", "termina",
+        "ejecuta", "crea", "elimina", "borra", "edita", "lista", "busca", "instala", "descarga",
+        "reinicia", "apaga", "notepad", "bloc de notas", "cmd", "powershell", "terminal"
+    }
+
     CLAUDE_KEYWORDS = {
         "refactor", "bug", "exploit", "payload", "código", "codigo", "script",
         "nmap", "ffuf", "gobuster", "sqlmap", "burp", "metasploit", "docker",
@@ -168,13 +180,17 @@ class ZaraRouter:
     def is_conversational(query: str) -> bool:
         """Devuelve True si la consulta es puramente conversacional/trivial."""
         low = query.lower().strip().rstrip("?.!")
-        # Coincidencia exacta o la query empieza con un patrón conocido
-        return any(
-            low == pat or low.startswith(pat)
-            for pat in ZaraRouter.CONVERSATIONAL_PATTERNS
-        ) or len(low.split()) <= 2 and not any(
-            c in low for c in ["abre", "ejecuta", "crea", "lista", "busca", "instala", "cierra"]
-        )
+
+        # Si contiene cualquier término de acción o control del sistema, NO es conversacional.
+        words = set(re.findall(r"\w+", low))
+        if any(w in words for w in ZaraRouter.SYSTEM_COMMAND_KEYWORDS):
+            return False
+
+        # Coincidencia con patrones de cortesía y conversación general
+        if any(low == pat or low.startswith(pat) for pat in ZaraRouter.CONVERSATIONAL_PATTERNS):
+            return True
+
+        return len(words) <= 2 and not any(k in low for k in ZaraRouter.SYSTEM_COMMAND_KEYWORDS)
 
     @staticmethod
     def classify(query: str, preferred: str = "auto") -> str:

@@ -113,8 +113,45 @@ def test_os_control_clipboard():
         assert test_val in r_clip["clipboard"]
 
 
+def test_os_control_system_telemetry():
+    res = os_control("system_stats")
+    assert res["success"] is True
+    assert "telemetry" in res
+    tel = res["telemetry"]
+    assert "cpu_percent" in tel
+    assert "ram_percent" in tel
+    assert "disk_free_gb" in tel
+    assert "uptime_hours" in tel
+    assert tel["ram_free_mb"] > 0
+    assert "Telemetría táctica" in res["message"]
+
+
+def test_os_control_network_info():
+    res = os_control("network_info")
+    assert res["success"] is True
+    assert "network" in res
+    net = res["network"]
+    assert "hostname" in net
+    assert "local_ip" in net
+    assert len(net["local_ip"].split(".")) == 4  # IPv4 válido
+
+
+def test_os_control_media_and_desktop_commands():
+    # Play/Pause
+    res_media = os_control("media_play_pause")
+    assert res_media["success"] is True
+
+    # Next track
+    res_next = os_control("media_next")
+    assert res_next["success"] is True
+
+    # Show desktop
+    res_desk = os_control("show_desktop")
+    assert res_desk["success"] is True
+
+
 def test_execute_tool_dispatch():
-    # Comprobar que execute_tool enruta a run_shell y web_search
+    # Comprobar que execute_tool enruta a run_shell, web_search y os_control telemetry
     if sys.platform == "win32":
         res_sh = execute_tool("run_shell", {"command": "Write-Output 42"})
     else:
@@ -122,6 +159,12 @@ def test_execute_tool_dispatch():
     assert res_sh["success"] is True
     assert "42" in res_sh["stdout"]
 
+    # Telemetría vía execute_tool
+    res_tel = execute_tool("os_control", {"action": "system_stats"})
+    assert res_tel["success"] is True
+    assert "cpu_percent" in res_tel["telemetry"]
+
     res_unknown = execute_tool("non_existent_tool", {})
     assert res_unknown["success"] is False
     assert "desconocida" in res_unknown["error"]
+

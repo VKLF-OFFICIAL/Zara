@@ -27,6 +27,11 @@ def test_router_is_conversational():
     assert ZaraRouter.is_conversational("lista los archivos del directorio actual") is False
     assert ZaraRouter.is_conversational("crea un script en python") is False
     assert ZaraRouter.is_conversational("cierra la ventana") is False
+    assert ZaraRouter.is_conversational("mi ip") is False
+    assert ZaraRouter.is_conversational("telemetría") is False
+    assert ZaraRouter.is_conversational("pausa música") is False
+    assert ZaraRouter.is_conversational("minimiza todo") is False
+    assert ZaraRouter.is_conversational("cuánta ram") is False
 
 
 def test_router_classify_keywords():
