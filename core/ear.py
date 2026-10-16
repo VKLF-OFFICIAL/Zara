@@ -18,8 +18,10 @@ BUGS CORREGIDOS:
 """
 
 from __future__ import annotations
+import collections
 import logging
 import queue
+import re
 import threading
 import time
 from typing import Callable, Generator, Optional
@@ -43,14 +45,56 @@ from config import (
 
 log = logging.getLogger("zara.ear")
 
+HALLUCINATION_PATTERNS = [
+    r"(?i)\bsubt[ií]tulos\s+(?:por|realizados|creados)?\s*(?:la\s+comunidad|amara)?\b",
+    r"(?i)\bamara\.org\b",
+    r"(?i)\bgracias\s+por\s+ver\b",
+    r"(?i)\bsuscr[ií]bete\b",
+    r"(?i)\bdale\s+(?:a\s+)?like\b",
+    r"(?i)\bhasta\s+la\s+pr[oó]xima\b",
+    r"(?i)\btodos\s+los\s+derechos\s+reservados\b",
+    r"(?i)\btransmisi[oó]n\s+en\s+vivo\b",
+    r"(?i)\bthank\s+you\s+for\s+watching\b",
+    r"(?i)\bplease\s+subscribe\b",
+]
 
-def normalize_audio(audio: np.ndarray, target_peak: float = 0.85, max_gain: float = 20.0) -> np.ndarray:
-    """Control automático de ganancia (AGC) para evitar pérdida fonética."""
+
+def clean_transcript(text: str) -> str:
+    """Elimina alucinaciones comunes de Whisper, repeticiones y artefactos de ruido."""
+    if not text:
+        return ""
+    t = text.strip()
+    # Limpieza de artefactos como '...', '---', '***' pero preservando '?' y '!'
+    t = re.sub(r"^[.\-_~*#\s]+", "", t)
+    t = re.sub(r"[.\-_~*#\s]+$", "", t)
+    t = t.strip()
+    if len(t) < 2:
+        return ""
+
+    for pat in HALLUCINATION_PATTERNS:
+        if re.search(pat, t):
+            log.info("Alucinación de Whisper suprimida: '%s'", text)
+            return ""
+
+    words = t.lower().split()
+    if len(words) >= 4 and len(set(words)) == 1:
+        log.info("Repetición patológica de Whisper suprimida: '%s'", text)
+        return ""
+
+    return t
+
+
+def normalize_audio(audio: np.ndarray, target_peak: float = 0.90, max_gain: float = 6.0) -> np.ndarray:
+    """Control automático de ganancia (AGC) inteligente para voz.
+    
+    Eleva la voz a un nivel óptimo preservando transitorios sin amplificar
+    el piso de ruido de fondo o estática electrónica del micrófono.
+    """
     arr = np.asarray(audio, dtype=np.float32)
     if arr.size == 0:
         return arr
     peak = float(np.max(np.abs(arr)))
-    if peak > 0.002:
+    if peak > 0.01:
         gain = min(target_peak / peak, max_gain)
         return arr * gain
     return arr
@@ -195,11 +239,15 @@ class ContinuousEar:
             log.exception("Fallo en la captura de audio continua: %s", exc)
 
     def _vad_processing_worker(self) -> None:
-        """Procesa frames con Silero VAD, gestiona Barge-in y segmenta locuciones."""
+        """Procesa frames con Silero VAD continuo, pre-roll ring buffer y Barge-in."""
         barge_in_consecutive_frames = 0
         barge_in_required_frames = max(1, int(VAD_BARGE_IN_TRIGGER_MS / (FRAME_SIZE / SAMPLE_RATE * 1000)))
 
-        buffer: list[np.ndarray] = []
+        # Pre-roll ring buffer para capturar consonantes iniciales (ej. s, p, t, k)
+        # sin acumular silencio leading antes de que el usuario empiece a hablar.
+        pre_roll_frames = max(4, int(VAD_SPEECH_PAD_MS / (FRAME_SIZE / SAMPLE_RATE * 1000)))
+        pre_roll_buffer: collections.deque[np.ndarray] = collections.deque(maxlen=pre_roll_frames)
+        speech_frames: list[np.ndarray] = []
         is_speech_active = False
 
         while not self._stop_event.is_set():
@@ -208,8 +256,7 @@ class ContinuousEar:
             except queue.Empty:
                 continue
 
-            # Escucha pausada: DRENAR toda la cola acumulada para evitar
-            # que frames en buffer se procesen al reanudar, y aplana el HUD.
+            # Escucha pausada: DRENAR toda la cola acumulada y aplanar el HUD
             if self._muted.is_set():
                 try:
                     while True:
@@ -221,7 +268,8 @@ class ContinuousEar:
                         self.rms_cb(0.0)
                     except Exception:
                         pass
-                buffer.clear()
+                speech_frames.clear()
+                pre_roll_buffer.clear()
                 is_speech_active = False
                 self._vad_iterator.reset_states()
                 continue
@@ -234,21 +282,7 @@ class ContinuousEar:
                 except Exception:
                     pass
 
-            # ── GATE DE ENERGÍA (Anti-falsos-positivos) ──────────────────
-            # Si el nivel RMS es menor a -42 dBFS (0.008 en escala lineal),
-            # el frame es silencio electrónico o ruido de fondo insignificante.
-            # Se descarta ANTES de pasarlo al modelo VAD: evita que Silero
-            # interprete ruido de WASAPI/PipeWire como voz del Señor VK.
-            if rms < 0.008:
-                if not is_speech_active:
-                    # Solo limpiar el buffer si aún no hemos detectado inicio de voz.
-                    # Si ya estábamos en medio de una locución, dejar que el VAD
-                    # detecte el silencio de forma natural para respetar speech_pad_ms.
-                    pass
-                continue
-
-            # [BUG-2 FIX] Silero v5 espera tensor de forma [1, T] (batch_size=1)
-            # Rellenar con ceros si el bloque es menor que FRAME_SIZE (FIN de stream)
+            # Rellenar con ceros si el bloque es menor que FRAME_SIZE
             if frame.shape[0] < FRAME_SIZE:
                 frame = np.pad(frame, (0, FRAME_SIZE - frame.shape[0]))
             tensor_chunk = torch.from_numpy(frame).unsqueeze(0)  # [1, 512]
@@ -256,7 +290,6 @@ class ContinuousEar:
             # 1. Detección de Barge-in mientras Zara habla
             if self.is_speaking_fn():
                 with torch.no_grad():
-                    # [BUG-2 FIX] API directa del modelo con tensor batched
                     speech_prob = self._vad_model(tensor_chunk, SAMPLE_RATE).item()
                 if speech_prob >= VAD_THRESHOLD:
                     barge_in_consecutive_frames += 1
@@ -267,39 +300,51 @@ class ContinuousEar:
                         barge_in_consecutive_frames = 0
                 else:
                     barge_in_consecutive_frames = max(0, barge_in_consecutive_frames - 1)
-                # [BUG-1 FIX] NO resetear el VADIterator aquí: provoca silencio
-                # post-barge-in. Solo limpiar buffer acumulado durante habla propia.
-                buffer.clear()
+                speech_frames.clear()
+                pre_roll_buffer.clear()
                 is_speech_active = False
                 continue
             else:
                 barge_in_consecutive_frames = 0
 
-            # 2. Segmentación de locución del usuario mediante VADIterator
-            # VADIterator.forward() espera tensor 1-D [T] sin batch dimension
+            # 2. Segmentación de locución mediante Silero VAD continuo
             tensor_1d = tensor_chunk.squeeze(0)
             vad_res = self._vad_iterator(tensor_1d)
-            buffer.append(frame)
 
-            if vad_res is not None:
-                if "start" in vad_res:
+            if not is_speech_active:
+                pre_roll_buffer.append(frame.copy())
+                if vad_res is not None and "start" in vad_res:
                     is_speech_active = True
-                elif "end" in vad_res and is_speech_active:
-                    # Fin de la frase con padding
-                    utterance = np.concatenate(buffer)
-                    buffer.clear()
+                    speech_frames = list(pre_roll_buffer)
+                    speech_frames.append(frame.copy())
+            else:
+                speech_frames.append(frame.copy())
+                if vad_res is not None and "end" in vad_res:
+                    utterance = np.concatenate(speech_frames)
+                    speech_frames.clear()
+                    pre_roll_buffer.clear()
                     is_speech_active = False
-                    # [BUG-1 FIX] Reset de estados aquí, al finalizar la locución real
                     self._vad_iterator.reset_states()
-                    if len(utterance) >= int(SAMPLE_RATE * 0.3):  # Mínimo 300 ms
-                        self._utterance_queue.put(utterance)
+
+                    # Validación de locución: duración mínima y nivel de energía real
+                    if len(utterance) >= int(SAMPLE_RATE * 0.35):
+                        u_peak = float(np.max(np.abs(utterance)))
+                        u_rms = float(np.sqrt(np.mean(utterance ** 2)))
+                        # Filtro anti-micrófono cerrado: evita encolar silencio electrónico
+                        if u_peak >= 0.015 and u_rms >= 0.003:
+                            self._utterance_queue.put(utterance)
+                        else:
+                            log.debug("Locución ignorada por energía nula (peak=%.4f, rms=%.4f)", u_peak, u_rms)
 
             # Límite de seguridad: locución no mayor a 25 segundos continuos
-            if len(buffer) > int(25 * (SAMPLE_RATE / FRAME_SIZE)):
+            if len(speech_frames) > int(25 * (SAMPLE_RATE / FRAME_SIZE)):
                 if is_speech_active:
-                    utterance = np.concatenate(buffer)
-                    self._utterance_queue.put(utterance)
-                buffer.clear()
+                    utterance = np.concatenate(speech_frames)
+                    u_peak = float(np.max(np.abs(utterance)))
+                    if u_peak >= 0.015:
+                        self._utterance_queue.put(utterance)
+                speech_frames.clear()
+                pre_roll_buffer.clear()
                 is_speech_active = False
                 self._vad_iterator.reset_states()
 
@@ -308,19 +353,32 @@ class ContinuousEar:
         if audio.size == 0:
             return ""
 
+        peak = float(np.max(np.abs(audio)))
+        rms = float(np.sqrt(np.mean(audio ** 2)))
+        # Si el audio es silencio electrónico o micrófono cerrado, descartar directamente
+        if peak < 0.015 or rms < 0.003:
+            return ""
+
         norm_audio = normalize_audio(audio)
-        segments, _info = self._whisper_model.transcribe(
-            norm_audio,
-            language=WHISPER_LANGUAGE,
-            beam_size=WHISPER_BEAM_SIZE,
-            best_of=WHISPER_BEAM_SIZE,
-            vad_filter=True,
-            initial_prompt=WHISPER_INITIAL_PROMPT,
-            condition_on_previous_text=False,
-            without_timestamps=True,
-        )
-        text = " ".join(seg.text.strip() for seg in segments).strip()
-        return text
+        try:
+            segments, _info = self._whisper_model.transcribe(
+                norm_audio,
+                language=WHISPER_LANGUAGE,
+                beam_size=WHISPER_BEAM_SIZE,
+                best_of=WHISPER_BEAM_SIZE,
+                temperature=0.0,
+                vad_filter=False,  # Silero VAD ya segmentó con precisión milimétrica
+                no_speech_threshold=0.6,
+                initial_prompt=WHISPER_INITIAL_PROMPT,
+                condition_on_previous_text=False,
+                without_timestamps=True,
+            )
+            raw_text = " ".join(seg.text.strip() for seg in segments).strip()
+        except Exception as exc:
+            log.warning("Fallo en la transcripción Whisper: %s", exc)
+            return ""
+
+        return clean_transcript(raw_text)
 
     def listen_utterances(self) -> Generator[str, None, None]:
         """Generador que produce frases transcritas en tiempo real.

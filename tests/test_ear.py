@@ -4,7 +4,7 @@ import numpy as np
 import pytest
 import torch
 
-from core.ear import normalize_audio, ContinuousEar
+from core.ear import normalize_audio, clean_transcript, ContinuousEar
 from config import FRAME_SIZE, SAMPLE_RATE
 
 
@@ -58,3 +58,29 @@ def test_frame_padding_on_short_chunks():
     assert padded.shape == (512,)
     assert padded[299] == 1.0
     assert padded[300] == 0.0
+
+
+def test_clean_transcript_valid_commands():
+    assert clean_transcript("Hola Zara") == "Hola Zara"
+    assert clean_transcript("¿Qué hora es?") == "¿Qué hora es?"
+    assert clean_transcript("Abre el navegador") == "Abre el navegador"
+    assert clean_transcript("  Comprueba mi IP...  ") == "Comprueba mi IP"
+
+
+def test_clean_transcript_hallucinations_suppressed():
+    # Subtítulos de YouTube/Amara
+    assert clean_transcript("Subtítulos realizados por la comunidad de Amara.org") == ""
+    assert clean_transcript("Subtítulos por Amara.org") == ""
+    assert clean_transcript("¡Muchas gracias por ver el video!") == ""
+    assert clean_transcript("Suscríbete a mi canal y dale like") == ""
+    assert clean_transcript("Hasta la próxima") == ""
+    assert clean_transcript("Thank you for watching!") == ""
+
+    # Puntuación o ruido sin texto
+    assert clean_transcript("...") == ""
+    assert clean_transcript("---") == ""
+    assert clean_transcript("?") == ""
+
+    # Repetición patológica
+    assert clean_transcript("gracias gracias gracias gracias") == ""
+

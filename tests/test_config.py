@@ -34,7 +34,7 @@ def test_audio_and_vad_defaults():
     assert config.FRAME_SIZE == 512
     assert config.VAD_MIN_SILENCE_MS >= 500
     assert config.VAD_SPEECH_PAD_MS >= 200
-    assert config.VAD_THRESHOLD >= 0.6  # Threshold anti-ruido
+    assert 0.4 <= config.VAD_THRESHOLD <= 0.8  # Threshold neuronal óptimo anti-ruido
 
 
 def test_forbidden_commands_regex():
