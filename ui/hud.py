@@ -120,25 +120,43 @@ QComboBox::down-arrow {
     margin-right: 4px;
 }
 QComboBox QAbstractItemView {
-    background-color: rgba(8, 14, 26, 245);
+    background-color: rgba(8, 14, 26, 250);
     color: #2EF2E6;
-    border: 1px solid rgba(46, 242, 230, 80);
+    border: 1px solid rgba(46, 242, 230, 90);
     border-radius: 6px;
-    selection-background-color: rgba(46, 242, 230, 40);
+    selection-background-color: rgba(46, 242, 230, 50);
     selection-color: #FFFFFF;
     font-family: 'Consolas', monospace;
     font-size: 11px;
     outline: none;
+    padding: 2px;
+}
+QComboBox QAbstractItemView::item {
+    min-height: 25px;
+    padding: 3px 8px;
+    border-radius: 4px;
+}
+QComboBox QAbstractItemView::item:hover {
+    background-color: rgba(46, 242, 230, 30);
+    color: #FFFFFF;
+}
+QComboBox QAbstractItemView::item:selected {
+    background-color: rgba(46, 242, 230, 60);
+    color: #FFFFFF;
 }
 QScrollBar:vertical {
-    background: rgba(3, 7, 18, 180);
-    width: 6px;
-    border-radius: 3px;
+    background: rgba(3, 7, 18, 220);
+    width: 8px;
+    border-radius: 4px;
+    margin: 2px;
 }
 QScrollBar::handle:vertical {
-    background: rgba(46, 242, 230, 80);
-    border-radius: 3px;
-    min-height: 20px;
+    background: rgba(46, 242, 230, 110);
+    border-radius: 4px;
+    min-height: 24px;
+}
+QScrollBar::handle:vertical:hover {
+    background: rgba(46, 242, 230, 180);
 }
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
 """
@@ -194,7 +212,7 @@ class ZaraPanel(QtWidgets.QWidget):
         super().__init__()
         self._ollama_models: list[str] = []
         self._desired_model: dict[str, str] = {}
-        self.setFixedSize(320, 460)
+        self.setFixedSize(340, 500)
         self.setWindowFlags(
             QtCore.Qt.FramelessWindowHint
             | QtCore.Qt.WindowStaysOnTopHint
@@ -268,9 +286,20 @@ class ZaraPanel(QtWidgets.QWidget):
         self.model_lbl = QtWidgets.QLabel("Modelo:")
         model_row.addWidget(self.model_lbl)
         self.model_combo = QtWidgets.QComboBox()
+        self.model_combo.setFocusPolicy(QtCore.Qt.WheelFocus)
+        self.model_combo.view().setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        self.model_combo.view().setAutoScroll(True)
         self.model_combo.currentIndexChanged.connect(self._on_model_changed)
         model_row.addWidget(self.model_combo, stretch=1)
         layout.addLayout(model_row)
+
+        # Buscador / filtro rápido de modelos locales (aparece para Ollama)
+        self.model_search_input = QtWidgets.QLineEdit()
+        self.model_search_input.setPlaceholderText("🔍 Filtrar modelos locales (ej: qwen, deepseek)...")
+        self.model_search_input.textChanged.connect(self._on_model_filter_changed)
+        self.model_search_input.hide()
+        layout.addWidget(self.model_search_input)
+
         self._refresh_model_options()
 
         # Botones rápidos
@@ -302,50 +331,69 @@ class ZaraPanel(QtWidgets.QWidget):
 
     def _on_provider_changed(self, _idx: int) -> None:
         self.brain_changed.emit(self._current_provider())
+        # Limpiar filtro al cambiar proveedor
+        self.model_search_input.blockSignals(True)
+        self.model_search_input.clear()
+        self.model_search_input.blockSignals(False)
+        self._refresh_model_options()
+
+    def _on_model_filter_changed(self, _text: str) -> None:
         self._refresh_model_options()
 
     def _on_model_changed(self, idx: int) -> None:
         if idx < 0:
             return
         model = self.model_combo.itemData(idx)
-        if model is None:
+        if model is None or model == "":
             return
         self.model_changed.emit(self._current_provider(), model)
 
     def _refresh_model_options(self) -> None:
-        """Repuebla el combo de modelo según el proveedor seleccionado arriba."""
+        """Repuebla el combo de modelo según el proveedor seleccionado arriba con soporte de filtrado."""
         provider = self._current_provider()
         self.model_combo.blockSignals(True)
         self.model_combo.clear()
-        self.model_combo.setMaxVisibleItems(8)
+        self.model_combo.setMaxVisibleItems(12)
 
         if provider == "ollama":
-            self.model_lbl.setText("Modelo:")
-            if self._ollama_models:
-                for name in self._ollama_models:
-                    # Truncar nombres muy largos en la etiqueta para que no
-                    # desborden el ancho del combo; el dato sigue siendo el nombre completo.
-                    display = name if len(name) <= 28 else name[:25] + "…"
+            self.model_search_input.show()
+            filter_text = self.model_search_input.text().strip().lower()
+
+            # Filtrar lista de modelos locales
+            candidates = self._ollama_models
+            if filter_text:
+                candidates = [m for m in candidates if filter_text in m.lower()]
+
+            if candidates:
+                count_str = f"Modelo ({len(candidates)}/{len(self._ollama_models)}):" if filter_text else f"Modelo ({len(candidates)}):"
+                self.model_lbl.setText(count_str)
+                for name in candidates:
+                    display = name if len(name) <= 26 else name[:23] + "…"
                     self.model_combo.addItem(display, name)
                     idx = self.model_combo.count() - 1
                     self.model_combo.setItemData(idx, name, QtCore.Qt.ToolTipRole)
+                self.model_combo.setEnabled(True)
             else:
-                self.model_combo.addItem("(sin modelos detectados)", "")
-            self.model_combo.setEnabled(bool(self._ollama_models))
-        elif provider == "claude":
-            self.model_lbl.setText("Modelo:")
-            for label, value in self._CLAUDE_MODEL_OPTIONS:
-                self.model_combo.addItem(label, value)
-            self.model_combo.setEnabled(True)
-        elif provider == "gemini":
-            self.model_lbl.setText("Modelo:")
-            for label, value in self._GEMINI_MODEL_OPTIONS:
-                self.model_combo.addItem(label, value)
-            self.model_combo.setEnabled(True)
-        else:  # auto
-            self.model_lbl.setText("Modelo: (auto)")
-            self.model_combo.addItem("El sistema elige", "")
-            self.model_combo.setEnabled(False)
+                self.model_lbl.setText("Modelo (0):")
+                msg = "(sin coincidencias)" if filter_text else "(sin modelos detectados)"
+                self.model_combo.addItem(msg, "")
+                self.model_combo.setEnabled(False)
+        else:
+            self.model_search_input.hide()
+            if provider == "claude":
+                self.model_lbl.setText("Modelo:")
+                for label, value in self._CLAUDE_MODEL_OPTIONS:
+                    self.model_combo.addItem(label, value)
+                self.model_combo.setEnabled(True)
+            elif provider == "gemini":
+                self.model_lbl.setText("Modelo:")
+                for label, value in self._GEMINI_MODEL_OPTIONS:
+                    self.model_combo.addItem(label, value)
+                self.model_combo.setEnabled(True)
+            else:  # auto
+                self.model_lbl.setText("Modelo: (auto)")
+                self.model_combo.addItem("El sistema elige", "")
+                self.model_combo.setEnabled(False)
 
         desired = self._desired_model.get(provider)
         if desired is not None:

@@ -163,8 +163,8 @@ SHELL_TIMEOUT = int(os.environ.get("ZARA_SHELL_TIMEOUT", "60"))
 FORBIDDEN_COMMANDS_REGEX = [
     r"\bmkfs(\.\w+)?\b",
     r"\bdd\s+if=",
-    r"\brm\s+-rf\s+/\s*(\*|$)",
-    r"\brm\s+-rf\s+/(bin|boot|dev|etc|lib|lib64|proc|root|sbin|sys|usr|var|home)(/|\b)",
+    r"\brm\b.*?\s-[a-zA-Z0-9-]*[rR][a-zA-Z0-9-]*\b.*?\s+/(?:[*\s]|$)",
+    r"\brm\b.*?\s-[a-zA-Z0-9-]*[rR][a-zA-Z0-9-]*\b.*?\s+/(bin|boot|dev|etc|lib|lib64|proc|root|sbin|sys|usr|var|home)(?:/|\b)",
     r"\bFormat-Volume\b",
     r"\bdiskpart\b.*clean",
     r":\(\)\s*\{\s*:\|:&\s*\};:",
