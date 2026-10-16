@@ -182,6 +182,7 @@ class Backend:
 
     def _fire_reminder(self, msg: str):
         texto = "Le recuerdo" + (f": {msg}." if msg else " algo pendiente.")
+        texto = self._address.apply(texto)
         log.info("recordatorio: %s", msg)
         try:
             import shutil
@@ -393,6 +394,19 @@ class Backend:
 
     # --- respuesta --------------------------------------------------------
     def respond(self, text: str, verified: bool = True) -> dict:
+        """Responde y MODERA los apelativos de la respuesta final (panel + voz):
+        el mismo moderador que usa la voz se aplica aquí una sola vez, para que
+        Zara no repita «Señor VK» en cada frase en ninguna de las dos salidas."""
+        res = self._respond_impl(text, verified)
+        try:
+            if isinstance(res, dict) and res.get("reply"):
+                res = dict(res)
+                res["reply"] = self._address.apply(res["reply"])
+        except Exception:  # noqa: BLE001
+            pass
+        return res
+
+    def _respond_impl(self, text: str, verified: bool = True) -> dict:
         """Intención directa, comando protegido o pregunta al cerebro.
 
         Nunca lanza: cualquier fallo se convierte en una respuesta y se registra.
@@ -488,6 +502,7 @@ class Backend:
         reply = (reply or "Tarea terminada.").strip()
         texto = f"Ya está. {reply}" if not reply.lower().startswith(
             ("ya está", "ya esta", "listo", "hecho", "la tarea")) else reply
+        texto = self._address.apply(texto)
         log.info("tarea terminada: %s", name)
         cb = self.on_task_done
         if cb is not None:
@@ -931,7 +946,10 @@ class Backend:
         if not self.speak_enabled:
             return
         self.ensure_ready_text()
-        say = self._address.apply(speech_text(text))
+        # La moderación de apelativos ya se hizo al finalizar la respuesta
+        # (respond/_task_finished/_fire_reminder): aquí NO se repite, para que
+        # panel y voz digan exactamente lo mismo y no se procese dos veces.
+        say = speech_text(text)
         if not say:
             return
         self._recent_spoken.append(say)
