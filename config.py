@@ -72,7 +72,7 @@ FRAME_SIZE = 512  # Bloques de 32 ms para VAD rápido
 VAD_MIN_SILENCE_MS = int(os.environ.get("ZARA_VAD_MIN_SILENCE_MS", "700"))
 VAD_SPEECH_PAD_MS = int(os.environ.get("ZARA_VAD_SPEECH_PAD_MS", "350"))
 VAD_BARGE_IN_TRIGGER_MS = int(os.environ.get("ZARA_VAD_BARGE_IN_MS", "250"))
-VAD_THRESHOLD = float(os.environ.get("ZARA_VAD_THRESHOLD", "0.5"))
+VAD_THRESHOLD = float(os.environ.get("ZARA_VAD_THRESHOLD", "0.65"))
 
 # faster-whisper
 WHISPER_MODEL_PRIMARY = os.environ.get("ZARA_WHISPER_MODEL", "deepdml/faster-whisper-large-v3-turbo-ct2")

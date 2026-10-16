@@ -106,7 +106,41 @@ QComboBox {
     padding: 3px 6px;
     font-family: 'Consolas', monospace;
     font-size: 11px;
+    min-width: 140px;
 }
+QComboBox::drop-down {
+    border: none;
+    width: 18px;
+}
+QComboBox::down-arrow {
+    image: none;
+    border-left: 4px solid transparent;
+    border-right: 4px solid transparent;
+    border-top: 5px solid #2EF2E6;
+    margin-right: 4px;
+}
+QComboBox QAbstractItemView {
+    background-color: rgba(8, 14, 26, 245);
+    color: #2EF2E6;
+    border: 1px solid rgba(46, 242, 230, 80);
+    border-radius: 6px;
+    selection-background-color: rgba(46, 242, 230, 40);
+    selection-color: #FFFFFF;
+    font-family: 'Consolas', monospace;
+    font-size: 11px;
+    outline: none;
+}
+QScrollBar:vertical {
+    background: rgba(3, 7, 18, 180);
+    width: 6px;
+    border-radius: 3px;
+}
+QScrollBar::handle:vertical {
+    background: rgba(46, 242, 230, 80);
+    border-radius: 3px;
+    min-height: 20px;
+}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
 """
 
 
@@ -160,7 +194,7 @@ class ZaraPanel(QtWidgets.QWidget):
         super().__init__()
         self._ollama_models: list[str] = []
         self._desired_model: dict[str, str] = {}
-        self.setFixedSize(300, 392)
+        self.setFixedSize(320, 460)
         self.setWindowFlags(
             QtCore.Qt.FramelessWindowHint
             | QtCore.Qt.WindowStaysOnTopHint
@@ -284,12 +318,18 @@ class ZaraPanel(QtWidgets.QWidget):
         provider = self._current_provider()
         self.model_combo.blockSignals(True)
         self.model_combo.clear()
+        self.model_combo.setMaxVisibleItems(8)
 
         if provider == "ollama":
             self.model_lbl.setText("Modelo:")
             if self._ollama_models:
                 for name in self._ollama_models:
-                    self.model_combo.addItem(name, name)
+                    # Truncar nombres muy largos en la etiqueta para que no
+                    # desborden el ancho del combo; el dato sigue siendo el nombre completo.
+                    display = name if len(name) <= 28 else name[:25] + "…"
+                    self.model_combo.addItem(display, name)
+                    idx = self.model_combo.count() - 1
+                    self.model_combo.setItemData(idx, name, QtCore.Qt.ToolTipRole)
             else:
                 self.model_combo.addItem("(sin modelos detectados)", "")
             self.model_combo.setEnabled(bool(self._ollama_models))

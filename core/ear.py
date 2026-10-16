@@ -208,8 +208,14 @@ class ContinuousEar:
             except queue.Empty:
                 continue
 
-            # Escucha pausada: descartar frame y aplana nivel visual del HUD
+            # Escucha pausada: DRENAR toda la cola acumulada para evitar
+            # que frames en buffer se procesen al reanudar, y aplana el HUD.
             if self._muted.is_set():
+                try:
+                    while True:
+                        self._raw_queue.get_nowait()
+                except queue.Empty:
+                    pass
                 if self.rms_cb:
                     try:
                         self.rms_cb(0.0)
@@ -217,6 +223,7 @@ class ContinuousEar:
                         pass
                 buffer.clear()
                 is_speech_active = False
+                self._vad_iterator.reset_states()
                 continue
 
             # Nivel RMS para la animación visual del HUD
@@ -226,6 +233,19 @@ class ContinuousEar:
                     self.rms_cb(rms)
                 except Exception:
                     pass
+
+            # ── GATE DE ENERGÍA (Anti-falsos-positivos) ──────────────────
+            # Si el nivel RMS es menor a -42 dBFS (0.008 en escala lineal),
+            # el frame es silencio electrónico o ruido de fondo insignificante.
+            # Se descarta ANTES de pasarlo al modelo VAD: evita que Silero
+            # interprete ruido de WASAPI/PipeWire como voz del Señor VK.
+            if rms < 0.008:
+                if not is_speech_active:
+                    # Solo limpiar el buffer si aún no hemos detectado inicio de voz.
+                    # Si ya estábamos en medio de una locución, dejar que el VAD
+                    # detecte el silencio de forma natural para respetar speech_pad_ms.
+                    pass
+                continue
 
             # [BUG-2 FIX] Silero v5 espera tensor de forma [1, T] (batch_size=1)
             # Rellenar con ceros si el bloque es menor que FRAME_SIZE (FIN de stream)
