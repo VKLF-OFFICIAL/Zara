@@ -311,9 +311,9 @@ def os_control(action: str, target: str = "", value: str = "") -> Dict[str, Any]
 
         elif action == "set_volume":
             try:
-                pct = float(value)
+                pct = float(value or target)
             except ValueError:
-                return {"success": False, "error": f"Valor de volumen inválido: '{value}'"}
+                return {"success": False, "error": f"Valor de volumen inválido: '{value or target}'"}
             if sys.platform == "win32":
                 msg = _set_windows_volume(pct)
             else:

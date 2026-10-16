@@ -104,6 +104,38 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
 # Anthropic API
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-3-7-sonnet-latest")
+# Alias de modelo para el CLI 'claude' (ej. "sonnet", "opus", "haiku", "fable"); vacío = por defecto.
+CLAUDE_MODEL_OVERRIDE = os.environ.get("ZARA_CLAUDE_MODEL", "")
+
+
+def persist_env_var(key: str, value: str) -> None:
+    """Actualiza (o añade) una variable en el archivo .env del proyecto.
+
+    Usado para recordar la elección de modelo/cerebro del Señor VK entre
+    reinicios de ZARA (panel táctico del HUD).
+    """
+    env_path = BASE_DIR / ".env"
+    lines: list[str] = []
+    if env_path.is_file():
+        with open(env_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+    found = False
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if stripped.startswith(f"{key}=") or stripped.startswith(f"{key} ="):
+            lines[i] = f'{key}="{value}"\n'
+            found = True
+            break
+    if not found:
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines.append(f'{key}="{value}"\n')
+
+    with open(env_path, "w", encoding="utf-8") as f:
+        f.writelines(lines)
+
+    os.environ[key] = value
 
 # --- AGENTE AUTÓNOMO (REACT) ---
 MAX_REACT_STEPS = int(os.environ.get("ZARA_MAX_REACT_STEPS", "8"))

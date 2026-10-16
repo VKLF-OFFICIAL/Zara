@@ -20,6 +20,7 @@ from typing import Any, AsyncGenerator, Callable, Dict, Generator, List, Optiona
 from config import (
     ANTHROPIC_API_KEY,
     ANTHROPIC_MODEL,
+    CLAUDE_MODEL_OVERRIDE,
     DEFAULT_BRAIN,
     GEMINI_API_KEY,
     GEMINI_MODEL,
@@ -31,6 +32,88 @@ from config import (
 from core.tools import TOOL_DEFINITIONS, execute_tool
 
 log = logging.getLogger("zara.brain")
+
+
+def list_ollama_models(host: str = OLLAMA_HOST, timeout: float = 3.0) -> List[str]:
+    """Consulta /api/tags de Ollama y devuelve los nombres de los modelos instalados localmente."""
+    try:
+        req = urllib.request.Request(f"{host.rstrip('/')}/api/tags", method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            data = json.loads(resp.read().decode("utf-8"))
+        names = [m.get("name", "") for m in data.get("models", []) if m.get("name")]
+        return sorted(names)
+    except Exception as exc:
+        log.warning("No se pudo listar los modelos de Ollama en %s: %s", host, exc)
+        return []
+
+# Busca un bloque de código ```json / ```xml / ``` que contenga un objeto JSON,
+# o un objeto JSON "suelto" en cualquier parte del texto de respuesta.
+_FENCED_JSON_RE = re.compile(r"```(?:json|xml)?\s*(\{.*?\})\s*```", re.DOTALL)
+_BARE_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def _extract_embedded_tool_call(text: str, known_tool_names: set) -> Optional[Dict[str, Any]]:
+    """Intenta extraer una llamada a herramienta {"name": ..., "arguments": {...}}
+
+    escrita por el modelo como texto plano en lugar de usar el campo nativo
+    `tool_calls` de la API de Ollama (frecuente en modelos no fine-tuneados
+    específicamente para tool calling, como variantes 'abliterate').
+    """
+    if not text or not text.strip():
+        return None
+
+    candidates = [m.group(1) for m in _FENCED_JSON_RE.finditer(text)]
+    bare = _BARE_JSON_RE.search(text)
+    if bare:
+        candidates.append(bare.group(0))
+    candidates.append(text.strip())
+
+    for candidate in candidates:
+        try:
+            obj = json.loads(candidate)
+        except Exception:
+            continue
+        if isinstance(obj, dict) and obj.get("name") in known_tool_names:
+            return obj
+    return None
+
+
+def _summarize_observations_locally(observations: List[str]) -> str:
+    """Construye una respuesta breve en texto plano a partir de observaciones de
+    herramientas ya ejecutadas, sin depender de otra llamada al LLM.
+
+    Se usa como red de seguridad cuando el modelo local se queda repitiendo la
+    misma llamada a herramienta sin nunca cerrar con una respuesta hablable.
+    """
+    parts: List[str] = []
+    for obs in observations:
+        _, _, raw_json = obs.partition(": ")
+        try:
+            data = json.loads(raw_json)
+        except Exception:
+            continue
+        if not isinstance(data, dict):
+            continue
+
+        if data.get("error"):
+            parts.append(f"Hubo un error: {data['error']}")
+        elif data.get("message"):
+            parts.append(str(data["message"]))
+        elif data.get("top_processes"):
+            names = ", ".join(p.get("name", "?") for p in data["top_processes"][:5])
+            parts.append(f"Los procesos que más consumen ahora son: {names}.")
+        elif data.get("stdout"):
+            parts.append(data["stdout"][:200])
+        elif data.get("content"):
+            parts.append(str(data["content"])[:200])
+        elif data.get("clipboard") is not None:
+            parts.append(f"El portapapeles contiene: {data['clipboard'][:150]}")
+        elif data.get("success"):
+            parts.append("Listo, Señor VK. La acción se completó correctamente.")
+
+    if not parts:
+        return "Tarea completada, Señor VK."
+    return " ".join(parts)
 
 
 # =============================================================================
@@ -90,6 +173,14 @@ class OllamaProvider:
         self.host = host.rstrip("/")
         self.model = model
 
+    def set_model(self, model: str) -> None:
+        """Cambia en caliente el modelo local usado para las próximas peticiones."""
+        self.model = model
+        log.info("Modelo de Ollama cambiado a: %s", model)
+
+    def list_models(self) -> List[str]:
+        return list_ollama_models(self.host)
+
     def is_available(self) -> bool:
         try:
             with urllib.request.urlopen(f"{self.host}/api/tags", timeout=1.5) as r:
@@ -102,19 +193,48 @@ class OllamaProvider:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
     ) -> Generator[Dict[str, Any], None, None]:
-        """Envía conversación a Ollama /api/chat y produce eventos de texto o tool_calls."""
+        """Envía conversación a Ollama /api/chat y produce eventos de texto o tool_calls.
+
+        Algunos modelos locales (ej. las variantes 'abliterate' de Qwen2.5-Coder) no
+        rellenan el campo nativo `tool_calls`, sino que escriben la llamada a la
+        herramienta como un bloque de código JSON dentro de `content`. Por eso el
+        contenido se acumula completo y se intenta interpretar como llamada a
+        herramienta antes de tratarlo como texto hablado.
+        """
         import requests
 
         url = f"{self.host}/api/chat"
+        sent_messages = messages
+        known_tool_names = {t.get("name") for t in (tools or [])}
+        if tools:
+            # Recordatorio de formato: algunos modelos locales no usan el campo nativo
+            # tool_calls y escriben la invocación como texto; forzar un formato JSON
+            # plano hace que _extract_embedded_tool_call lo detecte de forma fiable.
+            reminder = {
+                "role": "system",
+                "content": (
+                    "Cuando necesites usar una herramienta, responde ÚNICAMENTE con un objeto JSON "
+                    'de una sola línea: {"name": "<herramienta>", "arguments": {...}}. Sin texto '
+                    "adicional, sin explicaciones y sin bloques de código (```). Usa los nombres de "
+                    "parámetro EXACTOS del esquema de la herramienta. Si ya tienes el resultado de una "
+                    "observación del sistema, NO vuelvas a llamar a la misma herramienta: responde con "
+                    "una frase normal en texto plano resumiendo el resultado para el Señor VK."
+                ),
+            }
+            sent_messages = messages + [reminder]
+
         payload: Dict[str, Any] = {
             "model": self.model,
-            "messages": messages,
+            "messages": sent_messages,
             "stream": True,
-            "options": {"temperature": 0.2},
+            "options": {"temperature": 0.15},
         }
         if tools:
             # Formato estándar de herramientas para Ollama
             payload["tools"] = [{"type": "function", "function": t} for t in tools]
+
+        full_content = ""
+        native_tool_call_found = False
 
         try:
             with requests.post(url, json=payload, stream=True, timeout=60) as resp:
@@ -129,6 +249,7 @@ class OllamaProvider:
                         data = json.loads(line)
                         msg = data.get("message", {})
                         if "tool_calls" in msg and msg["tool_calls"]:
+                            native_tool_call_found = True
                             for tc in msg["tool_calls"]:
                                 fn = tc.get("function", {})
                                 yield {
@@ -137,11 +258,25 @@ class OllamaProvider:
                                     "args": fn.get("arguments", {}),
                                 }
                         elif "content" in msg and msg["content"]:
-                            yield {"type": "token", "token": msg["content"]}
+                            full_content += msg["content"]
                     except Exception:
                         pass
         except Exception as exc:
             yield {"type": "error", "error": f"Excepción en Ollama: {exc}"}
+            return
+
+        if native_tool_call_found:
+            return
+
+        parsed_call = _extract_embedded_tool_call(full_content, known_tool_names)
+        if parsed_call:
+            yield {
+                "type": "tool_call",
+                "name": parsed_call.get("name", ""),
+                "args": parsed_call.get("arguments") or parsed_call.get("args") or {},
+            }
+        elif full_content:
+            yield {"type": "token", "token": full_content}
 
 
 # =============================================================================
@@ -220,12 +355,21 @@ class GeminiProvider:
 class ClaudeProvider:
     """Proveedor de alto nivel con Claude 3.7 Sonnet / Claude Code CLI."""
 
+    # Alias de modelo aceptados por el CLI 'claude' (--model <alias>).
+    CLI_MODEL_ALIASES = ["sonnet", "opus", "haiku", "fable"]
+
     def __init__(self, api_key: str = ANTHROPIC_API_KEY, model: str = ANTHROPIC_MODEL):
         self.api_key = api_key
         self.model = model
+        self.cli_model_override: str = CLAUDE_MODEL_OVERRIDE
         self._client = None
         if self.api_key:
             self._init_client()
+
+    def set_cli_model(self, alias: str) -> None:
+        """Cambia en caliente el alias de modelo (sonnet/opus/haiku/fable) usado por el CLI."""
+        self.cli_model_override = alias or ""
+        log.info("Modelo del CLI de Claude cambiado a: %s", self.cli_model_override or "(por defecto)")
 
     def _init_client(self) -> None:
         try:
@@ -293,6 +437,8 @@ class ClaudeProvider:
                 user_msg = messages[-1]["content"] if messages else ""
                 full_prompt = f"{SYSTEM_PROMPT}\n\nPetición del Señor VK:\n{user_msg}"
                 cmd = [claude_bin, "-p", full_prompt, "--setting-sources", "project"]
+                if self.cli_model_override:
+                    cmd += ["--model", self.cli_model_override]
                 proc = subprocess.Popen(
                     cmd,
                     stdout=subprocess.PIPE,
@@ -359,6 +505,9 @@ class ZaraBrain:
                 self._emit_tool_event("inspect_screen", "Pantalla capturada correctamente.")
 
         # Bucle ReAct autónomo (hasta MAX_REACT_STEPS iteraciones)
+        last_tool_signature: Optional[Tuple] = None
+        last_observations: List[str] = []
+
         for step in range(1, MAX_REACT_STEPS + 1):
             log.info("Bucle ReAct - Paso %d/%d", step, MAX_REACT_STEPS)
 
@@ -400,6 +549,25 @@ class ZaraBrain:
                     self.history.append({"role": "assistant", "content": full_thought_text})
                 break
 
+            # Detección de bucle: algunos modelos locales piden la MISMA herramienta
+            # una y otra vez sin nunca cerrar con una respuesta de texto. Si la llamada
+            # es idéntica a la del paso anterior, no se vuelve a ejecutar: se corta el
+            # bucle y se resume localmente con la observación ya obtenida.
+            current_signature = tuple(sorted(
+                (tc.get("name", ""), json.dumps(tc.get("args", {}), sort_keys=True, ensure_ascii=False))
+                for tc in tool_calls_to_run
+            ))
+            if current_signature == last_tool_signature and last_observations:
+                log.warning(
+                    "Herramienta repetida sin progreso (%s). Resumiendo localmente sin más llamadas al LLM.",
+                    current_signature,
+                )
+                summary = _summarize_observations_locally(last_observations)
+                self.history.append({"role": "assistant", "content": summary})
+                yield summary
+                break
+            last_tool_signature = current_signature
+
             # Ejecutar herramientas autónomamente (YOLO Seguro)
             observations = []
             for tc in tool_calls_to_run:
@@ -417,11 +585,18 @@ class ZaraBrain:
                 observations.append(f"Resultado de {name}: {json.dumps(result, ensure_ascii=False)}")
                 self._emit_tool_event(name, "Completado.")
 
+            last_observations = observations
+
             # Inyectar observaciones al historial para que el modelo decida el siguiente paso o corrija
             obs_content = "\n\n".join(observations)
             self.history.append({
                 "role": "user",
-                "content": f"[OBSERVACIÓN DEL SISTEMA]:\n{obs_content}\n\nSi hubo un error, corrígelo de inmediato. Si la tarea terminó, resume el resultado para el Señor VK con elegancia.",
+                "content": (
+                    f"[OBSERVACIÓN DEL SISTEMA]:\n{obs_content}\n\n"
+                    "Si hubo un error, corrígelo de inmediato. Si la tarea terminó, resume el resultado "
+                    "para el Señor VK en una respuesta de texto normal y breve (sin bloques de código ni JSON). "
+                    "No vuelvas a llamar a la misma herramienta con los mismos parámetros."
+                ),
             })
 
     def _execute_stream_with_fallback(

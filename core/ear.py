@@ -57,6 +57,7 @@ class ContinuousEar:
         self.is_speaking_fn = is_speaking_fn or (lambda: False)
         self.rms_cb = rms_callback
 
+        self._muted = threading.Event()
         self._stop_event = threading.Event()
         self._raw_queue: queue.Queue[np.ndarray] = queue.Queue()
         self._utterance_queue: queue.Queue[np.ndarray] = queue.Queue()
@@ -146,6 +147,17 @@ class ContinuousEar:
             self._vad_thread.join(timeout=1.0)
         log.info("Oído de Zara detenido.")
 
+    def set_muted(self, muted: bool) -> None:
+        """Pausa o reanuda la escucha (el micrófono sigue capturando, pero se ignora)."""
+        if muted:
+            self._muted.set()
+        else:
+            self._muted.clear()
+        log.info("Escucha de Zara %s.", "pausada" if muted else "reanudada")
+
+    def is_muted(self) -> bool:
+        return self._muted.is_set()
+
     def _capture_audio_worker(self) -> None:
         """Lee bloques continuos de 16 kHz desde sounddevice."""
         import sounddevice as sd
@@ -181,6 +193,18 @@ class ContinuousEar:
             try:
                 frame = self._raw_queue.get(timeout=0.1)
             except queue.Empty:
+                continue
+
+            # Escucha pausada por el Señor VK: se descarta el frame (sin VAD, sin barge-in)
+            # y se aplana el nivel visual del HUD para reflejar el silencio.
+            if self._muted.is_set():
+                if self.rms_cb:
+                    try:
+                        self.rms_cb(0.0)
+                    except Exception:
+                        pass
+                buffer.clear()
+                is_speech_active = False
                 continue
 
             # Nivel RMS para la animación visual del HUD
