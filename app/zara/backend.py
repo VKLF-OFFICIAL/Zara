@@ -32,7 +32,7 @@ from .errors import BrainError
 log = logging.getLogger("zara.backend")
 
 _HELP = (
-    "Señor VK, esto es lo que puedo hacer por voz:\n"
+    "Esto es lo que puedo hacer por voz:\n"
     "• Conversar y trabajar: pregúnteme, o pídame tareas (programar, editar archivos, "
     "automatizar) — uso Claude con control del equipo.\n"
     "• Sistema: «estado del equipo», «qué hora es», «qué tiempo hace», «haz una captura».\n"
@@ -121,6 +121,11 @@ class Backend:
         self._speak_lock = threading.Lock()
         self._player = None
         self._stream_voice = False     # False = sin construir; None = no usable; obj = activo
+        from .address import AddressModerator
+        # Modera los apelativos EN VOZ: nada de «» en cada frase.
+        self._address = AddressModerator(
+            every=int(self.cfg.get("apelativo_cada", 6)),
+            cooldown=float(self.cfg.get("apelativo_descanso_s", 180.0)))
         self._recent_spoken = deque(maxlen=5)
         self.speak_enabled = bool(self.cfg.get("hablar", True))
         self._manos_enabled = bool(self.cfg.get("manos", True))
@@ -176,7 +181,7 @@ class Backend:
             pass
 
     def _fire_reminder(self, msg: str):
-        texto = "Señor VK, le recuerdo" + (f": {msg}." if msg else ".")
+        texto = "Le recuerdo" + (f": {msg}." if msg else " algo pendiente.")
         log.info("recordatorio: %s", msg)
         try:
             import shutil
@@ -270,8 +275,8 @@ class Backend:
         return EnergyVad(threshold=threshold)
 
     def _on_barge_in(self):
-        """El Señor VK habla mientras Zara responde: corta la voz al instante."""
-        log.info("barge-in: interrupción del Señor VK; abortando voz")
+        """El habla mientras Zara responde: corta la voz al instante."""
+        log.info("barge-in: interrupción del; abortando voz")
         self.stop_speaking()
 
     def _build_wake_detector(self):
@@ -365,7 +370,7 @@ class Backend:
     def open_listen_window(self, after_reply: bool = False):
         """Abre la ventana de escucha sin «Zara» una vez Zara ha terminado de hablar.
 
-        Tras el acuse («¿Sí, Señor VK?») siempre; tras una respuesta, solo en
+        Tras el acuse («¿Sí?») siempre; tras una respuesta, solo en
         modo conversación.
         """
         if not after_reply or self.cfg.get("modo_conversacion"):
@@ -373,7 +378,7 @@ class Backend:
 
     def _verify_audio(self, audio) -> tuple[bool, float]:
         """Verifica la huella de voz. Tras la primera autenticación correcta de la
-        sesión, relaja el umbral (el Señor VK ya está confirmado presente): evita
+        sesión, relaja el umbral (el ya está confirmado presente): evita
         rechazos molestos en frases cortas o con ruido durante la conversación."""
         relax = 0.08 if self._verified_once else 0.0
         thr = max(0.45, self._verifier.threshold - relax)
@@ -431,22 +436,22 @@ class Backend:
                 return self.core.handle_text(clean, brain_override=override, hands=hands)
         except BrainError as exc:
             log.warning("cerebro falló: %s", exc)
-            return {"reply": f"Lo siento, Señor VK: el cerebro no respondió ({exc}).",
+            return {"reply": f"Lo siento: el cerebro no respondió ({exc}).",
                     "brain": self.active_brain()}
         except Exception:
             log.exception("error procesando %r", text)
-            return {"reply": "Lo siento, Señor VK, ha ocurrido un error. "
+            return {"reply": "Lo siento, ha ocurrido un error. "
                              "Lo he dejado anotado en el registro.", "brain": "error"}
 
     def _run_skill(self, sk, g: dict) -> dict:
         """Ejecuta una skill declarativa (decir / shell / prompt)."""
         if sk.tipo == "decir":
-            return {"reply": sk.render("respuesta", g) or "Hecho, Señor VK.",
+            return {"reply": sk.render("respuesta", g) or "Hecho.",
                     "brain": "skill"}
         if sk.tipo == "shell":
             cmd = sk.render("comando", g).strip()
             if not cmd:
-                return {"reply": f"La skill «{sk.nombre}» no tiene comando, Señor VK.",
+                return {"reply": f"La skill «{sk.nombre}» no tiene comando.",
                         "brain": "skill"}
             return self._guarded_run(cmd, force_confirm=sk.confirmar)
         if sk.tipo == "prompt":
@@ -455,11 +460,11 @@ class Backend:
             try:
                 with self._brain_lock:
                     reply = brain.ask(filled)
-                return {"reply": reply or "Sin respuesta, Señor VK.", "brain": "skill · claude"}
+                return {"reply": reply or "Sin respuesta.", "brain": "skill · claude"}
             except BrainError as exc:
-                return {"reply": f"La skill no pudo consultar, Señor VK ({exc}).",
+                return {"reply": f"La skill no pudo consultar ({exc}).",
                         "brain": "skill"}
-        return {"reply": "No sé ejecutar esa skill, Señor VK.", "brain": "skill"}
+        return {"reply": "No sé ejecutar esa skill.", "brain": "skill"}
 
     def _run_async_task(self, clean: str, brain, hands=None) -> dict:
         """Lanza la tarea en segundo plano (agente Claude o cerebro con manos)
@@ -469,19 +474,19 @@ class Backend:
                 with self._brain_lock:
                     return self.core.handle_text(clean, brain_override=brain, hands=hands)
             except BrainError as exc:
-                return {"reply": f"La tarea no salió, Señor VK: {exc}.", "brain": "agente"}
+                return {"reply": f"La tarea no salió: {exc}.", "brain": "agente"}
             except Exception:
                 log.exception("tarea en segundo plano falló")
-                return {"reply": "La tarea falló, Señor VK; lo he anotado en el registro.",
+                return {"reply": "La tarea falló; lo he anotado en el registro.",
                         "brain": "agente"}
         self._tasks.submit(clean[:60], work, self._task_finished)
-        return {"reply": "Enseguida, Señor VK, me pongo con ello. Le aviso al terminar.",
+        return {"reply": "Enseguida, me pongo con ello. Le aviso al terminar.",
                 "brain": "agente", "async": True}
 
     def _task_finished(self, name: str, result):
         reply = result.get("reply") if isinstance(result, dict) else (result or "")
-        reply = (reply or "Tarea terminada, Señor VK.").strip()
-        texto = f"Ya está, Señor VK. {reply}" if not reply.lower().startswith(
+        reply = (reply or "Tarea terminada.").strip()
+        texto = f"Ya está. {reply}" if not reply.lower().startswith(
             ("ya está", "ya esta", "listo", "hecho", "la tarea")) else reply
         log.info("tarea terminada: %s", name)
         cb = self.on_task_done
@@ -514,7 +519,7 @@ class Backend:
     def _do_intent(self, it) -> dict:
         k = it.kind
         if k == "show_panel":
-            return {"reply": "Aquí tiene, Señor VK.", "brain": "acción", "ui": "show_panel"}
+            return {"reply": "Aquí tiene.", "brain": "acción", "ui": "show_panel"}
         if k == "stop_speaking":
             self.stop_speaking()
             return {"reply": "", "brain": "acción"}
@@ -557,19 +562,19 @@ class Backend:
             return self._screen_look(it.arg or "")
         if k == "power":
             return self._power(it.arg or "")
-        return {"reply": "No entendí la orden, Señor VK.", "brain": "acción"}
+        return {"reply": "No entendí la orden.", "brain": "acción"}
 
     # --- JARVIS: recordatorios, sesión, capturas, energía -------------------
     def _add_reminder(self, text: str) -> dict:
         from .reminders import parse_when
         when, msg = parse_when(text)
         if when is None:
-            return {"reply": "¿Para cuándo se lo recuerdo, Señor VK? "
+            return {"reply": "¿Para cuándo se lo recuerdo? "
                     "Dígame «en diez minutos» o «a las ocho».", "brain": "acción"}
         self._reminders.add(when, msg)
         cuando = when.strftime("las %H:%M")
         de_que = f": {msg}" if msg else ""
-        return {"reply": f"De acuerdo, Señor VK. Se lo recordaré a {cuando}{de_que}.",
+        return {"reply": f"De acuerdo. Se lo recordaré a {cuando}{de_que}.",
                 "brain": "acción"}
 
     def _lock_session(self) -> dict:
@@ -577,18 +582,18 @@ class Backend:
             try:
                 import ctypes
                 ctypes.windll.user32.LockWorkStation()
-                return {"reply": "Bloqueando la sesión, Señor VK.", "brain": "acción"}
+                return {"reply": "Bloqueando la sesión.", "brain": "acción"}
             except Exception as exc:
-                return {"reply": f"No pude bloquear la sesión, Señor VK ({exc}).", "brain": "acción"}
+                return {"reply": f"No pude bloquear la sesión ({exc}).", "brain": "acción"}
         import shutil as _sh
         if _sh.which("loginctl"):
             subprocess.run(["loginctl", "lock-session"], stdin=subprocess.DEVNULL)
-            return {"reply": "Bloqueando la sesión, Señor VK.", "brain": "acción"}
+            return {"reply": "Bloqueando la sesión.", "brain": "acción"}
         if _sh.which("qdbus-qt6"):
             subprocess.run(["qdbus-qt6", "org.freedesktop.ScreenSaver",
                             "/ScreenSaver", "Lock"], stdin=subprocess.DEVNULL)
-            return {"reply": "Bloqueando la pantalla, Señor VK.", "brain": "acción"}
-        return {"reply": "No encuentro cómo bloquear la sesión, Señor VK.", "brain": "acción"}
+            return {"reply": "Bloqueando la pantalla.", "brain": "acción"}
+        return {"reply": "No encuentro cómo bloquear la sesión.", "brain": "acción"}
 
     def _screenshot(self) -> dict:
         import shutil as _sh
@@ -610,15 +615,15 @@ class Backend:
                       f"$bmp.Save('{dest.as_posix()}'); $g.Dispose(); $bmp.Dispose()")
                 subprocess.run(["powershell", "-NoProfile", "-Command", ps], capture_output=True)
             if dest.exists():
-                return {"reply": "Captura guardada en Imágenes, Señor VK.", "brain": "acción"}
-            return {"reply": "No he podido hacer la captura, Señor VK.", "brain": "acción"}
+                return {"reply": "Captura guardada en Imágenes.", "brain": "acción"}
+            return {"reply": "No he podido hacer la captura.", "brain": "acción"}
 
         if _sh.which("spectacle"):
             subprocess.run(["spectacle", "-b", "-n", "-f", "-o", str(dest)],
                            stdin=subprocess.DEVNULL, capture_output=True)
         if dest.exists():
-            return {"reply": f"Captura guardada en Imágenes, Señor VK.", "brain": "acción"}
-        return {"reply": "No he podido hacer la captura, Señor VK.", "brain": "acción"}
+            return {"reply": f"Captura guardada en Imágenes.", "brain": "acción"}
+        return {"reply": "No he podido hacer la captura.", "brain": "acción"}
 
     def _screen_look(self, question: str) -> dict:
         """Captura la pantalla, se la pasa a Claude (multimodal) y la borra.
@@ -652,14 +657,14 @@ class Backend:
             subprocess.run(["spectacle", "-b", "-n", "-f", "-o", str(shot)],
                            stdin=subprocess.DEVNULL, capture_output=True)
         else:
-            return {"reply": "No encuentro con qué mirar la pantalla, Señor VK.",
+            return {"reply": "No encuentro con qué mirar la pantalla.",
                     "brain": "acción"}
 
         if not shot.exists():
-            return {"reply": "No he podido capturar la pantalla, Señor VK.",
+            return {"reply": "No he podido capturar la pantalla.",
                     "brain": "acción"}
         q = question.strip() or "dime brevemente qué hay en ella"
-        prompt = (f"Esta es una captura de la pantalla del Señor VK: {shot}\n"
+        prompt = (f"Esta es una captura de la pantalla del: {shot}\n"
                   f"Ábrela con la herramienta Read (es una imagen) y {q}. "
                   f"Responde en español, directo y sin tecnicismos innecesarios.")
         brain = None
@@ -667,15 +672,15 @@ class Backend:
             brain = self.core.brains.get("claude") or self.core.brains.get("agente")
         if brain is None:
             shot.unlink(missing_ok=True)
-            return {"reply": "No tengo un cerebro capaz de ver imágenes ahora mismo, Señor VK.",
+            return {"reply": "No tengo un cerebro capaz de ver imágenes ahora mismo.",
                     "brain": "acción"}
         try:
             with self._brain_lock:
                 reply = brain.ask(prompt)
-            return {"reply": reply or "No he sabido interpretar la pantalla, Señor VK.",
+            return {"reply": reply or "No he sabido interpretar la pantalla.",
                     "brain": "claude · visión"}
         except BrainError as exc:
-            return {"reply": f"No pude mirar la pantalla, Señor VK ({exc}).",
+            return {"reply": f"No pude mirar la pantalla ({exc}).",
                     "brain": "claude · visión"}
         finally:
             try:
@@ -686,8 +691,8 @@ class Backend:
     def _power(self, what: str) -> dict:
         verbo = {"poweroff": "apagar", "reboot": "reiniciar", "suspend": "suspender"}[what]
         if what != "suspend" and self.confirm.enabled:
-            if not self.confirm.ask(f"¿Seguro que quiere {verbo} el equipo, Señor VK?"):
-                return {"reply": "De acuerdo, no lo hago, Señor VK.", "brain": "guardián"}
+            if not self.confirm.ask(f"¿Seguro que quiere {verbo} el equipo?"):
+                return {"reply": "De acuerdo, no lo hago.", "brain": "guardián"}
         if sys.platform == "win32":
             cmd = {
                 "poweroff": ["shutdown.exe", "/s", "/t", "0"],
@@ -695,18 +700,18 @@ class Backend:
                 "suspend": ["rundll32.exe", "powrprof.dll,SetSuspendState", "Sleep"],
             }[what]
             subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
-            return {"reply": f"A la orden, Señor VK. Voy a {verbo} el equipo.", "brain": "acción"}
+            return {"reply": f"A la orden. Voy a {verbo} el equipo.", "brain": "acción"}
         cmd = {"poweroff": ["systemctl", "poweroff"],
                "reboot": ["systemctl", "reboot"],
                "suspend": ["systemctl", "suspend"]}[what]
         subprocess.Popen(cmd, stdin=subprocess.DEVNULL)
-        return {"reply": f"A la orden, Señor VK. Voy a {verbo} el equipo.", "brain": "acción"}
+        return {"reply": f"A la orden. Voy a {verbo} el equipo.", "brain": "acción"}
 
     def _close_app(self, name: str) -> dict:
         """Cierra una aplicación por su nombre directamente."""
         procs = actions.find_app_processes(name)
         if not procs:
-            return {"reply": f"No veo abierta ninguna aplicación «{name}», Señor VK.",
+            return {"reply": f"No veo abierta ninguna aplicación «{name}».",
                     "brain": "acción"}
         nombres = ", ".join(sorted({c for _, c in procs}))
         act = Action(kind="process", description=f"cerrar {name}",
@@ -714,9 +719,9 @@ class Backend:
         if self._guardian:
             self._guardian.classify(act)  # queda auditado
         if self.confirm.enabled and not self.confirm.ask(f"¿Cierro {nombres}? Se perderá lo que no esté guardado."):
-            return {"reply": "De acuerdo, no la cierro, Señor VK.", "brain": "guardián"}
+            return {"reply": "De acuerdo, no la cierro.", "brain": "guardián"}
         n = actions.terminate(procs)
-        return {"reply": f"Hecho, Señor VK: he cerrado {nombres}." if n else
+        return {"reply": f"Hecho: he cerrado {nombres}." if n else
                 "No he podido cerrarla.", "brain": "acción"}
 
     def _run_guarded_raw(self, cmd: str, force_confirm: bool = False):
@@ -732,7 +737,7 @@ class Backend:
             return ("blocked", decision.reason or "acción no permitida")
         if self.confirm.enabled and (decision.requires_confirmation or force_confirm):
             nivel = "crítica" if decision.level is Level.CRITICAL else "delicada"
-            if not self.confirm.ask(f"Acción {nivel}: «{cmd}». ¿Confirma, Señor VK?"):
+            if not self.confirm.ask(f"Acción {nivel}: «{cmd}». ¿Confirma?"):
                 return ("cancelled", "")
         if decision.requires_confirmation:
             try:
@@ -752,15 +757,15 @@ class Backend:
     def _guarded_run(self, cmd: str, force_confirm: bool = False) -> dict:
         status, res = self._run_guarded_raw(cmd, force_confirm=force_confirm)
         if status == "blocked":
-            return {"reply": f"No puedo ejecutar eso, Señor VK: {res}.", "brain": "guardián"}
+            return {"reply": f"No puedo ejecutar eso: {res}.", "brain": "guardián"}
         if status == "cancelled":
             extra = f" ({res})" if res else ""
-            return {"reply": f"Cancelado, Señor VK{extra}.", "brain": "guardián"}
+            return {"reply": f"Cancelado{extra}.", "brain": "guardián"}
         if status == "error":
             return {"reply": f"Falló el comando: {res}", "brain": "acción"}
         if "\n" not in res and len(res) <= 80:
-            return {"reply": f"Hecho, Señor VK: {res}.", "brain": "acción"}
-        return {"reply": f"Hecho, Señor VK.\n```\n{res[:1500]}\n```", "brain": "acción"}
+            return {"reply": f"Hecho: {res}.", "brain": "acción"}
+        return {"reply": f"Hecho.\n```\n{res[:1500]}\n```", "brain": "acción"}
 
     def _execute_tool(self, name: str, args: dict) -> dict:
         """Ejecuta una herramienta pedida por un cerebro (Tool Calling nativo),
@@ -775,7 +780,7 @@ class Backend:
                 if status == "blocked":
                     return {"success": False, "blocked": True, "stderr": out, "exit_code": 126}
                 if status == "cancelled":
-                    return {"success": False, "stderr": f"cancelado por el Señor VK ({out})", "exit_code": 130}
+                    return {"success": False, "stderr": f"cancelado por el ({out})", "exit_code": 130}
                 if status == "error":
                     return {"success": False, "stderr": out, "exit_code": 1}
                 return {"success": True, "stdout": out, "exit_code": 0}
@@ -833,7 +838,7 @@ class Backend:
     def _hands_runner(self, brain, prompt: str, context: str) -> str:
         """Protocolo de texto <ejecutar> para cerebros sin Tool Calling nativo.
         Bucle acotado; cada comando pasa por el Guardián. (Fallback del legado.)"""
-        convo = f"{PROTOCOL}\n\n---\nPetición del Señor VK:\n{prompt}"
+        convo = f"{PROTOCOL}\n\n---\nPetición del:\n{prompt}"
         reply = ""
         for _ in range(self._hands_max_steps):
             reply = brain.ask(convo, context=context)
@@ -846,14 +851,14 @@ class Backend:
                 log.info("manos (%s) ejecuta: %s", self.active_brain(), cmd)
                 status, out = self._run_guarded_raw(cmd)
                 etiqueta = {"blocked": "[BLOQUEADO por el Guardián] ",
-                            "cancelled": "[cancelado por el Señor VK] ",
+                            "cancelled": "[cancelado por el] ",
                             "error": "[error] "}.get(status, "")
                 bloques.append(f"$ {cmd}\n{etiqueta}{out}")
             convo = (f"{convo}\n\n{reply.strip()}\n\n---\nSalida de los comandos:\n"
                      + "\n\n".join(bloques)
-                     + "\n\n---\nResponde ahora al Señor VK con el resultado, en "
+                     + "\n\n---\nResponde ahora al con el resultado, en "
                        "español y breve. Si necesitas más comandos, usa <ejecutar>.")
-        return strip_actions(reply) or "He hecho lo que he podido, Señor VK."
+        return strip_actions(reply) or "He hecho lo que he podido."
 
     # --- voz ----------------------------------------------------------------
     def _build_stream_voice(self):
@@ -926,7 +931,7 @@ class Backend:
         if not self.speak_enabled:
             return
         self.ensure_ready_text()
-        say = speech_text(text)
+        say = self._address.apply(speech_text(text))
         if not say:
             return
         self._recent_spoken.append(say)

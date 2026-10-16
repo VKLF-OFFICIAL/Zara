@@ -5,10 +5,12 @@ import sys
 from pathlib import Path
 from ..errors import BrainError
 
+# Espacio de trabajo en el SSD nativo (rutas calientes, punto 6), no en NTFS.
 if sys.platform == "win32":
     _DEFAULT_SANDBOX = str(Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "zara" / "espacio")
 else:
-    _DEFAULT_SANDBOX = "/mnt/almacen/ZARA/espacio"
+    _DEFAULT_SANDBOX = str(Path(os.environ.get(
+        "XDG_DATA_HOME", str(Path.home() / ".local/share"))) / "zara" / "espacio")
 
 
 class _CliBrain:

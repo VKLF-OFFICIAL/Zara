@@ -22,39 +22,33 @@ def build_registry(persona: str = "", host: str = _HOST,
                    claude_model: str | None = None,
                    claude_mode: str = "agente",
                    claude_workdir: str | None = None,
-                   mcp_config: str | None = None) -> BrainRegistry:
-    """Crea el registro de cerebros, NATIVOS primero (SDK en memoria, Tool Calling)
-    y los CLI como último fallback.
+                   mcp_config: str | None = None,
+                   cli_fallback: bool = False) -> BrainRegistry:
+    """Crea el registro de cerebros. Por defecto, SOLO adaptadores NATIVOS en
+    memoria (SDK, Tool Calling): no hay ninguna dependencia de subproceso a los
+    CLI de consola de Claude/Gemini.
 
     Orden (define el activo por defecto = primer disponible):
       1. Gemini nativo (google-genai)  — respuesta instantánea y enrutamiento.
       2. Claude nativo (AsyncAnthropic).
-      3. Agente Claude CLI (control total del equipo) — fallback del legado.
-      4. Gemini CLI — fallback solo si no hay nativo utilizable.
-      5. Ollama nativo (/api/chat con herramientas) por cada modelo local.
+      3. Ollama nativo (/api/chat con herramientas) por cada modelo local.
+
+    `cli_fallback=True` (opcional, desactivado por defecto) añade al final el
+    agente Claude CLI y, si procede, el Gemini CLI, como RED DE SEGURIDAD para
+    equipos sin claves de API. Nunca se usa si hay un nativo disponible.
     """
-    brains: list = []
+    brains: list = [NativeGemini(system=persona), NativeAnthropic(system=persona)]
+    for name in _ollama_models(host):
+        brains.append(NativeOllama(name, system=persona, host=host))
 
-    gemini_native = NativeGemini(system=persona)
-    brains.append(gemini_native)
-
-    claude_native = NativeAnthropic(system=persona)
-    brains.append(claude_native)
-
-    # Agente Claude CLI (nombre «agente»): control nativo del equipo como respaldo.
-    agente = ClaudeBrain(system=persona, model=claude_model, mode="agente",
-                         workdir=claude_workdir, mcp_config=mcp_config)
-    agente.name = "agente"
-    brains.append(agente)
-
-    # Gemini CLI solo si su nativo no es utilizable pero el CLI sí.
-    if not gemini_native.available():
+    if cli_fallback:
+        agente = ClaudeBrain(system=persona, model=claude_model, mode="agente",
+                             workdir=claude_workdir, mcp_config=mcp_config)
+        agente.name = "agente"
+        brains.append(agente)
         gemini_cli = GeminiBrain(system=persona)
         if gemini_cli.available():
             gemini_cli.name = "gemini-cli"
             brains.append(gemini_cli)
-
-    for name in _ollama_models(host):
-        brains.append(NativeOllama(name, system=persona, host=host))
 
     return BrainRegistry(brains)

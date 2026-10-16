@@ -126,10 +126,10 @@ class ReActAgent:
                 last_text = text
 
             if error and not tool_calls:
-                return last_text or f"Lo siento, Señor VK: {error}."
+                return last_text or f"Lo siento, ha fallado: {error}."
 
             if not tool_calls:
-                return last_text or "Hecho, Señor VK."
+                return last_text or "Hecho."
 
             # Ejecutar las herramientas pedidas y realimentar los resultados.
             feedback: list[str] = []
@@ -152,8 +152,8 @@ class ReActAgent:
             messages.append({"role": "assistant", "content": assistant_note})
             messages.append({"role": "user", "content":
                              "Resultado de las herramientas:\n" + "\n\n".join(feedback) +
-                             "\n\nSi la tarea está completa, responde al Señor VK en "
-                             "español, breve y claro. Si algo falló, corrígelo y "
-                             "vuelve a intentarlo con las herramientas."})
+                             "\n\nSi la tarea está completa, responde en español, breve "
+                             "y claro (sin apelativos repetidos). Si algo falló, "
+                             "corrígelo y vuelve a intentarlo con las herramientas."})
 
-        return last_text or "He hecho lo que he podido, Señor VK."
+        return last_text or "He hecho lo que he podido."

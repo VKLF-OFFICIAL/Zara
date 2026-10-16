@@ -27,9 +27,12 @@ cerebro_por_defecto = ""          # "" = primer disponible; o "gemini", "claude"
 modelo_claude = ""                # "" = el de tu suscripción; o "haiku"/"sonnet"/"opus"
 cerebro_claude_modo = "agente"    # "agente" = control total (CLI fallback) | "consulta" = solo web+lectura
 claude_directorio = ""            # "" = su carpeta personal; carpeta de trabajo del agente CLI
+cli_fallback = false              # true = red de seguridad por CLI si faltan claves de API (off: solo nativos)
 
 # --- Comportamiento (modo JARVIS autónomo) ---
 pedir_confirmacion = false        # false = obedece y ejecuta directo, sin pedir permiso
+apelativo_cada = 6                # usa «Señor VK» en voz como mucho 1 de cada N respuestas
+apelativo_descanso_s = 180.0      # ...o si han pasado estos segundos desde el último
 manos = true                      # cualquier cerebro puede actuar en el sistema vía Guardián
 manos_max_pasos = 10              # vueltas del bucle ReAct con autocorrección (estilo Claude Code)
 modo_conversacion = false         # true = tras cada respuesta sigue sin repetir «Zara»

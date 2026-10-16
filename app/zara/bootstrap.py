@@ -18,6 +18,7 @@ _CONFIG_DEFAULTS = {
     "hablar": True,
     "motor_voz": "edge",               # "edge" (natural, red) | "piper" (local, instantánea) | "espeak"
     "voz_piper": "/mnt/almacen/IA/piper-voices/es_ES-sharvard-medium.onnx",
+    "cli_fallback": False,             # red de seguridad CLI (off: solo cerebros nativos)
 }
 
 
@@ -37,7 +38,8 @@ def build_core(paths: ZaraPaths | None = None, speak: bool | None = None) -> Zar
         persona, claude_model=cfg.get("modelo_claude") or None,
         claude_mode=cfg.get("cerebro_claude_modo", "agente"),
         claude_workdir=cfg.get("claude_directorio") or None,
-        mcp_config=str(mcp) if mcp.exists() else None)
+        mcp_config=str(mcp) if mcp.exists() else None,
+        cli_fallback=bool(cfg.get("cli_fallback", False)))
     if cfg.get("cerebro_por_defecto"):
         try:
             brains.switch(cfg["cerebro_por_defecto"])
