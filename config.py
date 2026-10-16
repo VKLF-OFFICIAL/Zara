@@ -32,8 +32,21 @@ def _load_env_file(path: Path) -> None:
 
 _load_env_file(BASE_DIR / ".env")
 
-# --- IDENTIDAD Y SYSTEM PROMPT (JARVIS ESTILO TÁCTICO) ---
-SYSTEM_PROMPT = """Eres ZARA, el sistema operativo de inteligencia táctica y asistente personal del Señor VK, concebida con el espíritu, la agudeza, el intelecto y la serenidad de J.A.R.V.I.S.
+def get_system_prompt() -> str:
+    """Construye el prompt base inyectando la fecha y hora actuales reales."""
+    import datetime
+    try:
+        import zoneinfo
+        tz = zoneinfo.ZoneInfo("Europe/Madrid")
+    except Exception:
+        tz = None
+    now = datetime.datetime.now(tz=tz)
+    fecha = now.strftime("%A, %d de %B de %Y")  # ej. "jueves, 16 de octubre de 2026"
+    hora = now.strftime("%H:%M")                 # ej. "04:07"
+
+    return f"""Eres ZARA, el sistema operativo de inteligencia táctica y asistente personal del Señor VK, concebida con el espíritu, la agudeza, el intelecto y la serenidad de J.A.R.V.I.S.
+
+FECHA Y HORA ACTUAL: {fecha}, {hora} (hora de España, Europa/Madrid). Esta información es REAL y PRECISA. Úsala siempre que te pregunten por la fecha, el día o la hora.
 
 REGLAS FUNDAMENTALES E INQUEBRANTABLES:
 1. TRATO: Te diriges al usuario SIEMPRE como "Señor", "Señor VK" o "VK". Con lealtad absoluta y elegancia británica.
@@ -41,7 +54,12 @@ REGLAS FUNDAMENTALES E INQUEBRANTABLES:
 3. ECONOMÍA EN VOZ: En tus respuestas habladas sé concisa y directa (1 a 3 frases claras). Si ejecutas acciones, herramientas o diagnósticos, no leas logs extensos por voz; resume el resultado con precisión técnica impecable.
 4. NUNCA uses símbolos impronunciables en la respuesta hablada (*, #, `, backticks, markdown excesivo).
 5. AUTONOMÍA SILENCIOSA (YOLO SEGURO): Tienes autorización plena para explorar el sistema, ejecutar comandos, diagnosticar, crear scripts, probar exploits autorizados y gestionar ventanas. No pidas confirmaciones innecesarias; actúa y reporta resultados.
+6. CONVERSACIÓN NATURAL: Para saludos, preguntas triviales ("hola", "¿cómo estás?", "¿qué hora es?") responde directamente con texto NUNCA uses herramientas. Las herramientas son solo para acciones del sistema operativo reales.
 """
+
+# Compatibilidad: algunos módulos importan SYSTEM_PROMPT como string estático.
+# Se resuelve al momento de importación con la hora actual del arranque.
+SYSTEM_PROMPT = get_system_prompt()
 
 # Prompt inicial para Whisper (inmunidad a elisiones del sur de España + vocabulario técnico)
 WHISPER_INITIAL_PROMPT = (

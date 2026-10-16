@@ -492,6 +492,81 @@ def invoke_claude_code(project_path: str, instruction: str) -> Dict[str, Any]:
 
 
 # =============================================================================
+# 6. HERRAMIENTA: BÚSQUEDA WEB EN TIEMPO REAL (web_search)
+# =============================================================================
+
+def web_search(query: str, max_results: int = 5) -> Dict[str, Any]:
+    """Busca en la web en tiempo real para obtener información actualizada."""
+    import html
+    import json as _json
+    import urllib.parse
+    import urllib.request
+
+    q = query.strip()
+    if not q:
+        return {"success": False, "error": "Consulta de búsqueda vacía."}
+
+    log.info("Buscando en la web: '%s'", q)
+    try:
+        url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote_plus(q)}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+        }
+        req = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(req, timeout=8.0) as resp:
+            raw = resp.read().decode("utf-8", errors="replace")
+
+        raw = html.unescape(raw)
+        results = []
+        snippets = re.findall(r'class="result__snippet[^"]*"[^>]*>(.*?)</a>', raw, re.DOTALL)
+        titles = re.findall(r'class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>', raw, re.DOTALL)
+
+        clean_tag = re.compile(r"<[^>]+>")
+        for idx, snip in enumerate(snippets[:max_results]):
+            snippet_text = clean_tag.sub("", snip).strip()
+            title_text = ""
+            link = ""
+            if idx < len(titles):
+                link = titles[idx][0]
+                title_text = clean_tag.sub("", titles[idx][1]).strip()
+            results.append({
+                "title": title_text or f"Resultado {idx+1}",
+                "snippet": snippet_text,
+                "url": link,
+            })
+
+        if not results:
+            api_url = f"https://api.duckduckgo.com/?q={urllib.parse.quote_plus(q)}&format=json&no_html=1&skip_disambig=1"
+            req_api = urllib.request.Request(api_url, headers=headers)
+            with urllib.request.urlopen(req_api, timeout=5.0) as resp:
+                data = _json.loads(resp.read().decode("utf-8", errors="replace"))
+                answer = data.get("AbstractText") or data.get("Answer")
+                if answer:
+                    results.append({
+                        "title": data.get("Heading", "Respuesta"),
+                        "snippet": answer,
+                        "url": data.get("AbstractURL", ""),
+                    })
+
+        return {
+            "success": True,
+            "query": q,
+            "results_count": len(results),
+            "results": results,
+        }
+    except Exception as exc:
+        log.warning("Fallo en web_search ('%s'): %s", q, exc)
+        return {
+            "success": False,
+            "query": q,
+            "error": f"Error buscando en la web: {exc}",
+            "results": [],
+        }
+
+
+# =============================================================================
 # REGISTRO Y ESQUEMAS DE HERRAMIENTAS (TOOL DEFINITIONS)
 # =============================================================================
 
@@ -541,6 +616,18 @@ TOOL_DEFINITIONS = [
         },
     },
     {
+        "name": "web_search",
+        "description": "Busca en la web en tiempo real (noticias, eventos de 2026, información reciente, documentación). Úsala cuando el Señor VK pida información actualizada o del mundo exterior.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string", "description": "Términos de búsqueda."},
+                "max_results": {"type": "integer", "description": "Número máximo de resultados a devolver (por defecto 5)."},
+            },
+            "required": ["query"],
+        },
+    },
+    {
         "name": "inspect_screen",
         "description": "Captura en memoria la pantalla actual del Señor VK para analizar ventanas, código o errores visuales.",
         "parameters": {
@@ -587,6 +674,11 @@ def execute_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             action=args.get("action", ""),
             target=args.get("target", ""),
             value=args.get("value", ""),
+        )
+    elif name == "web_search":
+        return web_search(
+            query=args.get("query", ""),
+            max_results=args.get("max_results", 5),
         )
     elif name == "inspect_screen":
         return inspect_screen(prompt=args.get("prompt", ""))

@@ -44,6 +44,7 @@ from config import (
     OLLAMA_HOST,
     OLLAMA_MODEL,
     SYSTEM_PROMPT,
+    get_system_prompt,
 )
 from core.tools import TOOL_DEFINITIONS, execute_tool
 
@@ -109,6 +110,13 @@ def _summarize_observations_locally(observations: List[str]) -> str:
 
         if data.get("error"):
             parts.append(f"Hubo un error: {data['error']}")
+        elif data.get("results"):
+            items = data["results"][:3]
+            summaries = [f"{it.get('title', '')}: {it.get('snippet', '')}" for it in items if it.get("snippet")]
+            if summaries:
+                parts.append("Según la información actualizada en la red: " + " ".join(summaries[:2]))
+            else:
+                parts.append("No se encontraron resultados específicos en la red, Señor VK.")
         elif data.get("message"):
             parts.append(str(data["message"]))
         elif data.get("top_processes"):
@@ -135,6 +143,16 @@ def _summarize_observations_locally(observations: List[str]) -> str:
 class ZaraRouter:
     """Clasifica intenciones del Señor VK en < 10 ms y enruta al mejor proveedor."""
 
+    # Patrones de conversación trivial: NO deben disparar herramientas del SO.
+    CONVERSATIONAL_PATTERNS = {
+        "hola", "buenos días", "buenas tardes", "buenas noches", "buenas",
+        "qué tal", "que tal", "cómo estás", "como estas", "cómo te va", "como te va",
+        "qué hora es", "que hora es", "qué día es", "que dia es", "qué fecha",
+        "que fecha", "cuándo es", "cuando es", "gracias", "de nada", "hasta luego",
+        "adiós", "adios", "chao", "bye", "¿estás ahí", "estas ahi", "test",
+        "oye", "hey", "ey", "dime", "zara", "hola zara",
+    }
+
     CLAUDE_KEYWORDS = {
         "refactor", "bug", "exploit", "payload", "código", "codigo", "script",
         "nmap", "ffuf", "gobuster", "sqlmap", "burp", "metasploit", "docker",
@@ -145,6 +163,18 @@ class ZaraRouter:
         "pantalla", "mira la pantalla", "qué ves", "que ves", "captura",
         "busca en la web", "noticias", "tiempo que hace", "clima", "resumen web"
     }
+
+    @staticmethod
+    def is_conversational(query: str) -> bool:
+        """Devuelve True si la consulta es puramente conversacional/trivial."""
+        low = query.lower().strip().rstrip("?.!")
+        # Coincidencia exacta o la query empieza con un patrón conocido
+        return any(
+            low == pat or low.startswith(pat)
+            for pat in ZaraRouter.CONVERSATIONAL_PATTERNS
+        ) or len(low.split()) <= 2 and not any(
+            c in low for c in ["abre", "ejecuta", "crea", "lista", "busca", "instala", "cierra"]
+        )
 
     @staticmethod
     def classify(query: str, preferred: str = "auto") -> str:
@@ -198,23 +228,27 @@ class OllamaProvider:
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
+        system_prompt: Optional[str] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         """Envía conversación a Ollama /api/chat y produce eventos de texto o tool_calls."""
         import requests
 
         url = f"{self.host}/api/chat"
-        sent_messages = messages
+
+        # Construir lista de mensajes: system primero (con fecha actual), luego historial
+        sent_messages: List[Dict[str, Any]] = []
+        if system_prompt:
+            sent_messages.append({"role": "system", "content": system_prompt})
+        sent_messages.extend(messages)
         known_tool_names = {t.get("name") for t in (tools or [])}
         if tools:
             reminder = {
                 "role": "system",
                 "content": (
-                    "Cuando necesites usar una herramienta, responde ÚNICAMENTE con un objeto JSON "
-                    'de una sola línea: {"name": "<herramienta>", "arguments": {...}}. Sin texto '
-                    "adicional, sin explicaciones y sin bloques de código (```). Usa los nombres de "
-                    "parámetro EXACTOS del esquema de la herramienta. Si ya tienes el resultado de una "
-                    "observación del sistema, NO vuelvas a llamar a la misma herramienta: responde con "
-                    "una frase normal en texto plano resumiendo el resultado para el Señor VK."
+                    "INSTRUCCIÓN TÁCTICA SOBRE HERRAMIENTAS:\n"
+                    "- Si la petición del Señor VK es una pregunta general, saludo, conversación, explicación o no requiere interactuar con el sistema, responde DIRECTAMENTE en lenguaje natural español, NUNCA uses JSON ni llames a herramientas.\n"
+                    "- ÚNICAMENTE cuando sea estrictamente necesario ejecutar una acción (comandos, web, archivos, apps, pantalla), responde con un objeto JSON de una sola línea: {\"name\": \"<herramienta>\", \"arguments\": {...}}. Sin bloques de código markdown.\n"
+                    "- Si ya recibiste una [OBSERVACIÓN DEL SISTEMA], NO vuelvas a llamar a la misma herramienta: resume el resultado directamente para el Señor VK."
                 ),
             }
             sent_messages = messages + [reminder]
@@ -302,11 +336,14 @@ class GeminiProvider:
         self,
         messages: List[Dict[str, Any]],
         screen_b64: Optional[str] = None,
+        system_prompt: Optional[str] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         """Streaming con Gemini Flash y soporte multimodal de pantalla en memoria."""
         if not self.is_available():
             yield {"type": "error", "error": "Gemini API no disponible o falta GEMINI_API_KEY."}
             return
+
+        effective_prompt = system_prompt or SYSTEM_PROMPT
 
         try:
             from google.genai import types
@@ -322,15 +359,15 @@ class GeminiProvider:
                 parts.append(types.Part.from_text(text=m["content"]))
                 contents.append(types.Content(role=role, parts=parts))
 
-            config = types.GenerateContentConfig(
-                system_instruction=SYSTEM_PROMPT,
+            cfg = types.GenerateContentConfig(
+                system_instruction=effective_prompt,
                 temperature=0.3,
             )
 
             response = self._client.models.generate_content_stream(
                 model=self.model,
                 contents=contents,
-                config=config,
+                config=cfg,
             )
 
             for chunk in response:
@@ -377,8 +414,11 @@ class ClaudeProvider:
         self,
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]] = None,
+        system_prompt: Optional[str] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         """Streaming con Anthropic API o delegación fluida a Claude CLI."""
+        effective_prompt = system_prompt or SYSTEM_PROMPT
+
         if self._client:
             try:
                 anthropic_tools = []
@@ -398,7 +438,7 @@ class ClaudeProvider:
                 with self._client.messages.stream(
                     model=self.model,
                     max_tokens=2048,
-                    system=SYSTEM_PROMPT,
+                    system=effective_prompt,
                     messages=formatted_msgs,
                     tools=anthropic_tools if anthropic_tools else None,
                     temperature=0.2,
@@ -426,7 +466,7 @@ class ClaudeProvider:
         if claude_bin:
             try:
                 user_msg = messages[-1]["content"] if messages else ""
-                full_prompt = f"{SYSTEM_PROMPT}\n\nPetición del Señor VK:\n{user_msg}"
+                full_prompt = f"{effective_prompt}\n\nPetición del Señor VK:\n{user_msg}"
                 cmd = [claude_bin, "-p", full_prompt, "--setting-sources", "project"]
                 if self.cli_model_override:
                     cmd += ["--model", self.cli_model_override]
@@ -485,14 +525,23 @@ class ZaraBrain:
 
         Produce tokens en tiempo real listos para el SentenceChunker de voz y el HUD.
         """
+        # Refrescar el system prompt con la fecha/hora real del momento actual.
+        current_system_prompt = get_system_prompt()
+
         self.history.append({"role": "user", "content": user_query})
         self._trim_history()
 
         chosen_provider = ZaraRouter.classify(user_query, preferred_provider)
-        log.info("Consulta del Señor VK: '%s' -> Enrutada a: %s", user_query[:50], chosen_provider)
+        is_chat_only = ZaraRouter.is_conversational(user_query)
+
+        log.info(
+            "Consulta del Señor VK: '%s' -> Enrutada a: %s%s",
+            user_query[:50], chosen_provider,
+            " [CHAT]" if is_chat_only else " [AGENT]",
+        )
 
         screen_b64: Optional[str] = None
-        if "pantalla" in user_query.lower() or "captura" in user_query.lower():
+        if not is_chat_only and ("pantalla" in user_query.lower() or "captura" in user_query.lower()):
             self._emit_tool_event("inspect_screen", "Capturando pantalla en memoria...")
             shot_res = execute_tool("inspect_screen", {"prompt": user_query})
             if shot_res.get("success"):
@@ -502,10 +551,17 @@ class ZaraBrain:
         last_tool_signature: Optional[Tuple] = None
         last_observations: List[str] = []
 
-        for step in range(1, MAX_REACT_STEPS + 1):
-            log.info("Bucle ReAct - Paso %d/%d", step, MAX_REACT_STEPS)
+        # Para consultas puramente conversacionales solo un paso, sin herramientas.
+        max_steps = 1 if is_chat_only else MAX_REACT_STEPS
 
-            events = self._execute_stream_with_fallback(chosen_provider, screen_b64)
+        for step in range(1, max_steps + 1):
+            log.info("Bucle ReAct - Paso %d/%d", step, max_steps)
+
+            events = self._execute_stream_with_fallback(
+                chosen_provider, screen_b64,
+                is_chat_only=is_chat_only,
+                system_prompt=current_system_prompt,
+            )
 
             full_thought_text = ""
             tool_calls_to_run: List[Dict[str, Any]] = []
@@ -532,7 +588,11 @@ class ZaraBrain:
                 else:
                     chosen_provider = "gemini"
                 log.info("Activando fallback automático a: %s", chosen_provider)
-                events2 = self._execute_stream_with_fallback(chosen_provider, screen_b64)
+                events2 = self._execute_stream_with_fallback(
+                    chosen_provider, screen_b64,
+                    is_chat_only=is_chat_only,
+                    system_prompt=current_system_prompt,
+                )
                 for event in events2:
                     if event.get("type") == "token":
                         t = event.get("token", "")
@@ -596,18 +656,29 @@ class ZaraBrain:
         self,
         provider_name: str,
         screen_b64: Optional[str] = None,
+        is_chat_only: bool = False,
+        system_prompt: Optional[str] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         """Invoca el generador correspondiente según el proveedor."""
+        # Herramientas solo disponibles si NO es modo conversacional puro
+        tools_to_pass = None if is_chat_only else TOOL_DEFINITIONS
+
         if provider_name == "gemini" and self.gemini.is_available():
-            yield from self.gemini.stream_chat(self.history, screen_b64=screen_b64)
+            yield from self.gemini.stream_chat(
+                self.history, screen_b64=screen_b64, system_prompt=system_prompt
+            )
             return
 
         if provider_name == "claude" and self.claude.is_available():
-            yield from self.claude.stream_chat(self.history, tools=TOOL_DEFINITIONS)
+            yield from self.claude.stream_chat(
+                self.history, tools=tools_to_pass, system_prompt=system_prompt
+            )
             return
 
         if self.ollama.is_available():
-            yield from self.ollama.stream_chat(self.history, tools=TOOL_DEFINITIONS)
+            yield from self.ollama.stream_chat(
+                self.history, tools=tools_to_pass, system_prompt=system_prompt
+            )
             return
 
         # Fallback de emergencia local directo

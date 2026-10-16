@@ -295,7 +295,6 @@ class ZaraPanel(QtWidgets.QWidget):
         text = self.input_box.text().strip()
         if text:
             self.text_submitted.emit(text)
-            self.log_line("VK", text)
             self.input_box.clear()
 
     def _current_provider(self) -> str:
