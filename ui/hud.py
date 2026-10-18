@@ -210,6 +210,46 @@ def _iridescent(phase: float) -> QtGui.QColor:
     return _lerp(VIOLET, PINK, (x - 0.5) * 2)
 
 
+def format_ollama_model_display(full_name: str, max_len: int = 36) -> str:
+    """Formatea inteligentemente el nombre de un modelo de Ollama para el HUD.
+
+    Estructura Ollama: [host/][namespace/]model_base[:tag]
+    Principios de diseño:
+      1. El tag (:7b, :14b, :Q3_K_M, :latest) es el discriminador esencial:
+         NUNCA se trunca para que modelos hermanos sean siempre identificables.
+      2. Los prefijos de host (ej: 'hf.co/', 'huggingface.co/') y namespace se
+         omiten de la etiqueta principal para aprovechar el ancho visual.
+      3. Si el nombre base + tag cabe en max_len, se muestra completo.
+      4. Si excede max_len, se recorta la parte derecha del nombre base con '…',
+         manteniendo el tag íntegro al final (ej: 'qwen2.5-coder-abli…:14b-instruct').
+    """
+    name = (full_name or "").strip()
+    if not name:
+        return ""
+
+    tag = ""
+    if ":" in name:
+        base, tag = name.rsplit(":", 1)
+    else:
+        base = name
+
+    parts = [p for p in base.split("/") if p]
+    model_base = parts[-1] if parts else base
+
+    tag_suffix = f":{tag}" if tag else ""
+    full_display = f"{model_base}{tag_suffix}"
+
+    if len(full_display) <= max_len:
+        return full_display
+
+    tag_len = len(tag_suffix)
+    avail = max_len - tag_len - 1  # 1 para '…'
+    if avail >= 6:
+        return f"{model_base[:avail]}…{tag_suffix}"
+
+    return full_display[:max_len - 1] + "…"
+
+
 # =============================================================================
 # [DISEÑO] Iconos vectoriales dibujados a mano (QPainter), sin emojis ni
 # dependencias externas de SVG/fuentes de iconos. Cada función pinta un
@@ -311,7 +351,7 @@ class ZaraPanel(QtWidgets.QWidget):
         super().__init__()
         self._ollama_models: list[str] = []
         self._desired_model: dict[str, str] = {}
-        self.setFixedSize(340, 500)
+        self.setFixedSize(380, 520)
         self.setWindowFlags(
             QtCore.Qt.FramelessWindowHint
             | QtCore.Qt.WindowStaysOnTopHint
@@ -396,7 +436,9 @@ class ZaraPanel(QtWidgets.QWidget):
         self.model_combo.setFocusPolicy(QtCore.Qt.WheelFocus)
         self.model_combo.view().setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         self.model_combo.view().setAutoScroll(True)
+        self.model_combo.view().setMinimumWidth(380)
         self.model_combo.currentIndexChanged.connect(self._on_model_changed)
+        self.model_combo.activated.connect(self._on_model_changed)
         model_row.addWidget(self.model_combo, stretch=1)
         layout.addLayout(model_row)
 
@@ -404,6 +446,7 @@ class ZaraPanel(QtWidgets.QWidget):
         self.model_search_input = QtWidgets.QLineEdit()
         self.model_search_input.setPlaceholderText("🔍 Filtrar modelos locales (ej: qwen, deepseek)...")
         self.model_search_input.textChanged.connect(self._on_model_filter_changed)
+        self.model_search_input.returnPressed.connect(self._on_model_filter_return_pressed)
         self.model_search_input.hide()
         layout.addWidget(self.model_search_input)
 
@@ -468,13 +511,24 @@ class ZaraPanel(QtWidgets.QWidget):
     def _on_model_filter_changed(self, _text: str) -> None:
         self._refresh_model_options()
 
+    def _on_model_filter_return_pressed(self) -> None:
+        """Al pulsar Enter en el buscador de modelos, activa de inmediato el primer modelo filtrado."""
+        if self.model_combo.count() > 0 and self.model_combo.isEnabled():
+            self.model_combo.setCurrentIndex(0)
+            self._on_model_changed(0)
+            display_name = self.model_combo.currentText()
+            self.log_line("SISTEMA", f"Modelo activado: {display_name}")
+            self.input_box.setFocus()
+
     def _on_model_changed(self, idx: int) -> None:
         if idx < 0:
             return
         model = self.model_combo.itemData(idx)
         if model is None or model == "":
             return
-        self.model_changed.emit(self._current_provider(), model)
+        provider = self._current_provider()
+        self._desired_model[provider] = model
+        self.model_changed.emit(provider, model)
 
     def _refresh_model_options(self) -> None:
         """Repuebla el combo de modelo según el proveedor seleccionado arriba con soporte de filtrado."""
@@ -496,10 +550,10 @@ class ZaraPanel(QtWidgets.QWidget):
                 count_str = f"Modelo ({len(candidates)}/{len(self._ollama_models)}):" if filter_text else f"Modelo ({len(candidates)}):"
                 self.model_lbl.setText(count_str)
                 for name in candidates:
-                    display = name if len(name) <= 26 else name[:23] + "…"
+                    display = format_ollama_model_display(name, max_len=36)
                     self.model_combo.addItem(display, name)
                     idx = self.model_combo.count() - 1
-                    self.model_combo.setItemData(idx, name, QtCore.Qt.ToolTipRole)
+                    self.model_combo.setItemData(idx, f"Modelo completo: {name}", QtCore.Qt.ToolTipRole)
                 self.model_combo.setEnabled(True)
             else:
                 self.model_lbl.setText("Modelo (0):")

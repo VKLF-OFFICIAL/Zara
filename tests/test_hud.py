@@ -83,3 +83,60 @@ def test_hud_state_and_colors(qapp):
     hud.set_muted(False)
     assert hud._muted is False
     assert "MIC ACTIVO" in hud.panel.status_lbl.text()
+
+
+def test_format_ollama_model_display():
+    from ui.hud import format_ollama_model_display
+
+    # Modelos del Señor VK mostrados en las capturas de Ollama
+    m1 = "huihui_ai/qwen2.5-coder-abliterate:7b-instruct"
+    m2 = "huihui_ai/qwen2.5-coder-abliterate:14b-instruct"
+    m3 = "hf.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED:Q3_K_M"
+    m4 = "hf.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED:Q4_K_M"
+
+    d1 = format_ollama_model_display(m1, max_len=36)
+    d2 = format_ollama_model_display(m2, max_len=36)
+    d3 = format_ollama_model_display(m3, max_len=36)
+    d4 = format_ollama_model_display(m4, max_len=36)
+
+    # 1. Ambos modelos de qwen deben diferenciarse claramente por su tag
+    assert d1 != d2
+    assert d1.endswith(":7b-instruct")
+    assert d2.endswith(":14b-instruct")
+
+    # 2. Ambos modelos de OBLITERATUS deben diferenciarse por su cuantización
+    assert d3 != d4
+    assert d3.endswith(":Q3_K_M")
+    assert d4.endswith(":Q4_K_M")
+
+    # 3. No deben exceder el max_len
+    assert len(d1) <= 36
+    assert len(d2) <= 36
+    assert len(d3) <= 36
+    assert len(d4) <= 36
+
+
+def test_model_selection_activation_and_return_pressed(qapp):
+    from ui.hud import ZaraPanel
+
+    panel = ZaraPanel()
+    models = [
+        "huihui_ai/qwen2.5-coder-abliterate:7b-instruct",
+        "huihui_ai/qwen2.5-coder-abliterate:14b-instruct",
+        "hf.co/OBLITERATUS/Qwen3.8-27B-OBLITERATED:Q3_K_M",
+    ]
+    panel.set_ollama_models(models, current=models[0])
+    panel.set_brain("ollama")
+
+    emitted = []
+    panel.model_changed.connect(lambda p, m: emitted.append((p, m)))
+
+    # Filtrar por "14b" y pulsar Enter
+    panel.model_search_input.setText("14b")
+    assert panel.model_combo.count() == 1
+    panel.model_search_input.returnPressed.emit()
+
+    assert len(emitted) == 1
+    assert emitted[0] == ("ollama", "huihui_ai/qwen2.5-coder-abliterate:14b-instruct")
+    assert panel._desired_model.get("ollama") == "huihui_ai/qwen2.5-coder-abliterate:14b-instruct"
+
