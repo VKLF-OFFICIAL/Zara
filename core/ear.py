@@ -32,6 +32,8 @@ from config import (
     FRAME_SIZE,
     MODELS_DIR,
     SAMPLE_RATE,
+    VAD_BARGE_IN_GRACE_MS,
+    VAD_BARGE_IN_MIN_RMS,
     VAD_BARGE_IN_TRIGGER_MS,
     VAD_MIN_SILENCE_MS,
     VAD_SPEECH_PAD_MS,
@@ -142,11 +144,54 @@ class ContinuousEar:
                 min_silence_duration_ms=VAD_MIN_SILENCE_MS,
                 speech_pad_ms=VAD_SPEECH_PAD_MS,
             )
+            # [FIX] Instancia de modelo INDEPENDIENTE y dedicada exclusivamente a
+            # los chequeos de barge-in mientras Zara habla. Antes se llamaba
+            # directamente a `self._vad_model(...)` (el mismo objeto que envuelve
+            # `self._vad_iterator`) saltándose el iterador. Silero VAD mantiene
+            # estado recurrente (LSTM) entre llamadas: esas invocaciones directas
+            # corrompían el estado que el iterador necesita para segmentar
+            # correctamente la SIGUIENTE locución del Señor VK, degradando el
+            # reconocimiento justo después de cada respuesta de Zara.
+            self._vad_model_bargein = load_silero_vad()
+
+            # [FIX] Tamaños de buffer derivados de la configuración, calculados
+            # una sola vez. Extraídos a atributos de instancia (en vez de
+            # variables locales del bucle) para que la máquina de estados de
+            # segmentación/barge-in se pueda testear llamando directamente a
+            # `_process_frame()` sin necesidad de hilos, cola ni hardware real.
+            self._barge_in_required_frames = max(
+                1, int(VAD_BARGE_IN_TRIGGER_MS / (FRAME_SIZE / SAMPLE_RATE * 1000))
+            )
+            self._pre_roll_capacity = max(
+                4, int(VAD_SPEECH_PAD_MS / (FRAME_SIZE / SAMPLE_RATE * 1000))
+            )
+            self._reset_segmentation_state()
+
             log.info("Silero VAD v5 cargado (silencio=%d ms, pad=%d ms)",
                      VAD_MIN_SILENCE_MS, VAD_SPEECH_PAD_MS)
         except Exception as exc:
             log.exception("Error al cargar Silero VAD: %s", exc)
             raise
+
+    def _reset_segmentation_state(self) -> None:
+        """Reinicia la máquina de estados de segmentación/barge-in a cero."""
+        self._barge_in_consecutive_frames = 0
+        # Pre-roll ring buffer para capturar consonantes iniciales (ej. s, p, t, k)
+        # sin acumular silencio leading antes de que el usuario empiece a hablar.
+        self._pre_roll_buffer: collections.deque[np.ndarray] = collections.deque(
+            maxlen=self._pre_roll_capacity
+        )
+        # [FIX] Pre-roll INDEPENDIENTE que se va llenando mientras Zara habla,
+        # para no perder el arranque real de una interrupción (ver _process_frame).
+        self._bargein_preroll_buffer: collections.deque[np.ndarray] = collections.deque(
+            maxlen=self._pre_roll_capacity
+        )
+        self._speech_frames: list[np.ndarray] = []
+        self._is_speech_active = False
+        # Seguimiento del flanco de inicio de habla de Zara para aplicar el
+        # periodo de gracia anti-eco.
+        self._was_speaking = False
+        self._speaking_started_at = 0.0
 
     def _init_whisper(self) -> None:
         """Inicializa faster-whisper en GPU CUDA o con fallback transparente a CPU."""
@@ -240,15 +285,7 @@ class ContinuousEar:
 
     def _vad_processing_worker(self) -> None:
         """Procesa frames con Silero VAD continuo, pre-roll ring buffer y Barge-in."""
-        barge_in_consecutive_frames = 0
-        barge_in_required_frames = max(1, int(VAD_BARGE_IN_TRIGGER_MS / (FRAME_SIZE / SAMPLE_RATE * 1000)))
-
-        # Pre-roll ring buffer para capturar consonantes iniciales (ej. s, p, t, k)
-        # sin acumular silencio leading antes de que el usuario empiece a hablar.
-        pre_roll_frames = max(4, int(VAD_SPEECH_PAD_MS / (FRAME_SIZE / SAMPLE_RATE * 1000)))
-        pre_roll_buffer: collections.deque[np.ndarray] = collections.deque(maxlen=pre_roll_frames)
-        speech_frames: list[np.ndarray] = []
-        is_speech_active = False
+        self._reset_segmentation_state()
 
         while not self._stop_event.is_set():
             try:
@@ -268,85 +305,145 @@ class ContinuousEar:
                         self.rms_cb(0.0)
                     except Exception:
                         pass
-                speech_frames.clear()
-                pre_roll_buffer.clear()
-                is_speech_active = False
+                self._reset_segmentation_state()
                 self._vad_iterator.reset_states()
                 continue
 
-            # Nivel RMS para la animación visual del HUD
-            rms = float(np.sqrt(np.mean(frame ** 2))) if frame.size else 0.0
-            if self.rms_cb:
-                try:
-                    self.rms_cb(rms)
-                except Exception:
-                    pass
+            self._process_frame(frame)
 
-            # Rellenar con ceros si el bloque es menor que FRAME_SIZE
-            if frame.shape[0] < FRAME_SIZE:
-                frame = np.pad(frame, (0, FRAME_SIZE - frame.shape[0]))
-            tensor_chunk = torch.from_numpy(frame).unsqueeze(0)  # [1, 512]
+    def _process_frame(self, frame: np.ndarray) -> None:
+        """[FIX, extraído para testabilidad] Procesa UN frame de audio: RMS
+        para el HUD, barge-in (modelo dedicado + gate de RMS + periodo de
+        gracia anti-eco) y segmentación de la locución del Señor VK mediante
+        Silero VAD continuo. Factorizado fuera del bucle de `_vad_processing_worker`
+        para poder testear la máquina de estados directamente, sin hilos,
+        colas ni hardware de audio real.
+        """
+        # Nivel RMS para la animación visual del HUD
+        rms = float(np.sqrt(np.mean(frame ** 2))) if frame.size else 0.0
+        if self.rms_cb:
+            try:
+                self.rms_cb(rms)
+            except Exception:
+                pass
 
-            # 1. Detección de Barge-in mientras Zara habla
-            if self.is_speaking_fn():
-                with torch.no_grad():
-                    speech_prob = self._vad_model(tensor_chunk, SAMPLE_RATE).item()
-                if speech_prob >= VAD_THRESHOLD:
-                    barge_in_consecutive_frames += 1
-                    if barge_in_consecutive_frames >= barge_in_required_frames:
-                        log.info("¡Barge-in detectado! El Señor VK está hablando. Interrumpiendo voz.")
-                        if self.barge_in_cb:
-                            self.barge_in_cb()
-                        barge_in_consecutive_frames = 0
-                else:
-                    barge_in_consecutive_frames = max(0, barge_in_consecutive_frames - 1)
-                speech_frames.clear()
-                pre_roll_buffer.clear()
-                is_speech_active = False
-                continue
+        # Rellenar con ceros si el bloque es menor que FRAME_SIZE
+        if frame.shape[0] < FRAME_SIZE:
+            frame = np.pad(frame, (0, FRAME_SIZE - frame.shape[0]))
+        tensor_chunk = torch.from_numpy(frame).unsqueeze(0)  # [1, 512]
+
+        # 1. Detección de Barge-in mientras Zara habla
+        if self.is_speaking_fn():
+            if not self._was_speaking:
+                self._speaking_started_at = time.monotonic()
+                # [FIX AUDITORÍA] Reiniciar el estado recurrente del modelo
+                # dedicado al barge-in al EMPEZAR cada sesión de habla de
+                # Zara (no entre frames de la misma sesión, donde el estado
+                # acumulado es intencional). Evita que un sesgo residual de
+                # la sesión anterior adelante o retrase la detección de la
+                # siguiente interrupción.
+                self._vad_model_bargein.reset_states()
+            self._was_speaking = True
+
+            # [FIX] Mantener un pre-roll de los frames más recientes MIENTRAS
+            # Zara habla, para no perder el arranque real de una interrupción
+            # genuina (antes se descartaba cada frame con speech_frames.clear()
+            # mientras hablaba, así que al confirmarse el barge-in se perdían
+            # las primeras palabras de lo que el Señor VK empezó a decir).
+            self._bargein_preroll_buffer.append(frame.copy())
+
+            # [FIX] Usar el modelo VAD dedicado al barge-in (no el que usa el
+            # iterador de segmentación) para no corromper su estado interno.
+            with torch.no_grad():
+                speech_prob = self._vad_model_bargein(tensor_chunk, SAMPLE_RATE).item()
+
+            in_grace_period = (
+                time.monotonic() - self._speaking_started_at
+            ) * 1000.0 < VAD_BARGE_IN_GRACE_MS
+            bargein_confirmed = False
+
+            # [FIX] Exigir también un nivel RMS mínimo y respetar el periodo
+            # de gracia tras iniciar la frase. Sin esto, el eco del propio
+            # altavoz de Zara filtrándose al micrófono (sin auriculares)
+            # puede alcanzar el umbral de VAD y cortarla a mitad de frase
+            # sin que el Señor VK haya dicho nada.
+            if (
+                speech_prob >= VAD_THRESHOLD
+                and rms >= VAD_BARGE_IN_MIN_RMS
+                and not in_grace_period
+            ):
+                self._barge_in_consecutive_frames += 1
+                if self._barge_in_consecutive_frames >= self._barge_in_required_frames:
+                    log.info("¡Barge-in detectado! El Señor VK está hablando. Interrumpiendo voz.")
+                    if self.barge_in_cb:
+                        self.barge_in_cb()
+                    self._barge_in_consecutive_frames = 0
+                    bargein_confirmed = True
             else:
-                barge_in_consecutive_frames = 0
+                self._barge_in_consecutive_frames = max(0, self._barge_in_consecutive_frames - 1)
 
-            # 2. Segmentación de locución mediante Silero VAD continuo
-            tensor_1d = tensor_chunk.squeeze(0)
-            vad_res = self._vad_iterator(tensor_1d)
-
-            if not is_speech_active:
-                pre_roll_buffer.append(frame.copy())
-                if vad_res is not None and "start" in vad_res:
-                    is_speech_active = True
-                    speech_frames = list(pre_roll_buffer)
-                    speech_frames.append(frame.copy())
+            if bargein_confirmed:
+                # [FIX] Sembrar la locución real con el pre-roll acumulado
+                # durante el habla de Zara, para no perder el arranque de la
+                # interrupción. A partir de aquí la segmentación normal
+                # (bloque 2, en la siguiente llamada) sigue acumulando sobre
+                # esta base hasta detectar el "end" real.
+                self._speech_frames = list(self._bargein_preroll_buffer)
+                self._is_speech_active = True
+                self._pre_roll_buffer.clear()
+                self._bargein_preroll_buffer.clear()
             else:
-                speech_frames.append(frame.copy())
-                if vad_res is not None and "end" in vad_res:
-                    utterance = np.concatenate(speech_frames)
-                    speech_frames.clear()
-                    pre_roll_buffer.clear()
-                    is_speech_active = False
-                    self._vad_iterator.reset_states()
+                self._speech_frames.clear()
+                self._pre_roll_buffer.clear()
+                self._is_speech_active = False
+            return
+        else:
+            self._was_speaking = False
+            self._barge_in_consecutive_frames = 0
+            self._bargein_preroll_buffer.clear()
 
-                    # Validación de locución: duración mínima y nivel de energía real
-                    if len(utterance) >= int(SAMPLE_RATE * 0.35):
-                        u_peak = float(np.max(np.abs(utterance)))
-                        u_rms = float(np.sqrt(np.mean(utterance ** 2)))
-                        # Filtro anti-micrófono cerrado: evita encolar silencio electrónico
-                        if u_peak >= 0.015 and u_rms >= 0.003:
-                            self._utterance_queue.put(utterance)
-                        else:
-                            log.debug("Locución ignorada por energía nula (peak=%.4f, rms=%.4f)", u_peak, u_rms)
+        # 2. Segmentación de locución mediante Silero VAD continuo
+        tensor_1d = tensor_chunk.squeeze(0)
+        vad_res = self._vad_iterator(tensor_1d)
 
-            # Límite de seguridad: locución no mayor a 25 segundos continuos
-            if len(speech_frames) > int(25 * (SAMPLE_RATE / FRAME_SIZE)):
-                if is_speech_active:
-                    utterance = np.concatenate(speech_frames)
+        if not self._is_speech_active:
+            self._pre_roll_buffer.append(frame.copy())
+            if vad_res is not None and "start" in vad_res:
+                self._is_speech_active = True
+                # [FIX AUDITORÍA] `frame` ya quedó como último elemento de
+                # `_pre_roll_buffer` en el append de arriba; volver a
+                # añadirlo aquí duplicaba los primeros 32 ms de cada locución.
+                self._speech_frames = list(self._pre_roll_buffer)
+        else:
+            self._speech_frames.append(frame.copy())
+            if vad_res is not None and "end" in vad_res:
+                utterance = np.concatenate(self._speech_frames)
+                self._speech_frames = []
+                self._pre_roll_buffer.clear()
+                self._is_speech_active = False
+                self._vad_iterator.reset_states()
+
+                # Validación de locución: duración mínima y nivel de energía real
+                if len(utterance) >= int(SAMPLE_RATE * 0.35):
                     u_peak = float(np.max(np.abs(utterance)))
-                    if u_peak >= 0.015:
+                    u_rms = float(np.sqrt(np.mean(utterance ** 2)))
+                    # Filtro anti-micrófono cerrado: evita encolar silencio electrónico
+                    if u_peak >= 0.015 and u_rms >= 0.003:
                         self._utterance_queue.put(utterance)
-                speech_frames.clear()
-                pre_roll_buffer.clear()
-                is_speech_active = False
-                self._vad_iterator.reset_states()
+                    else:
+                        log.debug("Locución ignorada por energía nula (peak=%.4f, rms=%.4f)", u_peak, u_rms)
+
+        # Límite de seguridad: locución no mayor a 25 segundos continuos
+        if len(self._speech_frames) > int(25 * (SAMPLE_RATE / FRAME_SIZE)):
+            if self._is_speech_active:
+                utterance = np.concatenate(self._speech_frames)
+                u_peak = float(np.max(np.abs(utterance)))
+                if u_peak >= 0.015:
+                    self._utterance_queue.put(utterance)
+            self._speech_frames = []
+            self._pre_roll_buffer.clear()
+            self._is_speech_active = False
+            self._vad_iterator.reset_states()
 
     def transcribe_array(self, audio: np.ndarray) -> str:
         """Transcribe un array float32 16 kHz con faster-whisper optimizado."""

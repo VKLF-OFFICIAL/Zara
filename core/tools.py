@@ -15,7 +15,7 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 import psutil
 
 from config import (
@@ -236,6 +236,32 @@ def _set_linux_volume(pct: float) -> str:
     return "No se encontró control de volumen (wpctl/pactl)."
 
 
+# [FIX] Hallazgo de auditoría en vivo: el Señor VK (y el modelo que lo
+# transcribe/razona) usa el nombre en ESPAÑOL de la aplicación ("Bloc de
+# notas", "Calculadora"), pero `shutil.which()` solo resuelve nombres de
+# ejecutable en inglés. Sin este alias, open_app caía siempre al último
+# fallback (ver más abajo), que antes reportaba éxito sin comprobar nada.
+_WIN_APP_ALIASES: Dict[str, str] = {
+    "bloc de notas": "notepad",
+    "notas": "notepad",
+    "calculadora": "calc",
+    "explorador de archivos": "explorer",
+    "explorador": "explorer",
+    "panel de control": "control",
+    "simbolo del sistema": "cmd",
+    "símbolo del sistema": "cmd",
+    "terminal": "wt",
+    "administrador de tareas": "taskmgr",
+    "pintor": "mspaint",
+    "paint": "mspaint",
+    "wordpad": "write",
+    "editor del registro": "regedit",
+    "configuracion": "ms-settings:",
+    "configuración": "ms-settings:",
+    "ajustes": "ms-settings:",
+}
+
+
 def os_control(action: str, target: str = "", value: str = "") -> Dict[str, Any]:
     """Control de aplicaciones, volumen, procesos y portapapeles."""
     action = action.lower().strip()
@@ -254,22 +280,43 @@ def os_control(action: str, target: str = "", value: str = "") -> Dict[str, Any]
                 return {"success": True, "message": f"URL '{tgt}' abierta en el navegador."}
 
             if sys.platform == "win32":
+                # [FIX] Resolver alias en español ANTES de shutil.which, que
+                # solo conoce nombres de ejecutable en inglés.
+                candidate = _WIN_APP_ALIASES.get(tgt.lower(), tgt)
+
                 # Intentos de ejecución en Windows
-                if shutil.which(tgt) or shutil.which(f"{tgt}.exe"):
-                    subprocess.Popen([tgt], shell=True)
+                resolved = shutil.which(candidate) or shutil.which(f"{candidate}.exe")
+                if resolved:
+                    subprocess.Popen([resolved])
                     return {"success": True, "message": f"Aplicación '{tgt}' iniciada."}
-                # Start Menu búsqueda rápida
+
+                # Start Menu búsqueda rápida (por nombre original Y por alias)
                 appdata = Path(os.environ.get("APPDATA", ""))
                 progdata = Path(os.environ.get("ProgramData", ""))
+                needles = {tgt.lower(), candidate.lower()}
                 for base in [appdata / "Microsoft/Windows/Start Menu/Programs", progdata / "Microsoft/Windows/Start Menu/Programs"]:
                     if base.is_dir():
                         for lnk in base.rglob("*.lnk"):
-                            if tgt.lower() in lnk.stem.lower():
+                            stem_low = lnk.stem.lower()
+                            if any(n in stem_low for n in needles):
                                 os.startfile(str(lnk))
                                 return {"success": True, "message": f"Aplicación '{lnk.stem}' iniciada desde el menú inicio."}
-                # Fallback PowerShell Start-Process
-                subprocess.Popen(["powershell.exe", "-NoProfile", "-Command", f"Start-Process '{tgt}' -ErrorAction SilentlyContinue"])
-                return {"success": True, "message": f"Comando Start-Process lanzado para '{tgt}'."}
+
+                # [FIX] Último recurso VERIFICABLE: os.startfile() usa el
+                # mismo mecanismo que el menú de Inicio de Windows (ShellExecute,
+                # entiende más alias que PATH) y lanza una excepción SÍNCRONA
+                # si no encuentra nada que ejecutar. El fallback anterior
+                # (Start-Process de PowerShell en un subprocess.Popen separado)
+                # reportaba éxito SIEMPRE sin comprobar si el proceso hijo
+                # realmente consiguió arrancar algo.
+                try:
+                    os.startfile(candidate)
+                    return {"success": True, "message": f"Aplicación '{tgt}' iniciada."}
+                except OSError as exc:
+                    return {
+                        "success": False,
+                        "error": f"No se encontró ninguna aplicación llamada '{tgt}': {exc}",
+                    }
             else:
                 # Linux (KDE, GNOME, XFCE con xdg-open o gtk-launch)
                 if shutil.which("gtk-launch"):
@@ -825,9 +872,55 @@ TOOL_DEFINITIONS = [
 ]
 
 
+_ACTION_ALIAS_CACHE: Optional[Dict[str, Tuple[str, str]]] = None
+
+
+def _get_action_alias_map() -> Dict[str, Tuple[str, str]]:
+    """[FIX] Hallazgo de auditoría en vivo contra Ollama real: con modelos
+    locales pequeños, el modelo a veces confunde un VALOR del enum "action"
+    de una herramienta genérica (p. ej. "open_app", parte de `os_control`)
+    con el NOMBRE de la propia herramienta, llamando a
+    {"name": "open_app", "arguments": {...}} en vez de
+    {"name": "os_control", "arguments": {"action": "open_app", ...}}.
+
+    Construye un mapa inverso {valor_de_enum -> (herramienta_real, parametro)}
+    a partir de TOOL_DEFINITIONS para corregirlo en tiempo de ejecución, en
+    vez de rechazar la llamada como "herramienta desconocida" (lo que antes
+    hacía que Zara leyera el JSON crudo en voz alta sin ejecutar nada)."""
+    global _ACTION_ALIAS_CACHE
+    if _ACTION_ALIAS_CACHE is None:
+        alias_map: Dict[str, Tuple[str, str]] = {}
+        for t in TOOL_DEFINITIONS:
+            tool_name = t.get("name", "")
+            props = (t.get("parameters", {}) or {}).get("properties", {}) or {}
+            for param_name, schema in props.items():
+                for enum_value in (schema.get("enum") or []):
+                    alias_map.setdefault(enum_value, (tool_name, param_name))
+        _ACTION_ALIAS_CACHE = alias_map
+    return _ACTION_ALIAS_CACHE
+
+
 def execute_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     """Enrutador de ejecución de herramientas."""
     name = name.strip()
+    # [FIX] Hallazgo de Gemini: si un proveedor nativo (Gemini/Claude) alucina
+    # una llamada sin parámetros, `args`/`input` puede llegar como None en vez
+    # de {}. Los `args.get(...)` de más abajo lanzarían AttributeError y
+    # romperían el generador de run_react_agent sin control en ese punto.
+    args = args or {}
+
+    known_names = {t.get("name", "") for t in TOOL_DEFINITIONS}
+    if name not in known_names:
+        alias = _get_action_alias_map().get(name)
+        if alias:
+            real_name, param_name = alias
+            log.info(
+                "Herramienta '%s' no reconocida; remapeada a %s(%s='%s').",
+                name, real_name, param_name, name,
+            )
+            args = {param_name: name, **(args or {})}
+            name = real_name
+
     if name == "run_shell":
         return run_shell(
             command=args.get("command", ""),

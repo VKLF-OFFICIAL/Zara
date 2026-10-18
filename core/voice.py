@@ -209,7 +209,19 @@ class EdgeTTSEngine:
 
 
 class VoiceSynthesizer:
-    """Gestor de voz de Zara con reproducción en streaming y cancelación Barge-in."""
+    """Gestor de voz de Zara con síntesis adelantada (pipeline), reproducción en
+    streaming y cancelación Barge-in.
+
+    [FIX] AUDITORÍA DE VOZ: medido en real, cada llamada de síntesis a EdgeTTS
+    tarda ~1.2-1.6s de ida y vuelta de red. La implementación anterior era
+    estrictamente secuencial (sintetizar frase -> reproducirla -> sintetizar la
+    siguiente -> reproducirla...), así que entre CADA frase de cualquier
+    respuesta de más de una frase había un corte de silencio de más de un
+    segundo mientras se esperaba a la red: eso es lo que se percibía como
+    "se corta cuando habla". Ahora hay dos hilos independientes: uno de
+    SÍNTESIS que va por delante sintetizando la siguiente frase mientras la
+    actual está sonando, y uno de REPRODUCCIÓN que solo consume audio ya listo.
+    """
 
     def __init__(self, on_state_change: Optional[Callable[[bool], None]] = None):
         self.on_state_change = on_state_change
@@ -218,22 +230,39 @@ class VoiceSynthesizer:
         self._edge = EdgeTTSEngine()
 
         self._tts_queue: queue.Queue[Optional[str]] = queue.Queue()
+        # [FIX] Cola de audio YA sintetizado, lista para reproducir sin más
+        # espera. El hilo de síntesis la alimenta por delante del de reproducción.
+        # Cada item es (samples, sr, generation) — ver _synthesis_worker/_playback_worker.
+        self._audio_queue: queue.Queue[tuple] = queue.Queue(maxsize=5)
         self._stop_event = threading.Event()
         self._is_speaking = False
-        self._lock = threading.Lock()
+        # [FIX AUDITORÍA] RLock en vez de Lock: defensa en profundidad para que
+        # un futuro callback de on_state_change que reentre en is_speaking()/
+        # say() desde el mismo hilo no provoque un deadlock.
+        self._lock = threading.RLock()
+        # Contador de frases pendientes (encoladas para sintetizar o ya
+        # sintetizadas y pendientes de reproducir). Solo cuando llega a 0
+        # consideramos que Zara ha terminado de hablar de verdad.
+        self._pending_count = 0
+        # Generación monótona: al abortar por barge-in se incrementa, así el
+        # hilo de síntesis descarta cualquier audio "en vuelo" de la tanda
+        # anterior en vez de dejarlo resucitar en la cola de reproducción.
+        self._generation = 0
 
-        self._worker_thread = threading.Thread(target=self._playback_worker, daemon=True)
-        self._worker_thread.start()
+        self._synthesis_thread = threading.Thread(target=self._synthesis_worker, daemon=True)
+        self._playback_thread = threading.Thread(target=self._playback_worker, daemon=True)
+        self._synthesis_thread.start()
+        self._playback_thread.start()
 
     def is_speaking(self) -> bool:
         with self._lock:
             return self._is_speaking
 
     def stop(self) -> None:
-        """Interrupción inmediata (Barge-in): detiene el audio y vacía la cola.
+        """Interrupción inmediata (Barge-in): detiene el audio y vacía las colas.
 
         [BUG-7 FIX] Actualizar _is_speaking=False ANTES de llamar sd.stop() y
-        vaciar la cola, para que el worker no emita on_state_change(False)
+        vaciar las colas, para que el worker no emita on_state_change(False)
         redundantemente después de que nosotros ya lo hemos hecho.
         """
         with self._lock:
@@ -244,6 +273,8 @@ class VoiceSynthesizer:
                         self.on_state_change(False)
                     except Exception:
                         pass
+            self._pending_count = 0
+            self._generation += 1
 
         # Detener reproducción actual
         try:
@@ -251,12 +282,13 @@ class VoiceSynthesizer:
         except Exception:
             pass
 
-        # Vaciar cola de frases pendientes
-        while not self._tts_queue.empty():
-            try:
-                self._tts_queue.get_nowait()
-            except queue.Empty:
-                break
+        # Vaciar colas de frases y audio pendientes
+        for q in (self._tts_queue, self._audio_queue):
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                except queue.Empty:
+                    break
 
         log.info("Reproducción de voz abortada por Barge-in.")
 
@@ -264,6 +296,8 @@ class VoiceSynthesizer:
         """Encola una frase completa para ser sintetizada."""
         clean = clean_text_for_speech(text)
         if clean:
+            with self._lock:
+                self._pending_count += 1
             self._tts_queue.put(clean)
 
     def feed_token_stream(self, token_generator: Generator[str, None, None]) -> None:
@@ -273,10 +307,10 @@ class VoiceSynthesizer:
             if self._stop_event.is_set():
                 break
             for sentence in chunker.push(token):
-                self._tts_queue.put(sentence)
+                self._enqueue_sentence(sentence)
 
         for sentence in chunker.flush():
-            self._tts_queue.put(sentence)
+            self._enqueue_sentence(sentence)
 
     async def feed_async_token_stream(self, async_generator: AsyncGenerator[str, None]) -> None:
         """Procesa un generador asíncrono de tokens del LLM usando SentenceChunker."""
@@ -285,10 +319,15 @@ class VoiceSynthesizer:
             if self._stop_event.is_set():
                 break
             for sentence in chunker.push(token):
-                self._tts_queue.put(sentence)
+                self._enqueue_sentence(sentence)
 
         for sentence in chunker.flush():
-            self._tts_queue.put(sentence)
+            self._enqueue_sentence(sentence)
+
+    def _enqueue_sentence(self, sentence: str) -> None:
+        with self._lock:
+            self._pending_count += 1
+        self._tts_queue.put(sentence)
 
     def _synthesize_audio(self, text: str) -> Optional[tuple[np.ndarray, int]]:
         """Intenta sintetizar con Kokoro si está habilitado; de lo contrario EdgeTTS."""
@@ -299,8 +338,23 @@ class VoiceSynthesizer:
 
         return self._edge.synthesize(text)
 
-    def _playback_worker(self) -> None:
-        """Hilo trabajador que toma frases de la cola, sintetiza y reproduce."""
+    def _synthesis_worker(self) -> None:
+        """[FIX] Hilo dedicado a la síntesis, por delante de la reproducción.
+
+        Convierte texto en audio en segundo plano mientras la frase anterior
+        suena, para que la latencia de red de EdgeTTS (~1.2-1.6s medidos) no
+        se perciba como un corte de silencio entre cada frase.
+
+        [FIX AUDITORÍA] Antes la comprobación de generación ("¿sigue vigente
+        este turno?") y el `self._audio_queue.put(...)` ocurrían en dos
+        bloques `with self._lock` SEPARADOS. Entre uno y otro, `stop()` podía
+        ejecutarse en otro hilo e incrementar la generación / vaciar la cola
+        *antes* de que este `put()` insertara el audio — y ese audio ya
+        "cancelado" acababa resucitando en `_audio_queue` igualmente. Ahora
+        todo el ciclo comprobar-generación + encolar es atómico bajo el mismo
+        `with self._lock`, y cada item se etiqueta con su generación para que
+        `_playback_worker` pueda volver a comprobarla justo antes de sonar.
+        """
         while not self._stop_event.is_set():
             try:
                 text = self._tts_queue.get(timeout=0.2)
@@ -308,15 +362,52 @@ class VoiceSynthesizer:
                 continue
 
             if text is None:
+                with self._lock:
+                    self._pending_count = max(0, self._pending_count - 1)
                 continue
-
-            audio_data = self._synthesize_audio(text)
-            if audio_data is None:
-                continue
-
-            samples, sr = audio_data
 
             with self._lock:
+                gen = self._generation
+
+            audio_data = self._synthesize_audio(text)
+
+            with self._lock:
+                # Tanda abortada por barge-in mientras sintetizábamos: esta
+                # generación ya no es la actual. NO tocamos _pending_count:
+                # ese contador pertenece íntegramente a la generación ACTUAL
+                # (stop() ya lo puso a 0 cuando canceló esta); descontar aquí
+                # restaría trabajo de un turno nuevo que nada tiene que ver.
+                if gen != self._generation:
+                    continue
+                if audio_data is None:
+                    self._pending_count = max(0, self._pending_count - 1)
+                    continue
+                try:
+                    self._audio_queue.put_nowait((audio_data[0], audio_data[1], gen))
+                except queue.Full:
+                    log.warning("Cola de audio llena: frase sintetizada descartada.")
+                    self._pending_count = max(0, self._pending_count - 1)
+
+    def _playback_worker(self) -> None:
+        """Hilo trabajador que solo reproduce audio ya sintetizado y listo.
+
+        [FIX AUDITORÍA] Cada item lleva la generación con la que se sintetizó.
+        Si cambió (barge-in) mientras esperaba en cola o a mitad de
+        reproducción, se descarta/corta sin tocar el contador de la
+        generación actual (que ya gestiona su propio trabajo pendiente).
+        """
+        while not self._stop_event.is_set():
+            try:
+                item = self._audio_queue.get(timeout=0.2)
+            except queue.Empty:
+                continue
+
+            samples, sr, item_gen = item
+
+            with self._lock:
+                if item_gen != self._generation:
+                    # Turno ya cancelado mientras esperaba en cola: descartar.
+                    continue
                 self._is_speaking = True
                 if self.on_state_change:
                     try:
@@ -329,7 +420,9 @@ class VoiceSynthesizer:
                 # [BUG-6 FIX] sd.get_stream() lanza RuntimeError si no hay stream;
                 # usar sd.wait() con intervalo de polling manual es más seguro.
                 while True:
-                    if not self._is_speaking or self._stop_event.is_set():
+                    with self._lock:
+                        still_current = item_gen == self._generation
+                    if not still_current or not self._is_speaking or self._stop_event.is_set():
                         sd.stop()
                         break
                     try:
@@ -343,17 +436,21 @@ class VoiceSynthesizer:
                 log.warning("Error durante la reproducción en sounddevice: %s", exc)
             finally:
                 with self._lock:
-                    if self._tts_queue.empty():
-                        self._is_speaking = False
-                        if self.on_state_change:
-                            try:
-                                self.on_state_change(False)
-                            except Exception:
-                                pass
+                    if item_gen == self._generation:
+                        self._pending_count = max(0, self._pending_count - 1)
+                        if self._pending_count == 0:
+                            self._is_speaking = False
+                            if self.on_state_change:
+                                try:
+                                    self.on_state_change(False)
+                                except Exception:
+                                    pass
 
     def shutdown(self) -> None:
         """Cierre ordenado del motor de voz."""
         self.stop()
         self._stop_event.set()
-        if self._worker_thread.is_alive():
-            self._worker_thread.join(timeout=1.0)
+        if self._synthesis_thread.is_alive():
+            self._synthesis_thread.join(timeout=1.0)
+        if self._playback_thread.is_alive():
+            self._playback_thread.join(timeout=1.0)

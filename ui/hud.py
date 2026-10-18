@@ -24,16 +24,22 @@ class HUDState(Enum):
     SPEAKING = "SPEAKING"
 
 
-# Paleta táctica de Zara.
-CYAN = QtGui.QColor("#2EF2E6")
-VIOLET = QtGui.QColor("#5A4BFF")
-PINK = QtGui.QColor("#EC4899")
-BG = QtGui.QColor("#07080C")
-MUTED_GRAY = QtGui.QColor("#4B5563")
+# [DISEÑO] Paleta táctica definitiva de Zara (revisión visual con ChatGPT como
+# diseñador: mismo espíritu cian/violeta/rosa, pero fondos más sobrios y
+# acentos reservados para lo importante, en vez de neón por todas partes).
+CYAN = QtGui.QColor("#2EF2E6")       # Acento / IDLE
+VIOLET = QtGui.QColor("#8878FF")     # Procesando (THINKING)
+PINK = QtGui.QColor("#FF5CB8")       # Voz de Zara (SPEAKING)
+GREEN = QtGui.QColor("#34D399")      # Escuchando (LISTENING)
+BG = QtGui.QColor("#080B12")         # Fondo principal
+PANEL_BG = QtGui.QColor("#101725")   # Paneles y tarjetas
+SURFACE = QtGui.QColor("#172438")    # Superficie elevada
+TEXT_MAIN = QtGui.QColor("#E5EDF7")  # Texto principal
+MUTED_GRAY = QtGui.QColor("#64748B")
 
 _STATE_COLOR = {
     HUDState.IDLE: CYAN,
-    HUDState.LISTENING: QtGui.QColor("#10B981"),
+    HUDState.LISTENING: GREEN,
     HUDState.THINKING: VIOLET,
     HUDState.SPEAKING: PINK,
 }
@@ -51,114 +57,139 @@ AVATAR_CANDIDATES = [
     str(_PROJECT_ROOT / "config" / "avatar.jpg"),
     str(_PROJECT_ROOT / "config" / "zara-icon.png"),
 ]
+APP_ICON_CANDIDATES = [
+    str(_PROJECT_ROOT / "config" / "zara-icon.ico"),
+    str(_PROJECT_ROOT / "config" / "zara-icon.png"),
+]
 
-_PANEL_STYLE = """
-QFrame#bg {
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 rgba(8, 14, 26, 235), stop:1 rgba(15, 23, 42, 245));
-    border: 1px solid rgba(46, 242, 230, 90);
+# [DISEÑO] Pilas de fuentes con fallback seguro: la fuente preferida va
+# primero (Orbitron para títulos "HUD", JetBrains Mono para la consola/datos
+# técnicos, Inter para el resto de la interfaz), pero como no se garantiza
+# que estén instaladas en el Windows del Señor VK, Qt recorre la lista y usa
+# la primera disponible — nunca se queda sin fuente legible.
+_FONT_TITLE = "'Orbitron', 'Segoe UI Semibold', 'Segoe UI', sans-serif"
+_FONT_MONO = "'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace"
+_FONT_UI = "'Inter', 'Segoe UI', sans-serif"
+
+_PANEL_STYLE = f"""
+QFrame#bg {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 rgba(8, 11, 18, 245), stop:1 rgba(16, 23, 37, 250));
+    border: 1px solid rgba(46, 242, 230, 60);
     border-radius: 14px;
-}
-QLabel { color: #94A3B8; font-family: 'Consolas', monospace; border: none; }
-QLabel#title { color: #2EF2E6; font-size: 13px; font-weight: bold; }
-QLabel#status { color: #E2E8F0; font-size: 11px; }
-QPushButton {
-    background-color: rgba(46, 242, 230, 18);
-    color: #2EF2E6;
-    border: 1px solid rgba(46, 242, 230, 70);
-    border-radius: 6px;
-    padding: 4px 8px;
-    font-family: 'Consolas', monospace;
-    font-size: 11px;
-}
-QPushButton:hover { background-color: rgba(46, 242, 230, 40); }
-QPushButton:pressed { background-color: rgba(46, 242, 230, 60); }
-QPushButton#closeBtn {
+}}
+QLabel {{ color: #94A3B8; font-family: {_FONT_UI}; font-size: 12px; border: none; }}
+QLabel#title {{ color: #E5EDF7; font-family: {_FONT_TITLE}; font-size: 20px; font-weight: 600; }}
+QLabel#status {{ color: #E5EDF7; font-family: {_FONT_UI}; font-size: 12px; }}
+QPushButton {{
+    background-color: #131D2C;
+    color: #DCE8F6;
+    border: 1px solid #30445F;
+    border-radius: 8px;
+    padding: 9px 12px;
+    font-family: {_FONT_UI};
+    font-size: 12px;
+}}
+QPushButton:hover {{ background-color: #192A3D; border: 1px solid #2EF2E6; }}
+QPushButton:pressed {{ background-color: #102B3A; padding-top: 10px; padding-bottom: 8px; }}
+QPushButton#iconBtn {{
+    background-color: #131D2C;
+    border: 1px solid #30445F;
+    border-radius: 20px;
+    padding: 0px;
+}}
+QPushButton#iconBtn:hover {{ background-color: #192A3D; border: 1px solid #2EF2E6; }}
+QPushButton#iconBtn:pressed {{ background-color: #102B3A; }}
+QPushButton#closeBtn {{
     color: #F87171;
     border: none;
     background: transparent;
-    font-size: 14px;
+    font-size: 15px;
     font-weight: bold;
     padding: 0px 4px;
-}
-QPushButton#closeBtn:hover { color: #FCA5A5; }
-QPlainTextEdit {
-    background-color: rgba(3, 7, 18, 190);
-    color: #CBD5E1;
-    border: 1px solid rgba(46, 242, 230, 50);
-    border-radius: 6px;
-    font-family: 'Consolas', monospace;
-    font-size: 10px;
-}
-QLineEdit {
-    background-color: rgba(3, 7, 18, 190);
-    color: #2EF2E6;
-    border: 1px solid rgba(46, 242, 230, 60);
-    border-radius: 6px;
-    padding: 4px 6px;
-    font-family: 'Consolas', monospace;
+}}
+QPushButton#closeBtn:hover {{ color: #FCA5A5; }}
+QPlainTextEdit#console {{
+    background-color: #0B111C;
+    color: #C3D2E5;
+    border: 1px solid #1E3045;
+    border-radius: 10px;
+    padding: 10px;
+    font-family: {_FONT_MONO};
     font-size: 11px;
-}
-QComboBox {
-    background-color: rgba(3, 7, 18, 190);
-    color: #2EF2E6;
-    border: 1px solid rgba(46, 242, 230, 60);
-    border-radius: 6px;
-    padding: 3px 6px;
-    font-family: 'Consolas', monospace;
-    font-size: 11px;
+    selection-background-color: #17465A;
+}}
+QLineEdit {{
+    background-color: #101725;
+    color: #E5EDF7;
+    border: 1px solid #30445F;
+    border-radius: 8px;
+    padding: 9px 10px;
+    font-family: {_FONT_UI};
+    font-size: 12px;
+}}
+QLineEdit:focus {{ border: 1px solid #2EF2E6; }}
+QComboBox {{
+    background-color: #101725;
+    color: #E5EDF7;
+    border: 1px solid #30445F;
+    border-radius: 8px;
+    padding: 7px 8px;
+    font-family: {_FONT_UI};
+    font-size: 12px;
     min-width: 140px;
-}
-QComboBox::drop-down {
+}}
+QComboBox:focus {{ border: 1px solid #2EF2E6; }}
+QComboBox::drop-down {{
     border: none;
-    width: 18px;
-}
-QComboBox::down-arrow {
+    width: 20px;
+}}
+QComboBox::down-arrow {{
     image: none;
     border-left: 4px solid transparent;
     border-right: 4px solid transparent;
     border-top: 5px solid #2EF2E6;
-    margin-right: 4px;
-}
-QComboBox QAbstractItemView {
-    background-color: rgba(8, 14, 26, 250);
-    color: #2EF2E6;
-    border: 1px solid rgba(46, 242, 230, 90);
-    border-radius: 6px;
-    selection-background-color: rgba(46, 242, 230, 50);
+    margin-right: 6px;
+}}
+QComboBox QAbstractItemView {{
+    background-color: #101725;
+    color: #E5EDF7;
+    border: 1px solid #30445F;
+    border-radius: 8px;
+    selection-background-color: rgba(46, 242, 230, 35);
     selection-color: #FFFFFF;
-    font-family: 'Consolas', monospace;
-    font-size: 11px;
+    font-family: {_FONT_UI};
+    font-size: 12px;
     outline: none;
-    padding: 2px;
-}
-QComboBox QAbstractItemView::item {
-    min-height: 25px;
-    padding: 3px 8px;
-    border-radius: 4px;
-}
-QComboBox QAbstractItemView::item:hover {
-    background-color: rgba(46, 242, 230, 30);
+    padding: 4px;
+}}
+QComboBox QAbstractItemView::item {{
+    min-height: 26px;
+    padding: 4px 8px;
+    border-radius: 6px;
+}}
+QComboBox QAbstractItemView::item:hover {{
+    background-color: rgba(46, 242, 230, 25);
     color: #FFFFFF;
-}
-QComboBox QAbstractItemView::item:selected {
-    background-color: rgba(46, 242, 230, 60);
+}}
+QComboBox QAbstractItemView::item:selected {{
+    background-color: rgba(46, 242, 230, 50);
     color: #FFFFFF;
-}
-QScrollBar:vertical {
-    background: rgba(3, 7, 18, 220);
+}}
+QScrollBar:vertical {{
+    background: #0B111C;
     width: 8px;
     border-radius: 4px;
     margin: 2px;
-}
-QScrollBar::handle:vertical {
+}}
+QScrollBar::handle:vertical {{
     background: rgba(46, 242, 230, 110);
     border-radius: 4px;
     min-height: 24px;
-}
-QScrollBar::handle:vertical:hover {
+}}
+QScrollBar::handle:vertical:hover {{
     background: rgba(46, 242, 230, 180);
-}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0px; }
+}}
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
 """
 
 
@@ -177,6 +208,68 @@ def _iridescent(phase: float) -> QtGui.QColor:
     if x < 0.5:
         return _lerp(CYAN, VIOLET, x * 2)
     return _lerp(VIOLET, PINK, (x - 0.5) * 2)
+
+
+# =============================================================================
+# [DISEÑO] Iconos vectoriales dibujados a mano (QPainter), sin emojis ni
+# dependencias externas de SVG/fuentes de iconos. Cada función pinta un
+# glifo simple y reconocible sobre un QPixmap transparente que luego se usa
+# como QIcon en los botones del panel.
+# =============================================================================
+
+def _draw_mic_icon(p: QtGui.QPainter, rect: QtCore.QRectF, color: QtGui.QColor) -> None:
+    cx, cy = rect.center().x(), rect.center().y()
+    w, h = rect.width(), rect.height()
+    p.setPen(QtCore.Qt.NoPen)
+    p.setBrush(color)
+    capsule = QtCore.QRectF(cx - w * 0.14, cy - h * 0.32, w * 0.28, h * 0.42)
+    p.drawRoundedRect(capsule, capsule.width() / 2, capsule.width() / 2)
+    pen = QtGui.QPen(color, w * 0.07, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
+    p.setPen(pen)
+    p.setBrush(QtCore.Qt.NoBrush)
+    stand = QtCore.QRectF(cx - w * 0.22, cy - h * 0.12, w * 0.44, h * 0.4)
+    p.drawArc(stand, 0, -180 * 16)
+    p.drawLine(QtCore.QPointF(cx, cy + h * 0.28), QtCore.QPointF(cx, cy + h * 0.38))
+    p.drawLine(QtCore.QPointF(cx - w * 0.16, cy + h * 0.38), QtCore.QPointF(cx + w * 0.16, cy + h * 0.38))
+
+
+def _draw_mic_off_icon(p: QtGui.QPainter, rect: QtCore.QRectF, color: QtGui.QColor) -> None:
+    _draw_mic_icon(p, rect, color)
+    pen = QtGui.QPen(QtGui.QColor("#F87171"), rect.width() * 0.09, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
+    p.setPen(pen)
+    d = rect.width() * 0.32
+    cx, cy = rect.center().x(), rect.center().y()
+    p.drawLine(QtCore.QPointF(cx - d, cy - d), QtCore.QPointF(cx + d, cy + d))
+
+
+def _draw_stop_icon(p: QtGui.QPainter, rect: QtCore.QRectF, color: QtGui.QColor) -> None:
+    p.setPen(QtCore.Qt.NoPen)
+    p.setBrush(color)
+    w, h = rect.width(), rect.height()
+    sq = QtCore.QRectF(rect.center().x() - w * 0.2, rect.center().y() - h * 0.2, w * 0.4, h * 0.4)
+    p.drawRoundedRect(sq, w * 0.06, w * 0.06)
+
+
+def _draw_power_icon(p: QtGui.QPainter, rect: QtCore.QRectF, color: QtGui.QColor) -> None:
+    w, h = rect.width(), rect.height()
+    cx, cy = rect.center().x(), rect.center().y()
+    pen = QtGui.QPen(color, w * 0.09, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap)
+    p.setPen(pen)
+    p.setBrush(QtCore.Qt.NoBrush)
+    arc_rect = QtCore.QRectF(cx - w * 0.26, cy - h * 0.26, w * 0.52, h * 0.52)
+    p.drawArc(arc_rect, (90 + 35) * 16, (360 - 70) * 16)
+    p.drawLine(QtCore.QPointF(cx, cy - h * 0.34), QtCore.QPointF(cx, cy))
+
+
+def build_icon(draw_fn, color: QtGui.QColor, px: int = 40) -> QtGui.QIcon:
+    """Renderiza un glifo vectorial en un QPixmap transparente de `px`x`px`."""
+    pm = QtGui.QPixmap(px, px)
+    pm.fill(QtCore.Qt.transparent)
+    p = QtGui.QPainter(pm)
+    p.setRenderHint(QtGui.QPainter.Antialiasing)
+    draw_fn(p, QtCore.QRectF(0, 0, px, px), color)
+    p.end()
+    return QtGui.QIcon(pm)
 
 
 class ZaraPanel(QtWidgets.QWidget):
@@ -228,6 +321,13 @@ class ZaraPanel(QtWidgets.QWidget):
         bg = QtWidgets.QFrame(self)
         bg.setObjectName("bg")
         bg.setStyleSheet(_PANEL_STYLE)
+        # [DISEÑO] Sombra suave para dar profundidad ("glassmorphism" ligero)
+        # sin abusar de efectos: un único halo moderado, no uno por widget.
+        shadow = QtWidgets.QGraphicsDropShadowEffect(bg)
+        shadow.setBlurRadius(36)
+        shadow.setOffset(0, 6)
+        shadow.setColor(QtGui.QColor(0, 0, 0, 160))
+        bg.setGraphicsEffect(shadow)
         outer.addWidget(bg)
 
         layout = QtWidgets.QVBoxLayout(bg)
@@ -255,6 +355,7 @@ class ZaraPanel(QtWidgets.QWidget):
 
         # Consola de eventos
         self.console = QtWidgets.QPlainTextEdit()
+        self.console.setObjectName("console")
         self.console.setReadOnly(True)
         self.console.setMaximumBlockCount(300)
         layout.addWidget(self.console, stretch=1)
@@ -302,22 +403,43 @@ class ZaraPanel(QtWidgets.QWidget):
 
         self._refresh_model_options()
 
-        # Botones rápidos
+        # [DISEÑO] Botones rápidos como iconos circulares vectoriales (nada de
+        # emojis): el texto descriptivo pasa a tooltip, por accesibilidad.
         btn_row = QtWidgets.QHBoxLayout()
-        self.mic_btn = QtWidgets.QPushButton("🎤 Mic")
+        btn_row.setSpacing(10)
+        btn_row.addStretch()
+
+        self.mic_btn = QtWidgets.QPushButton()
+        self.mic_btn.setObjectName("iconBtn")
+        self.mic_btn.setFixedSize(40, 40)
+        self.mic_btn.setIcon(build_icon(_draw_mic_icon, CYAN))
+        self.mic_btn.setIconSize(QtCore.QSize(22, 22))
+        self.mic_btn.setToolTip("Micrófono: activar / silenciar")
         self.mic_btn.setCursor(QtCore.Qt.PointingHandCursor)
         self.mic_btn.clicked.connect(self.mic_toggle_requested.emit)
         btn_row.addWidget(self.mic_btn)
 
-        interrupt_btn = QtWidgets.QPushButton("⛔ Parar")
+        interrupt_btn = QtWidgets.QPushButton()
+        interrupt_btn.setObjectName("iconBtn")
+        interrupt_btn.setFixedSize(40, 40)
+        interrupt_btn.setIcon(build_icon(_draw_stop_icon, QtGui.QColor("#F87171")))
+        interrupt_btn.setIconSize(QtCore.QSize(22, 22))
+        interrupt_btn.setToolTip("Parar: interrumpir la respuesta de Zara")
         interrupt_btn.setCursor(QtCore.Qt.PointingHandCursor)
         interrupt_btn.clicked.connect(self.interrupt_requested.emit)
         btn_row.addWidget(interrupt_btn)
 
-        quit_btn = QtWidgets.QPushButton("Salir")
+        quit_btn = QtWidgets.QPushButton()
+        quit_btn.setObjectName("iconBtn")
+        quit_btn.setFixedSize(40, 40)
+        quit_btn.setIcon(build_icon(_draw_power_icon, VIOLET))
+        quit_btn.setIconSize(QtCore.QSize(22, 22))
+        quit_btn.setToolTip("Salir: cerrar ZARA")
         quit_btn.setCursor(QtCore.Qt.PointingHandCursor)
         quit_btn.clicked.connect(self.quit_requested.emit)
         btn_row.addWidget(quit_btn)
+
+        btn_row.addStretch()
         layout.addLayout(btn_row)
 
     def _submit_text(self) -> None:
@@ -410,7 +532,9 @@ class ZaraPanel(QtWidgets.QWidget):
         self.status_lbl.setText(f"ESTADO: {state_text} // {mic_text}")
 
     def set_muted_visual(self, muted: bool) -> None:
-        self.mic_btn.setText("🔇 Mic" if muted else "🎤 Mic")
+        icon_fn = _draw_mic_off_icon if muted else _draw_mic_icon
+        self.mic_btn.setIcon(build_icon(icon_fn, MUTED_GRAY if muted else CYAN))
+        self.mic_btn.setToolTip("Micrófono silenciado" if muted else "Micrófono: activar / silenciar")
 
     def set_brain(self, value: str) -> None:
         for i in range(self.brain_combo.count()):
@@ -464,6 +588,11 @@ class ZaraHUD(QtWidgets.QWidget):
         self._d = diameter
         self._state = HUDState.IDLE
         self._phase = 0.0
+        # [DISEÑO] Fase de color IDLE independiente de la de rotación/onda:
+        # un ciclo cian→violeta→rosa de ~10s se percibe premium y calmado;
+        # si compartiera la fase con el giro del anillo, iría a ~3.5s (muy
+        # "nervioso" para un HUD de alta gama).
+        self._color_phase = 0.0
         self._level = 0.2
         self._target_level = 0.2
         self._muted = False
@@ -483,6 +612,10 @@ class ZaraHUD(QtWidgets.QWidget):
 
     def _init_window(self) -> None:
         self.setWindowTitle("ZARA")
+        for candidate in APP_ICON_CANDIDATES:
+            if Path(candidate).is_file():
+                self.setWindowIcon(QtGui.QIcon(candidate))
+                break
         self.setFixedSize(self._d, self._d)
         self.setWindowFlags(
             QtCore.Qt.FramelessWindowHint
@@ -595,6 +728,10 @@ class ZaraHUD(QtWidgets.QWidget):
         self._phase += 0.05
         if self._phase > 2 * math.pi:
             self._phase -= 2 * math.pi
+        # ~36 fps * 0.018 rad/tick ≈ 2π cada 10s (vs. ~3.5s de self._phase).
+        self._color_phase += 0.018
+        if self._color_phase > 2 * math.pi:
+            self._color_phase -= 2 * math.pi
 
         if self._state in (HUDState.LISTENING, HUDState.SPEAKING):
             self._target_level = max(self._target_level, 0.45 + 0.4 * abs(math.sin(self._phase * 2.3)))
@@ -609,7 +746,7 @@ class ZaraHUD(QtWidgets.QWidget):
         if self._muted:
             return MUTED_GRAY
         if self._state == HUDState.IDLE:
-            return _iridescent(self._phase)
+            return _iridescent(self._color_phase)
         return _STATE_COLOR[self._state]
 
     # --- pintura ---

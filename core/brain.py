@@ -29,6 +29,7 @@ import re
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import urllib.request
 from typing import Any, AsyncGenerator, Callable, Dict, Generator, List, Optional, Tuple
@@ -67,33 +68,116 @@ def list_ollama_models(host: str = OLLAMA_HOST, timeout: float = 3.0) -> List[st
         return []
 
 
-_FENCED_JSON_RE = re.compile(r"```(?:json|xml)?\s*(\{.*?\})\s*```", re.DOTALL)
-_BARE_JSON_RE = re.compile(r"\{.*\}", re.DOTALL)
+# [FIX] Formatos alternativos de llamada a herramienta que emiten algunas
+# plantillas de modelos locales (Qwen/Hermes abliterados, etc.) en lugar del
+# JSON plano {"name": ..., "arguments": {...}} que se les pide explícitamente:
+#   - Pseudo-XML de un solo tag:  <function name="open_app" arguments='{"target":"notepad"}'/>
+#   - Formato nativo de Qwen:     <tool_call>{"name": ..., "arguments": {...}}</tool_call>
+_FUNCTION_TAG_RE = re.compile(
+    r"<function\s+name=[\"']([^\"']+)[\"']\s+arguments=[\"'](\{.*?\})[\"']\s*/?>",
+    re.DOTALL,
+)
+_TOOL_CALL_TAG_RE = re.compile(r"<tool_call>\s*(\{.*?\})\s*</tool_call>", re.DOTALL)
 
 
-def _extract_embedded_tool_call(text: str, known_tool_names: set) -> Optional[Dict[str, Any]]:
-    """Intenta extraer una llamada a herramienta {\"name\": ..., \"arguments\": {...}}
+def _iter_json_objects(text: str):
+    """Escanea `text` con un decodificador JSON real y produce cada objeto de
+    nivel superior válido que encuentra.
 
-    escrita por el modelo como texto plano en lugar de usar el campo nativo
-    `tool_calls` de la API de Ollama.
+    [FIX] La implementación anterior usaba regex ingenuas (`\\{.*\\}`) que se
+    rompían con JSON anidado (p. ej. {"name": ..., "arguments": {...}}) y con
+    varias llamadas seguidas en la misma respuesta (el modelo a veces separa
+    una petición de dos datos en dos objetos JSON consecutivos). Un decoder
+    real resuelve ambos casos sin ambigüedad.
     """
+    decoder = json.JSONDecoder()
+    i, n = 0, len(text)
+    while i < n:
+        if text[i] == "{":
+            try:
+                obj, end = decoder.raw_decode(text, i)
+                yield obj
+                i = end
+                continue
+            except (json.JSONDecodeError, ValueError):
+                pass
+        i += 1
+
+
+def _extract_embedded_tool_calls(
+    text: str,
+    known_tool_names: set,
+    tool_definitions: Optional[List[Dict[str, Any]]] = None,
+) -> List[Dict[str, Any]]:
+    """Extrae TODAS las llamadas a herramienta {\"name\": ..., \"arguments\": {...}}
+
+    escritas por el modelo como texto plano en lugar de usar el campo nativo
+    `tool_calls` de la API de Ollama. Soporta JSON plano o dentro de fences
+    markdown (anidado o con varias llamadas seguidas) y los formatos
+    alternativos `<function .../>` / `<tool_call>...</tool_call>`.
+
+    [FIX] Hallazgo de auditoría en vivo: con modelos locales pequeños, el
+    modelo a veces llama directamente a un VALOR del enum "action" de una
+    herramienta genérica (p. ej. "open_app", parte de `os_control`) como si
+    fuera el nombre de la propia herramienta. Si se pasa `tool_definitions`,
+    esos valores también se aceptan aquí (SIN remapear: se deja el nombre y
+    los argumentos tal cual los escribió el modelo) para que la llamada no se
+    descarte entera antes de llegar a `execute_tool()`, que es quien hace la
+    corrección real en un único sitio central.
+    """
+    calls: List[Dict[str, Any]] = []
     if not text or not text.strip():
-        return None
+        return calls
 
-    candidates = [m.group(1) for m in _FENCED_JSON_RE.finditer(text)]
-    bare = _BARE_JSON_RE.search(text)
-    if bare:
-        candidates.append(bare.group(0))
-    candidates.append(text.strip())
+    recognized = set(known_tool_names)
+    for t in tool_definitions or []:
+        props = (t.get("parameters", {}) or {}).get("properties", {}) or {}
+        for schema in props.values():
+            recognized.update(schema.get("enum") or [])
 
-    for candidate in candidates:
+    seen = set()
+
+    def _maybe_add(name: Any, arguments: Any) -> None:
+        if not name or name not in recognized:
+            return
+        if not isinstance(arguments, dict):
+            arguments = {}
+        key = (name, json.dumps(arguments, sort_keys=True, ensure_ascii=False))
+        if key in seen:
+            return
+        seen.add(key)
+        calls.append({"name": name, "arguments": arguments})
+
+    for m in _FUNCTION_TAG_RE.finditer(text):
         try:
-            obj = json.loads(candidate)
+            args = json.loads(m.group(2))
+        except Exception:
+            args = {}
+        _maybe_add(m.group(1), args)
+
+    for m in _TOOL_CALL_TAG_RE.finditer(text):
+        try:
+            obj = json.loads(m.group(1))
         except Exception:
             continue
-        if isinstance(obj, dict) and obj.get("name") in known_tool_names:
-            return obj
-    return None
+        if isinstance(obj, dict):
+            _maybe_add(obj.get("name"), obj.get("arguments") or obj.get("args"))
+
+    for obj in _iter_json_objects(text):
+        if isinstance(obj, dict):
+            _maybe_add(obj.get("name"), obj.get("arguments") or obj.get("args"))
+
+    return calls
+
+
+def _extract_embedded_tool_call(
+    text: str,
+    known_tool_names: set,
+    tool_definitions: Optional[List[Dict[str, Any]]] = None,
+) -> Optional[Dict[str, Any]]:
+    """Compatibilidad: devuelve solo la primera llamada detectada (o None)."""
+    calls = _extract_embedded_tool_calls(text, known_tool_names, tool_definitions)
+    return calls[0] if calls else None
 
 
 def _summarize_observations_locally(observations: List[str]) -> str:
@@ -251,38 +335,65 @@ class OllamaProvider:
 
         url = f"{self.host}/api/chat"
 
-        # Construir lista de mensajes: system primero (con fecha actual), luego historial
-        sent_messages: List[Dict[str, Any]] = []
-        if system_prompt:
-            sent_messages.append({"role": "system", "content": system_prompt})
-        sent_messages.extend(messages)
         known_tool_names = {t.get("name") for t in (tools or [])}
-        if tools:
-            reminder = {
-                "role": "system",
-                "content": (
-                    "INSTRUCCIÓN TÁCTICA SOBRE HERRAMIENTAS:\n"
-                    "- Si la petición del Señor VK es una pregunta general, saludo, conversación, explicación o no requiere interactuar con el sistema, responde DIRECTAMENTE en lenguaje natural español, NUNCA uses JSON ni llames a herramientas.\n"
-                    "- ÚNICAMENTE cuando sea estrictamente necesario ejecutar una acción (comandos, web, archivos, apps, pantalla), responde con un objeto JSON de una sola línea: {\"name\": \"<herramienta>\", \"arguments\": {...}}. Sin bloques de código markdown.\n"
-                    "- Si ya recibiste una [OBSERVACIÓN DEL SISTEMA], NO vuelvas a llamar a la misma herramienta: resume el resultado directamente para el Señor VK."
-                ),
-            }
-            sent_messages = messages + [reminder]
 
-        payload: Dict[str, Any] = {
-            "model": self.model,
-            "messages": sent_messages,
-            "stream": True,
-            "options": {"temperature": 0.15},
-        }
-        if tools:
-            payload["tools"] = [{"type": "function", "function": t} for t in tools]
+        # [FIX] Construir lista de mensajes: system primero (con fecha actual),
+        # luego historial, y por último el recordatorio táctico de herramientas
+        # AÑADIDO (no sustituido) para no perder la personalidad/reglas de Zara.
+        def _build_messages() -> List[Dict[str, Any]]:
+            sent: List[Dict[str, Any]] = []
+            if system_prompt:
+                sent.append({"role": "system", "content": system_prompt})
+            sent.extend(messages)
+            if tools:
+                sent.append({
+                    "role": "system",
+                    "content": (
+                        "INSTRUCCIÓN TÁCTICA SOBRE HERRAMIENTAS:\n"
+                        "- Si la petición del Señor VK es una pregunta general, saludo, conversación, explicación o no requiere interactuar con el sistema, responde DIRECTAMENTE en lenguaje natural español, NUNCA uses JSON ni llames a herramientas.\n"
+                        "- ÚNICAMENTE cuando sea estrictamente necesario ejecutar una acción (comandos, web, archivos, apps, pantalla), responde con un objeto JSON de una sola línea: {\"name\": \"<herramienta>\", \"arguments\": {...}}. Sin bloques de código markdown.\n"
+                        "- Si ya recibiste una [OBSERVACIÓN DEL SISTEMA], NO vuelvas a llamar a la misma herramienta: resume el resultado directamente para el Señor VK."
+                    ),
+                })
+            return sent
+
+        def _post(use_native_tools: bool):
+            payload: Dict[str, Any] = {
+                "model": self.model,
+                "messages": _build_messages(),
+                "stream": True,
+                "options": {"temperature": 0.15},
+            }
+            if tools and use_native_tools:
+                payload["tools"] = [{"type": "function", "function": t} for t in tools]
+            return requests.post(url, json=payload, stream=True, timeout=60)
 
         full_content = ""
         native_tool_call_found = False
+        use_native_tools = bool(tools)
 
         try:
-            with requests.post(url, json=payload, stream=True, timeout=60) as resp:
+            resp = _post(use_native_tools)
+
+            # [FIX] Muchos modelos locales (p. ej. qwen2.5-coder) NO soportan
+            # tool-calling nativo en Ollama y responden HTTP 400 ("does not
+            # support tools"), lo que antes abortaba toda la interacción con
+            # el sistema. Reintentamos sin el campo nativo "tools" y confiamos
+            # en el recordatorio táctico + extracción de JSON embebido, que
+            # funciona con cualquier modelo instruction-following.
+            if use_native_tools and resp.status_code == 400:
+                try:
+                    resp.close()
+                except Exception:
+                    pass
+                log.info(
+                    "El modelo Ollama '%s' no soporta tool-calling nativo (HTTP 400). "
+                    "Reintentando en modo JSON embebido.", self.model,
+                )
+                use_native_tools = False
+                resp = _post(use_native_tools)
+
+            with resp:
                 if resp.status_code != 200:
                     yield {"type": "error", "error": f"Ollama HTTP {resp.status_code}: {resp.text}"}
                     return
@@ -313,13 +424,17 @@ class OllamaProvider:
         if native_tool_call_found:
             return
 
-        parsed_call = _extract_embedded_tool_call(full_content, known_tool_names)
-        if parsed_call:
-            yield {
-                "type": "tool_call",
-                "name": parsed_call.get("name", ""),
-                "args": parsed_call.get("arguments") or parsed_call.get("args") or {},
-            }
+        # [FIX] Extraer TODAS las llamadas embebidas (antes solo se tomaba la
+        # primera y, con regex ingenuas, ni siquiera esa si había JSON anidado
+        # o varias llamadas seguidas en la misma respuesta).
+        parsed_calls = _extract_embedded_tool_calls(full_content, known_tool_names, tools)
+        if parsed_calls:
+            for pc in parsed_calls:
+                yield {
+                    "type": "tool_call",
+                    "name": pc.get("name", ""),
+                    "args": pc.get("arguments") or pc.get("args") or {},
+                }
         elif full_content:
             yield {"type": "token", "token": full_content}
 
@@ -351,10 +466,13 @@ class GeminiProvider:
     def stream_chat(
         self,
         messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
         screen_b64: Optional[str] = None,
         system_prompt: Optional[str] = None,
     ) -> Generator[Dict[str, Any], None, None]:
-        """Streaming con Gemini Flash y soporte multimodal de pantalla en memoria."""
+        """Streaming con Gemini Flash, soporte multimodal de pantalla en memoria
+        y [FIX] tool calling nativo (antes `tools` se ignoraba por completo aquí,
+        por lo que Gemini nunca podía ejecutar acciones sobre el sistema)."""
         if not self.is_available():
             yield {"type": "error", "error": "Gemini API no disponible o falta GEMINI_API_KEY."}
             return
@@ -375,9 +493,22 @@ class GeminiProvider:
                 parts.append(types.Part.from_text(text=m["content"]))
                 contents.append(types.Content(role=role, parts=parts))
 
+            gemini_tools = None
+            if tools:
+                function_declarations = [
+                    types.FunctionDeclaration(
+                        name=t["name"],
+                        description=t.get("description", ""),
+                        parameters=t.get("parameters"),
+                    )
+                    for t in tools
+                ]
+                gemini_tools = [types.Tool(function_declarations=function_declarations)]
+
             cfg = types.GenerateContentConfig(
                 system_instruction=effective_prompt,
                 temperature=0.3,
+                tools=gemini_tools,
             )
 
             response = self._client.models.generate_content_stream(
@@ -387,8 +518,20 @@ class GeminiProvider:
             )
 
             for chunk in response:
-                if chunk.text:
-                    yield {"type": "token", "token": chunk.text}
+                for cand in (chunk.candidates or []):
+                    content = getattr(cand, "content", None)
+                    if not content or not content.parts:
+                        continue
+                    for part in content.parts:
+                        fc = getattr(part, "function_call", None)
+                        if fc is not None and fc.name:
+                            yield {
+                                "type": "tool_call",
+                                "name": fc.name,
+                                "args": dict(fc.args or {}),
+                            }
+                        elif getattr(part, "text", None):
+                            yield {"type": "token", "token": part.text}
 
         except Exception as exc:
             log.exception("Error en streaming con Gemini: %s", exc)
@@ -519,6 +662,18 @@ class ZaraBrain:
         self.gemini = GeminiProvider()
         self.claude = ClaudeProvider()
 
+        # [FIX] AUDITORÍA: un barge-in detenía el AUDIO (VoiceSynthesizer.stop())
+        # pero nunca cancelaba la generación del LLM ni el bucle ReAct en curso.
+        # El agente seguía produciendo tokens/llamadas a herramientas del turno
+        # interrumpido, que acababan reproduciéndose de nuevo poco después,
+        # dando la sensación de que Zara "sigue hablando" tras ser cortada.
+        self._cancel_event = threading.Event()
+
+    def cancel_current_turn(self) -> None:
+        """Señala al bucle ReAct en curso (si hay uno) que se detenga de
+        inmediato sin terminar de generar ni reproducir el resto del turno."""
+        self._cancel_event.set()
+
     def _emit_tool_event(self, tool_name: str, status: str) -> None:
         if self.on_tool_event:
             try:
@@ -541,6 +696,10 @@ class ZaraBrain:
 
         Produce tokens en tiempo real listos para el SentenceChunker de voz y el HUD.
         """
+        # [FIX] Cada turno NUEVO empieza limpio: cualquier cancelación de un
+        # turno anterior ya resuelto no debe afectar a este.
+        self._cancel_event.clear()
+
         # Refrescar el system prompt con la fecha/hora real del momento actual.
         current_system_prompt = get_system_prompt()
 
@@ -571,6 +730,13 @@ class ZaraBrain:
         max_steps = 1 if is_chat_only else MAX_REACT_STEPS
 
         for step in range(1, max_steps + 1):
+            # [FIX] Barge-in: si el Señor VK interrumpió a Zara, detener el
+            # bucle ReAct de inmediato en vez de seguir generando/ejecutando
+            # herramientas de un turno que ya no interesa a nadie.
+            if self._cancel_event.is_set():
+                log.info("Turno cancelado por barge-in antes del paso %d. Descartando el resto.", step)
+                return
+
             log.info("Bucle ReAct - Paso %d/%d", step, max_steps)
 
             events = self._execute_stream_with_fallback(
@@ -584,6 +750,9 @@ class ZaraBrain:
             has_error = False
 
             for event in events:
+                if self._cancel_event.is_set():
+                    log.info("Turno cancelado por barge-in a mitad de la respuesta. Descartando el resto.")
+                    return
                 etype = event.get("type")
                 if etype == "token":
                     tok = event.get("token", "")
@@ -610,6 +779,9 @@ class ZaraBrain:
                     system_prompt=current_system_prompt,
                 )
                 for event in events2:
+                    if self._cancel_event.is_set():
+                        log.info("Turno cancelado por barge-in durante el fallback. Descartando el resto.")
+                        return
                     if event.get("type") == "token":
                         t = event.get("token", "")
                         full_thought_text += t
@@ -622,6 +794,10 @@ class ZaraBrain:
                     self.history.append({"role": "assistant", "content": full_thought_text})
                     self._trim_history()
                 break
+
+            if self._cancel_event.is_set():
+                log.info("Turno cancelado por barge-in justo antes de ejecutar herramientas. Abortando.")
+                return
 
             current_signature = tuple(sorted(
                 (tc.get("name", ""), json.dumps(tc.get("args", {}), sort_keys=True, ensure_ascii=False))
@@ -638,6 +814,24 @@ class ZaraBrain:
                 yield summary
                 break
             last_tool_signature = current_signature
+
+            # [FIX] AUDITORÍA: mantener la alternancia user/assistant que
+            # exigen las APIs de Claude/Gemini. Si el modelo pidió una
+            # herramienta SIN emitir texto antes (lo habitual con modelos
+            # locales, que normalmente solo devuelven el JSON de la llamada),
+            # el siguiente mensaje añadido al historial era la observación
+            # con rol "user" — justo después del "user" de la petición
+            # original o de una observación anterior, dejando DOS mensajes
+            # "user" consecutivos. Claude/Gemini rechazan o se comportan mal
+            # ante eso. Un placeholder breve del lado "assistant" restaura la
+            # alternancia incluso cuando el modelo no dijo nada antes de actuar.
+            self.history.append({
+                "role": "assistant",
+                "content": full_thought_text or (
+                    "Ejecutando " + ", ".join(tc.get("name", "?") for tc in tool_calls_to_run) + "..."
+                ),
+            })
+            self._trim_history()
 
             observations = []
             for tc in tool_calls_to_run:
@@ -667,6 +861,31 @@ class ZaraBrain:
                 ),
             })
             self._trim_history()
+        else:
+            # [FIX] AUDITORÍA (hallazgo de Gemini): la cláusula `else` de un
+            # `for` solo se ejecuta si el bucle agotó todas sus iteraciones
+            # SIN pasar por `break` (y nunca si hubo `return`, como en los
+            # cancelados por barge-in arriba). Es decir: llegamos aquí
+            # únicamente cuando se agotó MAX_REACT_STEPS mientras el modelo
+            # seguía pidiendo herramientas sin dar nunca una respuesta final.
+            # Antes el generador terminaba aquí sin producir NADA: el Señor
+            # VK se quedaba sin respuesta y el historial quedaba con un
+            # mensaje "[OBSERVACIÓN DEL SISTEMA]" de rol `user` huérfano justo
+            # antes del siguiente turno, rompiendo la alternancia user/
+            # assistant que exigen las APIs de Claude/Gemini (y confundiendo
+            # a los modelos locales).
+            log.warning(
+                "Se agotaron los %d pasos del bucle ReAct sin respuesta final. Resumiendo localmente.",
+                max_steps,
+            )
+            summary = (
+                _summarize_observations_locally(last_observations)
+                if last_observations
+                else "He alcanzado el límite de pasos para esta tarea, Señor VK. Deme más indicaciones si necesita que continúe."
+            )
+            self.history.append({"role": "assistant", "content": summary})
+            self._trim_history()
+            yield summary
 
     def _execute_stream_with_fallback(
         self,
@@ -680,8 +899,10 @@ class ZaraBrain:
         tools_to_pass = None if is_chat_only else TOOL_DEFINITIONS
 
         if provider_name == "gemini" and self.gemini.is_available():
+            # [FIX] Antes no se pasaban las herramientas a Gemini: nunca podía
+            # ejecutar acciones reales sobre el sistema, solo responder en texto.
             yield from self.gemini.stream_chat(
-                self.history, screen_b64=screen_b64, system_prompt=system_prompt
+                self.history, tools=tools_to_pass, screen_b64=screen_b64, system_prompt=system_prompt
             )
             return
 

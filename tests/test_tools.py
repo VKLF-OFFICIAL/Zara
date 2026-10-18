@@ -150,6 +150,96 @@ def test_os_control_media_and_desktop_commands():
     assert res_desk["success"] is True
 
 
+def test_action_alias_map_resolves_known_enum_values():
+    """[Regresión, hallazgo en vivo contra Ollama real] El modelo a veces
+    llama directamente a un VALOR del enum "action" de una herramienta
+    genérica (p. ej. "open_app", parte de os_control) como si fuera el
+    nombre de la propia herramienta. El mapa de alias debe reconocerlos."""
+    from core.tools import _get_action_alias_map
+
+    alias_map = _get_action_alias_map()
+    assert alias_map["open_app"] == ("os_control", "action")
+    assert alias_map["list"] == ("file_manager", "action")
+
+
+def test_execute_tool_remaps_hallucinated_action_as_name(monkeypatch):
+    """[Regresión, hallazgo en vivo] {"name": "open_app", "arguments": {...}}
+    debe remapearse a os_control(action="open_app", ...) en vez de
+    rechazarse como 'herramienta desconocida' (lo que antes hacía que Zara
+    leyera el JSON crudo en voz alta sin ejecutar nada)."""
+    calls = []
+
+    def fake_os_control(action, target="", value=""):
+        calls.append((action, target, value))
+        return {"success": True, "message": "ok"}
+
+    monkeypatch.setattr("core.tools.os_control", fake_os_control)
+
+    res = execute_tool("open_app", {"target": "Bloc de notas"})
+
+    assert res["success"] is True
+    assert calls == [("open_app", "Bloc de notas", "")]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Resolución de apps específica de Windows")
+def test_open_app_spanish_alias_resolves_via_which(monkeypatch):
+    """[Regresión, hallazgo en vivo] 'Bloc de notas' (nombre en español que
+    usa el Señor VK) debe resolverse al ejecutable real (notepad) en vez de
+    caer directamente al fallback sin verificar."""
+    import core.tools as tools_module
+
+    popen_calls = []
+    monkeypatch.setattr(tools_module.subprocess, "Popen", lambda args, **kw: popen_calls.append(args))
+    monkeypatch.setattr(
+        tools_module.shutil, "which",
+        lambda name: "C:\\Windows\\System32\\notepad.exe" if name.lower() == "notepad" else None,
+    )
+
+    res = os_control("open_app", target="Bloc de notas")
+
+    assert res["success"] is True
+    assert popen_calls == [["C:\\Windows\\System32\\notepad.exe"]]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Resolución de apps específica de Windows")
+def test_open_app_reports_real_failure_when_nothing_resolves(monkeypatch):
+    """[Regresión, hallazgo en vivo] Antes el último fallback (Start-Process
+    de PowerShell en un subprocess separado, fire-and-forget) reportaba
+    éxito SIEMPRE sin comprobar si algo realmente se abrió. Ahora debe
+    reportar un fallo real cuando no se encuentra nada que ejecutar."""
+    import core.tools as tools_module
+
+    monkeypatch.setattr(tools_module.shutil, "which", lambda name: None)
+    monkeypatch.setattr(tools_module.Path, "is_dir", lambda self: False)
+
+    def fake_startfile(path):
+        raise OSError("[WinError 2] no encontrado (doble de prueba)")
+
+    monkeypatch.setattr(tools_module.os, "startfile", fake_startfile)
+
+    res = os_control("open_app", target="aplicacion_inexistente_zzz")
+
+    assert res["success"] is False
+    assert "No se encontró ninguna aplicación" in res["error"]
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="Resolución de apps específica de Windows")
+def test_open_app_startfile_fallback_reports_honest_success(monkeypatch):
+    """El último recurso (os.startfile) debe reportar éxito solo cuando
+    realmente no lanza excepción, usando el alias en español resuelto."""
+    import core.tools as tools_module
+
+    monkeypatch.setattr(tools_module.shutil, "which", lambda name: None)
+    monkeypatch.setattr(tools_module.Path, "is_dir", lambda self: False)
+    startfile_calls = []
+    monkeypatch.setattr(tools_module.os, "startfile", lambda path: startfile_calls.append(path))
+
+    res = os_control("open_app", target="configuracion")
+
+    assert res["success"] is True
+    assert startfile_calls == ["ms-settings:"]
+
+
 def test_execute_tool_dispatch():
     # Comprobar que execute_tool enruta a run_shell, web_search y os_control telemetry
     if sys.platform == "win32":

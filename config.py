@@ -91,6 +91,15 @@ VAD_MIN_SILENCE_MS = int(os.environ.get("ZARA_VAD_MIN_SILENCE_MS", "700"))
 VAD_SPEECH_PAD_MS = int(os.environ.get("ZARA_VAD_SPEECH_PAD_MS", "350"))
 VAD_BARGE_IN_TRIGGER_MS = int(os.environ.get("ZARA_VAD_BARGE_IN_MS", "250"))
 VAD_THRESHOLD = float(os.environ.get("ZARA_VAD_THRESHOLD", "0.5"))
+# [FIX] Nivel RMS mínimo exigido ADEMÁS de la probabilidad del VAD para disparar
+# un barge-in. Sin esto, el eco del propio altavoz de Zara filtrándose al
+# micrófono (sin auriculares) puede alcanzar el umbral de VAD y cortarla a
+# mitad de frase sin que el Señor VK haya dicho nada.
+VAD_BARGE_IN_MIN_RMS = float(os.environ.get("ZARA_VAD_BARGE_IN_MIN_RMS", "0.02"))
+# [FIX] Periodo de gracia tras el inicio de cada frase hablada por Zara durante
+# el cual se ignoran los chequeos de barge-in (el arranque brusco del TTS es el
+# momento de mayor riesgo de eco falso-positivo).
+VAD_BARGE_IN_GRACE_MS = int(os.environ.get("ZARA_VAD_BARGE_IN_GRACE_MS", "300"))
 
 # faster-whisper
 WHISPER_MODEL_PRIMARY = os.environ.get("ZARA_WHISPER_MODEL", "deepdml/faster-whisper-large-v3-turbo-ct2")

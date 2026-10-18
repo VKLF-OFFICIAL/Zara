@@ -68,7 +68,62 @@
 
 ---
 
-## 3. Despliegue y Uso
+## 3. Instalación desde Cero
+
+### Requisitos previos
+- **Python 3.10+** (recomendado 3.12).
+- **[Ollama](https://ollama.com)** instalado si quieres un cerebro 100% local y sin internet (`ollama serve` corriendo).
+- Micrófono y, preferiblemente, **auriculares** (ver sección 6 — evita el eco que confunde a Zara con una interrupción).
+- Windows 10/11 o Linux (Kali/Fedora/Debian).
+
+### Paso 1 — Clonar e instalar dependencias
+```powershell
+# Windows (PowerShell)
+git clone https://github.com/VKLF-OFFICIAL/Zara.git
+cd Zara
+python -m venv .venv
+.venv\Scripts\activate
+pip install -r requirements.txt
+copy .env.example .env
+```
+```bash
+# Linux
+git clone https://github.com/VKLF-OFFICIAL/Zara.git
+cd Zara
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp .env.example .env
+```
+O deja que el propio script lo haga por ti, incluyendo la copia de `.env`:
+```powershell
+python setup_and_run.py --install --check
+```
+
+### Paso 2 — Preparar el modelo local de Ollama (opcional pero recomendado)
+```bash
+ollama serve                     # si no corre ya como servicio
+ollama pull qwen2.5-coder:7b     # o el modelo que prefieras
+ollama list                      # copia el nombre EXACTO (con tag) que aparezca aquí
+```
+Edita `OLLAMA_MODEL` en tu `.env` para que coincida **exactamente** con ese nombre (Ollama es estricto: `qwen2.5-coder:7b` y `qwen2.5-coder:7b-instruct` son modelos distintos para él).
+
+### Paso 3 — Claves de API (opcionales)
+Edita `.env`:
+- `GEMINI_API_KEY`: para visión de pantalla (`inspect_screen`) y búsqueda web con Gemini 2.5 Flash.
+- `ANTHROPIC_API_KEY`: para tareas de código/seguridad con Claude. Sin esta clave, si tienes el CLI `claude` instalado y en el `PATH`, Zara lo usa automáticamente como alternativa.
+
+Sin ninguna de las dos, Zara funciona igual de bien **100% offline** con `ZARA_DEFAULT_BRAIN="ollama"`.
+
+### Paso 4 — Verificar antes de arrancar
+```powershell
+python setup_and_run.py --check
+```
+Esto comprueba la versión de Python, las dependencias, los dispositivos de audio por defecto y si Ollama responde, sin llegar a abrir el HUD.
+
+---
+
+## 4. Despliegue y Uso
 
 ### En Windows 10/11
 ```powershell
@@ -101,7 +156,7 @@ chmod +x setup_and_run.sh
 
 ---
 
-## 4. Configuración (`.env`)
+## 5. Configuración (`.env`)
 Edite el archivo `.env` para personalizar API Keys o motores:
 ```env
 # Claves de IA (Opcionales, fallback automático a Ollama local)
@@ -117,4 +172,44 @@ ZARA_TTS_ENGINE="edge"
 ZARA_EDGE_VOICE="es-ES-XimenaNeural"
 ZARA_EDGE_RATE="+6%"
 ZARA_EDGE_PITCH="+2Hz"
+
+# Barge-in anti-eco (ver sección 6 si Zara se corta sola al hablar)
+ZARA_VAD_BARGE_IN_MIN_RMS=0.02
+ZARA_VAD_BARGE_IN_GRACE_MS=300
 ```
+
+---
+
+## 6. Cómo dejarlo funcionando a la perfección
+
+### Usa auriculares, no los altavoces del equipo
+Sin cancelación de eco por hardware, el propio audio de Zara puede filtrarse del altavoz al micrófono y confundirse con una interrupción real, cortándola a media frase. Zara ya filtra esto exigiendo un volumen mínimo (`ZARA_VAD_BARGE_IN_MIN_RMS`) y un periodo de gracia al empezar cada frase (`ZARA_VAD_BARGE_IN_GRACE_MS`), pero unos auriculares eliminan el problema de raíz. Si aun así se corta sola, sube `ZARA_VAD_BARGE_IN_MIN_RMS` (p. ej. `0.04`).
+
+### Elige un modelo de Ollama que siga bien las instrucciones
+No todos los modelos locales manejan igual el "function calling". Zara es robusta frente a formatos no estándar (JSON embebido en texto, tags `<function>`/`<tool_call>`, o que el modelo confunda el valor de una acción con el nombre de la herramienta), pero cuanto mejor siga instrucciones el modelo, más fiable y rápida será. Con 8 GB de VRAM o más, `qwen2.5-coder:7b` (o superior) va bien. Sin GPU, usa un modelo más pequeño y acepta más latencia.
+
+### Di los nombres de las apps como las conoces, en español
+Para abrir aplicaciones ("abre el bloc de notas", "abre la calculadora", "abre el navegador"), Zara ya traduce los nombres comunes en español al ejecutable real de Windows. Si una app no abre, prueba a decir su nombre tal cual aparece en el menú Inicio, o el nombre técnico del ejecutable.
+
+### Comprueba que Ollama responde ANTES de arrancar Zara
+```bash
+curl http://localhost:11434/api/tags
+```
+Si no responde nada, arranca `ollama serve` en otra terminal antes de lanzar Zara.
+
+### Ejecuta los tests tras cualquier cambio
+```powershell
+pytest tests/ -v
+```
+Todos deben pasar en verde antes de dar por buena una modificación.
+
+### Problemas comunes
+
+| Síntoma | Causa probable | Solución |
+|---|---|---|
+| Zara se corta a media frase sin que hables | Eco del altavoz detectado como interrupción | Usa auriculares, o sube `ZARA_VAD_BARGE_IN_MIN_RMS` |
+| No te reconoce bien / tarda en reaccionar | Micrófono lejos o volumen bajo | Acércate al micrófono; revisa `ZARA_VAD_THRESHOLD` |
+| "Abre X" dice que funcionó pero no pasa nada | Nombre de la app no resoluble por Windows | Usa el nombre común en español o el nombre del ejecutable |
+| Respuestas con JSON crudo en vez de ejecutar la acción | El modelo local alucinó un formato no reconocido | Prueba con un modelo más grande/reciente; revisa los logs (`zara.brain`) |
+| Arranca pero no detecta Ollama | `ollama serve` no corre, o `OLLAMA_HOST`/`OLLAMA_MODEL` no coinciden | `ollama list` para ver nombres exactos; `curl $OLLAMA_HOST/api/tags` |
+| Corte de más de 1s entre frases de una misma respuesta | Síntesis de voz esperando a la red (EdgeTTS) | Ya mitigado por el pipeline de síntesis adelantada; si persiste, revisa tu conexión |

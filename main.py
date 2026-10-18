@@ -14,7 +14,7 @@ import sys
 import threading
 from typing import Optional
 
-from PySide6 import QtCore, QtWidgets
+from PySide6 import QtCore, QtGui, QtWidgets
 
 import config
 from core.brain import ZaraBrain, list_ollama_models
@@ -123,6 +123,11 @@ class ZaraController(QtCore.QObject):
     def _on_barge_in(self) -> None:
         """Interrupción inmediata: el Señor VK ha hablado sobre Zara (o pulsó 'Parar')."""
         self.voice.stop()
+        # [FIX AUDITORÍA] Antes solo se detenía el AUDIO; el cerebro seguía
+        # generando/ejecutando el turno interrumpido en segundo plano y las
+        # frases que terminaba de producir volvían a reproducirse poco
+        # después, como si Zara "siguiera hablando" tras el corte.
+        self.brain.cancel_current_turn()
         self.sig_hud_state.emit(HUDState.IDLE if self.ear.is_muted() else HUDState.LISTENING)
 
     def _on_voice_state_change(self, is_speaking: bool) -> None:
@@ -196,7 +201,19 @@ class ZaraController(QtCore.QObject):
         threading.Thread(target=self._process_query, args=(text,), daemon=True).start()
 
     def _voice_loop_worker(self) -> None:
-        """Hilo continuo que procesa las locuciones del Señor VK."""
+        """Hilo continuo que procesa las locuciones del Señor VK.
+
+        [FIX AUDITORÍA] Antes llamaba a _process_query() de forma síncrona
+        en este mismo hilo: mientras el turno anterior seguía "ocupado"
+        (generando o esperando una herramienta), listen_utterances() no
+        volvía a transcribir nada nuevo hasta que terminara, así que una
+        nueva locución real del Señor VK podía quedar escuchada pero sin
+        procesar durante varios segundos. Ahora cada locución se procesa en
+        su propio hilo (igual que ya hacían las órdenes de texto del panel);
+        si todavía hay un turno ocupado, se trata como una interrupción
+        implícita: se cancela el turno en curso en vez de dejarlo terminar o
+        descartar la orden nueva.
+        """
         for text in self.ear.listen_utterances():
             if self._stop_event.is_set():
                 break
@@ -205,7 +222,12 @@ class ZaraController(QtCore.QObject):
             if not clean_text:
                 continue
 
-            self._process_query(clean_text)
+            if self._is_busy:
+                log.info("Nueva locución mientras se procesaba un turno anterior: cancelándolo.")
+                self.voice.stop()
+                self.brain.cancel_current_turn()
+
+            threading.Thread(target=self._process_query, args=(clean_text,), daemon=True).start()
 
     def _process_query(self, clean_text: str) -> None:
         """Procesa una orden (de voz o texto) a través del agente ReAct y la sintetiza."""
@@ -245,6 +267,13 @@ def main() -> None:
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     app.setApplicationName("ZARA v2.0")
+    # [DISEÑO] Icono de aplicación (barra de tareas/Alt+Tab si el SO lo expone
+    # pese a Qt.Tool, y para cualquier ventana futura que herede el icono).
+    icon_path = config.BASE_DIR / "config" / "zara-icon.ico"
+    if not icon_path.is_file():
+        icon_path = config.BASE_DIR / "config" / "zara-icon.png"
+    if icon_path.is_file():
+        app.setWindowIcon(QtGui.QIcon(str(icon_path)))
 
     controller = ZaraController(cli_mode=args.cli)
 
