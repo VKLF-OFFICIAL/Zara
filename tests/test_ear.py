@@ -5,8 +5,25 @@ import pytest
 import torch
 
 import core.ear as ear_module
-from core.ear import normalize_audio, clean_transcript, ContinuousEar
+from core.ear import normalize_audio, clean_transcript, contains_wake_word, ContinuousEar
 from config import FRAME_SIZE, SAMPLE_RATE
+
+
+def test_contains_wake_word_detects_zara_anywhere_in_the_phrase():
+    """[Regresión] Palabra de activación: sin mencionar a Zara, ruido
+    ambiente (TV, conversaciones) con palabras como 'pausa' o 'minimiza' no
+    debe tratarse como una orden dirigida a ella."""
+    assert contains_wake_word("Zara, abre el bloc de notas") is True
+    assert contains_wake_word("oye zara pon pausa a la musica") is True
+    assert contains_wake_word("abre el bloc de notas zara") is True
+    assert contains_wake_word("ZARA minimiza todo") is True
+
+    # Sin la palabra "zara": debe ignorarse, aunque contenga palabras de
+    # control del sistema (el escenario real del bug: TV/conversación).
+    assert contains_wake_word("pon pausa a la musica") is False
+    assert contains_wake_word("minimiza eso un poco") is False
+    assert contains_wake_word("") is False
+    assert contains_wake_word("mazara") is False  # no es la palabra completa
 
 
 # =============================================================================

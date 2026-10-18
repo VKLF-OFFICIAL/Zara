@@ -303,12 +303,39 @@ class ZaraRouter:
 # PROVEEDOR 1: LOCAL OLLAMA
 # =============================================================================
 
+def _pick_default_ollama_model(models: List[str]) -> str:
+    """Elige un modelo instalado razonable cuando OLLAMA_MODEL no está
+    configurado explícitamente en .env. Prefiere variantes "coder" (suelen
+    seguir mejor las instrucciones de tool-calling); si no hay ninguna, usa
+    la primera de la lista (orden alfabético, según list_ollama_models)."""
+    if not models:
+        return ""
+    for m in models:
+        if "coder" in m.lower():
+            return m
+    return models[0]
+
+
 class OllamaProvider:
     """Proveedor local offline con Ollama."""
 
     def __init__(self, host: str = OLLAMA_HOST, model: str = OLLAMA_MODEL):
         self.host = host.rstrip("/")
         self.model = model
+        if not self.model:
+            # [FIX] Sin OLLAMA_MODEL en .env, autodetectar en vez de fallar
+            # contra un nombre fijo que puede no existir en esta máquina
+            # (Ollama es estricto: el tag debe coincidir EXACTAMENTE con lo
+            # que devuelve `ollama list`).
+            installed = self.list_models()
+            self.model = _pick_default_ollama_model(installed)
+            if self.model:
+                log.info("OLLAMA_MODEL no configurado; usando detectado automáticamente: %s", self.model)
+            else:
+                log.warning(
+                    "No se detectó ningún modelo de Ollama instalado "
+                    "(¿está 'ollama serve' corriendo y hay al menos un modelo con 'ollama pull'?)."
+                )
 
     def set_model(self, model: str) -> None:
         self.model = model

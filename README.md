@@ -104,9 +104,8 @@ python setup_and_run.py --install --check
 ```bash
 ollama serve                     # si no corre ya como servicio
 ollama pull qwen2.5-coder:7b     # o el modelo que prefieras
-ollama list                      # copia el nombre EXACTO (con tag) que aparezca aquí
 ```
-Edita `OLLAMA_MODEL` en tu `.env` para que coincida **exactamente** con ese nombre (Ollama es estricto: `qwen2.5-coder:7b` y `qwen2.5-coder:7b-instruct` son modelos distintos para él).
+No necesitas tocar `OLLAMA_MODEL` en `.env`: si lo dejas vacío (por defecto), Zara autodetecta los modelos instalados con `ollama list` y elige uno automáticamente (prioriza variantes "coder"). Solo rellena `OLLAMA_MODEL` si quieres fijar uno en concreto entre varios instalados — en ese caso debe coincidir **exactamente** con el nombre que muestra `ollama list` (Ollama es estricto: `qwen2.5-coder:7b` y `qwen2.5-coder:7b-instruct` son modelos distintos para él). También puedes cambiarlo en caliente desde el selector del panel táctico del HUD.
 
 ### Paso 3 — Claves de API (opcionales)
 Edita `.env`:

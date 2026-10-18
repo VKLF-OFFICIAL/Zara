@@ -122,11 +122,16 @@ DEFAULT_BRAIN = os.environ.get("ZARA_DEFAULT_BRAIN", "auto")  # "auto", "ollama"
 
 # Ollama
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "qwen2.5-coder:7b")
+# [FIX] Vacío por defecto = autodetectar entre los modelos instalados
+# (ver OllamaProvider.__init__ en core/brain.py) en vez de fallar contra un
+# nombre fijo que puede no existir en esta máquina.
+OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "")
 
-# Gemini API
+# Gemini API & Live
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_LIVE_MODEL = os.environ.get("ZARA_GEMINI_LIVE_MODEL", "gemini-2.5-flash-preview-native-audio-dialog")
+GEMINI_LIVE_VOICE = os.environ.get("ZARA_GEMINI_LIVE_VOICE", "Aoede")
 
 # Anthropic API
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")

@@ -3,11 +3,48 @@
 import pytest
 
 from core.brain import (
+    OllamaProvider,
     ZaraBrain,
     ZaraRouter,
     _extract_embedded_tool_call,
+    _pick_default_ollama_model,
     _summarize_observations_locally,
 )
+
+
+def test_pick_default_ollama_model_prefers_coder_variant():
+    """[Autodetección] Entre varios modelos instalados, se prefiere uno con
+    'coder' en el nombre (suele seguir mejor las instrucciones de
+    tool-calling); si no hay ninguno, se usa el primero de la lista."""
+    assert _pick_default_ollama_model([]) == ""
+    assert _pick_default_ollama_model(["llama3.1:8b", "mistral:7b"]) == "llama3.1:8b"
+    assert _pick_default_ollama_model(
+        ["llama3.1:8b", "huihui_ai/qwen2.5-coder-abliterate:7b-instruct", "mistral:7b"]
+    ) == "huihui_ai/qwen2.5-coder-abliterate:7b-instruct"
+
+
+def test_ollama_provider_autodetects_model_when_unconfigured(monkeypatch):
+    """[Regresión] Sin OLLAMA_MODEL en .env (model=""), OllamaProvider debe
+    autodetectar consultando los modelos instalados, en vez de quedarse con
+    un nombre fijo que puede no existir en esta máquina."""
+    monkeypatch.setattr(
+        OllamaProvider, "list_models", lambda self: ["mistral:7b", "qwen2.5-coder:7b"]
+    )
+
+    provider = OllamaProvider(model="")
+    assert provider.model == "qwen2.5-coder:7b"
+
+
+def test_ollama_provider_keeps_explicit_model(monkeypatch):
+    """Si OLLAMA_MODEL SÍ está configurado, no se toca ni se consulta nada."""
+    calls = []
+    monkeypatch.setattr(
+        OllamaProvider, "list_models", lambda self: calls.append(1) or ["otro:modelo"]
+    )
+
+    provider = OllamaProvider(model="mi-modelo-fijo:latest")
+    assert provider.model == "mi-modelo-fijo:latest"
+    assert calls == []
 
 
 def test_router_is_conversational():

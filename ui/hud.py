@@ -285,9 +285,15 @@ class ZaraPanel(QtWidgets.QWidget):
 
     _BRAIN_OPTIONS = [
         ("Auto", "auto"),
+        ("Gemini Live (Streaming)", "gemini_live"),
         ("Ollama (local)", "ollama"),
         ("Claude", "claude"),
         ("Gemini", "gemini"),
+    ]
+    _GEMINI_LIVE_MODEL_OPTIONS = [
+        ("Gemini 2.5 Flash Live", "gemini-2.5-flash-preview-native-audio-dialog"),
+        ("Gemini 2.0 Flash Live", "gemini-2.0-flash-live-001"),
+        ("Gemini 2.0 Flash Exp", "gemini-2.0-flash-exp"),
     ]
     _CLAUDE_MODEL_OPTIONS = [
         ("Por defecto", ""),
@@ -505,6 +511,11 @@ class ZaraPanel(QtWidgets.QWidget):
             if provider == "claude":
                 self.model_lbl.setText("Modelo:")
                 for label, value in self._CLAUDE_MODEL_OPTIONS:
+                    self.model_combo.addItem(label, value)
+                self.model_combo.setEnabled(True)
+            elif provider == "gemini_live":
+                self.model_lbl.setText("Modelo:")
+                for label, value in self._GEMINI_LIVE_MODEL_OPTIONS:
                     self.model_combo.addItem(label, value)
                 self.model_combo.setEnabled(True)
             elif provider == "gemini":

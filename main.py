@@ -17,8 +17,9 @@ from typing import Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 
 import config
-from core.brain import ZaraBrain, list_ollama_models
-from core.ear import ContinuousEar
+from core.brain import ZaraBrain, list_ollama_models, _pick_default_ollama_model
+from core.ear import ContinuousEar, contains_wake_word
+from core.live import GeminiLiveSession
 from core.voice import VoiceSynthesizer
 from ui.hud import HUDState, ZaraHUD
 
@@ -62,7 +63,19 @@ class ZaraController(QtCore.QObject):
             rms_callback=self._on_rms_level,
         )
 
-        # 4. Interfaz HUD Holográfica (bola flotante + panel táctico)
+        # 4. Sesión Gemini Live (Streaming nativo de ultra-baja latencia)
+        self.live_session = GeminiLiveSession(
+            api_key=config.GEMINI_API_KEY,
+            model=config.GEMINI_LIVE_MODEL,
+            voice_name=config.GEMINI_LIVE_VOICE,
+            on_transcript_in=self._on_live_transcript_in,
+            on_transcript_out=self._on_live_transcript_out,
+            on_tool_event=self._on_brain_tool_event,
+            on_state_change=self._on_live_state_change,
+            on_rms_level=self._on_rms_level,
+        )
+
+        # 5. Interfaz HUD Holográfica (bola flotante + panel táctico)
         self.hud: Optional[ZaraHUD] = None
         if not self.cli_mode:
             self.hud = ZaraHUD()
@@ -87,11 +100,45 @@ class ZaraController(QtCore.QObject):
         self.hud.quit_requested.connect(self._on_quit_requested)
         self.hud.text_command_submitted.connect(self._on_text_command)
 
+    def _on_live_transcript_in(self, text: str) -> None:
+        clean = text.strip()
+        if clean:
+            log.info("[LIVE USER] %s", clean)
+            self.sig_user_speech.emit(clean)
+
+    def _on_live_transcript_out(self, text: str) -> None:
+        clean = text.strip()
+        if clean:
+            log.info("[LIVE ZARA] %s", clean)
+            self.sig_assistant_reply.emit(clean)
+
+    def _on_live_state_change(self, state: str) -> None:
+        if state == "speaking":
+            self.sig_hud_state.emit(HUDState.SPEAKING)
+        elif state == "thinking":
+            self.sig_hud_state.emit(HUDState.THINKING)
+        elif state == "listening":
+            self.sig_hud_state.emit(HUDState.LISTENING)
+        elif state == "connected":
+            self.sig_hud_state.emit(HUDState.IDLE)
+            if self.hud:
+                self.hud.panel.log_line("SISTEMA", "Gemini Live: WebSocket conectado.")
+        elif state in ("connecting", "reconnecting"):
+            self.sig_hud_state.emit(HUDState.THINKING)
+            if self.hud:
+                self.hud.panel.log_line("SISTEMA", f"Gemini Live: {state}...")
+        else:
+            self.sig_hud_state.emit(HUDState.IDLE)
+
     def start(self) -> None:
         """Inicia todos los subsistemas de Zara."""
         log.info("Iniciando subsistemas de ZARA v2.0...")
-        self.ear.start()
-        self._worker_thread.start()
+        if self._preferred_provider == "gemini_live" and self.live_session.is_available():
+            log.info("Iniciando directamente en modo Gemini Live...")
+            self.live_session.start()
+        else:
+            self.ear.start()
+            self._worker_thread.start()
 
         if self.hud:
             self.hud.show()
@@ -110,23 +157,29 @@ class ZaraController(QtCore.QObject):
         """Consulta los modelos realmente instalados en Ollama (hilo aparte, red)."""
         models = list_ollama_models(self.brain.ollama.host)
         if models:
+            # [FIX] Si Ollama no respondió a tiempo durante el arranque
+            # (OllamaProvider.__init__ ya intentó autodetectar), el modelo
+            # pudo quedar vacío. Con la lista real ya disponible, completar
+            # la autodetección ahora en vez de dejarlo sin modelo.
+            if not self.brain.ollama.model:
+                self.brain.ollama.set_model(_pick_default_ollama_model(models))
             self.sig_ollama_models.emit(models, self.brain.ollama.model)
 
     def shutdown(self) -> None:
         """Cierre ordenado de todos los hilos y motores."""
         log.info("Apagando ZARA v2.0...")
         self._stop_event.set()
+        self.live_session.stop()
         self.ear.stop()
         self.voice.shutdown()
         log.info("Todos los subsistemas detenidos. Hasta pronto, Señor VK.")
 
     def _on_barge_in(self) -> None:
         """Interrupción inmediata: el Señor VK ha hablado sobre Zara (o pulsó 'Parar')."""
+        if self.live_session.is_running():
+            self.live_session.interrupt()
         self.voice.stop()
-        # [FIX AUDITORÍA] Antes solo se detenía el AUDIO; el cerebro seguía
-        # generando/ejecutando el turno interrumpido en segundo plano y las
-        # frases que terminaba de producir volvían a reproducirse poco
-        # después, como si Zara "siguiera hablando" tras el corte.
+        # [FIX AUDITORÍA] Detener AUDIO y cancelar el turno del cerebro
         self.brain.cancel_current_turn()
         self.sig_hud_state.emit(HUDState.IDLE if self.ear.is_muted() else HUDState.LISTENING)
 
@@ -138,7 +191,7 @@ class ZaraController(QtCore.QObject):
             self.sig_hud_state.emit(HUDState.IDLE)
 
     def _on_rms_level(self, rms: float) -> None:
-        if not self.voice.is_speaking():
+        if not self.voice.is_speaking() and not self.live_session.is_model_speaking():
             self.sig_rms_level.emit(rms)
 
     def _on_brain_tool_event(self, tool_name: str, desc: str) -> None:
@@ -148,8 +201,10 @@ class ZaraController(QtCore.QObject):
 
     def _on_mic_toggle(self) -> None:
         """Pausa o reanuda la escucha continua (botón de micrófono del panel)."""
-        muted = not self.ear.is_muted()
+        is_live = self.live_session.is_running()
+        muted = not self.live_session.is_muted() if is_live else not self.ear.is_muted()
         self.ear.set_muted(muted)
+        self.live_session.set_muted(muted)
         if self.hud:
             self.hud.set_muted(muted)
             self.sig_hud_state.emit(HUDState.IDLE)
@@ -158,8 +213,28 @@ class ZaraController(QtCore.QObject):
         """Cambia en caliente el cerebro LLM preferido desde el panel táctico."""
         self._preferred_provider = provider
         log.info("Cerebro preferido cambiado a: %s", provider)
-        if self.hud:
-            self.hud.panel.log_line("SISTEMA", f"Cerebro cambiado a: {provider}")
+
+        if provider == "gemini_live":
+            if not self.live_session.is_available():
+                log.warning("Gemini Live no disponible: se requiere GEMINI_API_KEY en .env")
+                if self.hud:
+                    self.hud.panel.log_line("ERROR", "Gemini Live requiere GEMINI_API_KEY en .env")
+                self.voice.say("Señor VK, para activar Gemini Live en streaming se requiere configurar GEMINI_API_KEY.")
+                return
+
+            # Pausar oído clásico para evitar conflicto de captura de micrófono
+            self.ear.stop()
+            self.voice.stop()
+            self.live_session.start()
+            if self.hud:
+                self.hud.panel.log_line("SISTEMA", "Modo Live activado: streaming de audio bidireccional.")
+        else:
+            # Si veníamos de Live, detenerlo y arrancar oído clásico
+            if self.live_session.is_running():
+                self.live_session.stop()
+                self.ear.start()
+            if self.hud:
+                self.hud.panel.log_line("SISTEMA", f"Cerebro cambiado a: {provider}")
 
     def _on_model_changed(self, provider: str, model: str) -> None:
         """Cambia en caliente el modelo concreto del proveedor seleccionado y lo persiste."""
@@ -174,6 +249,10 @@ class ZaraController(QtCore.QObject):
         elif provider == "gemini":
             self.brain.gemini.model = model
             config.persist_env_var("GEMINI_MODEL", model)
+            label = model
+        elif provider == "gemini_live":
+            self.live_session.set_model(model)
+            config.persist_env_var("ZARA_GEMINI_LIVE_MODEL", model)
             label = model
         else:
             return
@@ -220,6 +299,18 @@ class ZaraController(QtCore.QObject):
 
             clean_text = text.strip()
             if not clean_text:
+                continue
+
+            # [FIX] Palabra de activación obligatoria para órdenes de VOZ: el
+            # micrófono escucha de forma continua, así que sin esto cualquier
+            # ruido ambiente (TV, conversaciones, música) con palabras como
+            # "pausa" o "minimiza" podía disparar acciones reales (minimizar
+            # ventanas, pausar/reproducir multimedia...) sin que el Señor VK
+            # se dirigiera a Zara en absoluto. Las órdenes escritas en el
+            # panel táctico (_on_text_command) NO pasan por aquí: teclear ya
+            # es una acción deliberada y no está sujeta a ruido ambiente.
+            if not contains_wake_word(clean_text):
+                log.debug("Locución ignorada (sin mencionar a Zara): '%s'", clean_text)
                 continue
 
             if self._is_busy:

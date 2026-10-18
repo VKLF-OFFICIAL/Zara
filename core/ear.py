@@ -47,6 +47,19 @@ from config import (
 
 log = logging.getLogger("zara.ear")
 
+# [FIX] Palabra de activación obligatoria: sin escucha continua filtrada por
+# una palabra clave, cualquier ruido ambiente (TV, conversaciones, música)
+# que contenga términos como "pausa", "play" o "minimiza" podía disparar
+# acciones reales sobre el sistema (minimizar ventanas, pausar/reproducir
+# multimedia...) sin que el Señor VK se dirigiera a Zara en absoluto.
+_WAKE_WORD_RE = re.compile(r"(?i)\bzara\b")
+
+
+def contains_wake_word(text: str) -> bool:
+    """Indica si la locución transcrita menciona a Zara en algún punto."""
+    return bool(text) and bool(_WAKE_WORD_RE.search(text))
+
+
 HALLUCINATION_PATTERNS = [
     r"(?i)\bsubt[ií]tulos\s+(?:por|realizados|creados)?\s*(?:la\s+comunidad|amara)?\b",
     r"(?i)\bamara\.org\b",
