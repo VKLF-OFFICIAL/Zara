@@ -4,16 +4,57 @@ on:
   pull_request:
 jobs:
   test:
+    # [FIX MUL-14/V1_-14] ZARA debe funcionar igual en Windows 10/11 y en Linux: los tests
+    # ligeros se ejecutan en los dos sistemas y en todas las versiones de Python admitidas.
+    # Los tests que dependen de bash o de rutas POSIX se saltan solos en Windows (skipif).
+    name: Tests ligeros (${{ matrix.os }}, Python ${{ matrix.python-version }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        python-version: ["3.10", "3.12", "3.13", "3.14"]
+    # Sin PYTHONUTF8: en Windows se prueba con la codificación por defecto (cp1252), como
+    # la tiene el usuario, para que salte cualquier open() sin encoding="utf-8".
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Dependencias ligeras (sin audio/GPU)
+        run: python -m pip install pytest ruff psutil httpx ddgs numpy pillow
+      - name: Lint (errores graves)
+        run: ruff check --select E9,F63,F7,F82,F401 core ui main.py config.py setup_and_run.py
+      - name: Lint del lanzador de Linux
+        if: runner.os == 'Linux'
+        run: shellcheck -S warning setup_and_run.sh
+      - name: Tests
+        run: python -m pytest tests/test_tools.py tests/test_brain.py tests/test_config.py tests/test_gemini_models.py tests/test_geometry.py tests/test_antigravity.py tests/test_workspace.py tests/test_v1_instalacion.py -q -k "not live"
+
+  dependencias:
+    # [FIX V1_-1] requirements.txt debe instalarse en Python 3.10-3.14 en Linux y Windows sin
+    # compilar nada (kokoro-onnx no existe para 3.14 y pillow 10 no tiene wheels cp314).
+    # uv resuelve para cada plataforma y versión solo con metadatos, sin descargar torch.
+    name: requirements.txt instalable (Python 3.10-3.14, Linux y Windows)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-          cache: pip
-      - name: Dependencias ligeras (sin audio/GPU)
-        run: pip install pytest ruff psutil httpx ddgs numpy pillow
-      - name: Lint (errores graves)
-        run: ruff check --select E9,F63,F7,F82,F401 core ui main.py config.py
-      - name: Tests
-        run: python -m pytest tests/test_tools.py tests/test_brain.py tests/test_config.py tests/test_gemini_models.py tests/test_geometry.py tests/test_antigravity.py -q -k "not live"
+      - name: Instalar uv
+        run: python -m pip install uv
+      - name: Resolver solo con wheels
+        run: |
+          status=0
+          for py in 3.10 3.11 3.12 3.13 3.14; do
+            for plat in x86_64-manylinux_2_28 x86_64-pc-windows-msvc; do
+              echo "== Python $py / $plat"
+              if ! uv pip compile requirements.txt --python-version "$py" --python-platform "$plat" \
+                  --only-binary :all: --no-header --quiet > /dev/null; then
+                status=1
+              fi
+            done
+          done
+          exit $status

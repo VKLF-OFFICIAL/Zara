@@ -16,6 +16,9 @@ BUGS CORREGIDOS:
   - [BUG-8] SentenceChunker: el bucle interno en push() podía entrar en bucle
     infinito si el buffer nunca decrece (ej. texto sin delimitadores con coma
     que forman candidato largo). Añadido guard de progreso.
+  - [AUD-6] Con la cola de audio llena se descartaban frases ya sintetizadas:
+    ahora el hilo de síntesis espera sitio (interrumpible por stop()).
+  - [AUD-8] Tras un barge-in ya no suena el trozo de frase que quedaba a medias.
 """
 
 from __future__ import annotations
@@ -27,7 +30,6 @@ import threading
 import time
 from typing import AsyncGenerator, Callable, Generator, List, Optional
 import numpy as np
-import sounddevice as sd
 
 from config import (
     EDGE_PITCH,
@@ -40,6 +42,22 @@ from config import (
 )
 
 log = logging.getLogger("zara.voice")
+
+# [FIX MUL-2] En Linux sin la librería de sistema PortAudio (libportaudio2), importar
+# sounddevice lanza OSError («PortAudio library not found»), no ImportError, y tumbaba
+# `import core.voice` y con él toda la app. Ahora Zara arranca sin voz hablada (el chat
+# escrito y el panel siguen funcionando) y el motivo queda en AUDIO_OUTPUT_ERROR.
+try:
+    import sounddevice as sd
+except (ImportError, OSError) as _sd_exc:  # depende de las librerías del sistema
+    sd = None
+    AUDIO_OUTPUT_ERROR = (
+        f"sounddevice no disponible ({_sd_exc}): Zara no podrá hablar. En Linux instale PortAudio "
+        "(sudo apt install libportaudio2 en Debian/Kali/Ubuntu, sudo dnf install portaudio en Fedora)."
+    )
+    log.warning(AUDIO_OUTPUT_ERROR)
+else:
+    AUDIO_OUTPUT_ERROR = ""
 
 
 def clean_text_for_speech(text: str) -> str:
@@ -128,6 +146,64 @@ class SentenceChunker:
             ready.append(rem)
         self._buffer = ""
         return ready
+
+    def pending(self) -> str:
+        """Texto acumulado que aún no se ha emitido como frase."""
+        return self._buffer
+
+
+def _new_chunker() -> SentenceChunker:
+    return SentenceChunker(min_length=35, first_min_length=FIRST_SENTENCE_MIN_CHARS)
+
+
+class _TokenFeed:
+    """[FIX AUD-8] Lleva un flujo de tokens del LLM a la voz respetando los barge-in.
+
+    Antes, tras un stop() a mitad de respuesta, el bucle de tokens terminaba con
+    normalidad (el cerebro cancela el turno) y `chunker.flush()` encolaba el trozo de
+    frase pendiente con la generación NUEVA: Zara soltaba otra media frase justo después
+    de que el Señor VK la mandara callar. Ahora:
+      - si hubo stop(), lo que quedaba en el chunker pertenece a lo interrumpido y se
+        descarta; si era una frase a medias, los tokens siguientes se saltan hasta su
+        final (el «resto» de esa frase tampoco suena);
+      - el flush final solo se hace si no ha habido stop() desde el último token;
+      - si el turno sigue de verdad (p. ej. la respuesta a una confirmación se dijo encima
+        del aviso de Zara y la herramienta continúa), las frases NUEVAS sí se dicen.
+    No se deja de consumir el generador: el cerebro termina o cancela su turno él mismo.
+    """
+
+    def __init__(self, synth: "VoiceSynthesizer"):
+        self._synth = synth
+        self._chunker = _new_chunker()
+        self._gen = synth._current_generation()
+        self._skipping = False
+
+    def _sync_generation(self) -> None:
+        current = self._synth._current_generation()
+        if current == self._gen:
+            return
+        pending = self._chunker.pending().rstrip()
+        cut_mid_sentence = bool(pending) and pending[-1] not in ".!?:;"
+        self._chunker = _new_chunker()
+        self._gen = current
+        self._skipping = self._skipping or cut_mid_sentence
+
+    def push(self, token: str) -> None:
+        self._sync_generation()
+        if self._skipping:
+            match = SentenceChunker.DELIMITERS.search(token)
+            if not match:
+                return
+            token = token[match.end():]
+            self._skipping = False
+        for sentence in self._chunker.push(token):
+            self._synth._enqueue_sentence(sentence, self._gen)
+
+    def finish(self) -> None:
+        if self._skipping or self._synth._current_generation() != self._gen:
+            return  # stop() después del último token: lo pendiente era de lo interrumpido
+        for sentence in self._chunker.flush():
+            self._synth._enqueue_sentence(sentence, self._gen)
 
 
 class KokoroEngine:
@@ -266,12 +342,25 @@ class VoiceSynthesizer:
         with self._lock:
             return self._is_speaking
 
+    def output_available(self) -> bool:
+        """Indica si hay salida de audio (si no, ver AUDIO_OUTPUT_ERROR)."""
+        return sd is not None
+
+    def _current_generation(self) -> int:
+        with self._lock:
+            return self._generation
+
     def stop(self) -> None:
         """Interrupción inmediata (Barge-in): detiene el audio y vacía las colas.
 
         [BUG-7 FIX] Actualizar _is_speaking=False ANTES de llamar sd.stop() y
         vaciar las colas, para que el worker no emita on_state_change(False)
         redundantemente después de que nosotros ya lo hemos hecho.
+
+        [FIX AUD-8] Las colas se vacían dentro del MISMO lock que pone el contador
+        a 0. Antes se vaciaban fuera (y tras sd.stop(), que tarda unos ms): una frase
+        encolada en esa ventana dejaba _pending_count en 1 sin elemento en la cola, y
+        _is_speaking no volvía a False hasta el siguiente barge-in.
         """
         with self._lock:
             if self._is_speaking:
@@ -283,20 +372,20 @@ class VoiceSynthesizer:
                         pass
             self._pending_count = 0
             self._generation += 1
+            # Vaciar colas de frases y audio pendientes
+            for q in (self._tts_queue, self._audio_queue):
+                while True:
+                    try:
+                        q.get_nowait()
+                    except queue.Empty:
+                        break
 
         # Detener reproducción actual
-        try:
-            sd.stop()
-        except Exception:
-            pass
-
-        # Vaciar colas de frases y audio pendientes
-        for q in (self._tts_queue, self._audio_queue):
-            while not q.empty():
-                try:
-                    q.get_nowait()
-                except queue.Empty:
-                    break
+        if sd is not None:
+            try:
+                sd.stop()
+            except Exception:
+                pass
 
         log.info("Reproducción de voz abortada por Barge-in.")
 
@@ -304,38 +393,40 @@ class VoiceSynthesizer:
         """Encola una frase completa para ser sintetizada."""
         clean = clean_text_for_speech(text)
         if clean:
-            with self._lock:
-                self._pending_count += 1
-            self._tts_queue.put(clean)
+            self._enqueue_sentence(clean)
 
     def feed_token_stream(self, token_generator: Generator[str, None, None]) -> None:
         """Procesa un generador síncrono de tokens del LLM usando SentenceChunker."""
-        chunker = SentenceChunker(min_length=35, first_min_length=FIRST_SENTENCE_MIN_CHARS)
+        feed = _TokenFeed(self)
         for token in token_generator:
             if self._stop_event.is_set():
                 break
-            for sentence in chunker.push(token):
-                self._enqueue_sentence(sentence)
-
-        for sentence in chunker.flush():
-            self._enqueue_sentence(sentence)
+            feed.push(token)
+        feed.finish()
 
     async def feed_async_token_stream(self, async_generator: AsyncGenerator[str, None]) -> None:
         """Procesa un generador asíncrono de tokens del LLM usando SentenceChunker."""
-        chunker = SentenceChunker(min_length=35, first_min_length=FIRST_SENTENCE_MIN_CHARS)
+        feed = _TokenFeed(self)
         async for token in async_generator:
             if self._stop_event.is_set():
                 break
-            for sentence in chunker.push(token):
-                self._enqueue_sentence(sentence)
+            feed.push(token)
+        feed.finish()
 
-        for sentence in chunker.flush():
-            self._enqueue_sentence(sentence)
+    def _enqueue_sentence(self, sentence: str, gen: Optional[int] = None) -> bool:
+        """Encola una frase etiquetada con su generación (por defecto, la actual).
 
-    def _enqueue_sentence(self, sentence: str) -> None:
+        [FIX AUD-8] Si `gen` ya no es la actual (hubo un stop()), la frase se descarta.
+        Comprobar, contar y encolar ocurre bajo el mismo lock que usa stop().
+        """
         with self._lock:
+            if gen is None:
+                gen = self._generation
+            elif gen != self._generation:
+                return False
             self._pending_count += 1
-        self._tts_queue.put(sentence)
+            self._tts_queue.put((gen, sentence))  # cola sin límite: nunca bloquea
+            return True
 
     def _synthesize_audio(self, text: str) -> Optional[tuple[np.ndarray, int]]:
         """Intenta sintetizar con Kokoro si está habilitado; de lo contrario EdgeTTS."""
@@ -365,17 +456,25 @@ class VoiceSynthesizer:
         """
         while not self._stop_event.is_set():
             try:
-                text = self._tts_queue.get(timeout=0.2)
+                item = self._tts_queue.get(timeout=0.2)
             except queue.Empty:
                 continue
 
-            if text is None:
+            if item is None:
                 with self._lock:
                     self._pending_count = max(0, self._pending_count - 1)
                 continue
 
+            # [FIX AUD-8] Cada frase lleva la generación con la que se encoló: una frase
+            # de una tanda ya cancelada no se sintetiza ni toca el contador actual.
+            gen, text = item
             with self._lock:
-                gen = self._generation
+                if gen != self._generation:
+                    continue
+                if sd is None:
+                    # [FIX MUL-2] Sin salida de audio no se sintetiza (ni se gasta red).
+                    self._pending_count = max(0, self._pending_count - 1)
+                    continue
 
             t0 = time.monotonic()
             audio_data = self._synthesize_audio(text)
@@ -392,11 +491,24 @@ class VoiceSynthesizer:
                 if audio_data is None:
                     self._pending_count = max(0, self._pending_count - 1)
                     continue
-                try:
-                    self._audio_queue.put_nowait((audio_data[0], audio_data[1], gen))
-                except queue.Full:
-                    log.warning("Cola de audio llena: frase sintetizada descartada.")
-                    self._pending_count = max(0, self._pending_count - 1)
+
+            # [FIX AUD-6] Contrapresión en vez de descartar: la síntesis va por delante
+            # de la reproducción (Kokoro < 0,2 s y EdgeTTS 1,2-1,6 s por frase, frente a
+            # 3-5 s de audio), así que en respuestas largas la cola se llenaba y
+            # put_nowait tiraba frases ya sintetizadas sin aviso. Ahora se espera a que
+            # haya sitio; comprobar la generación y encolar sigue siendo atómico, y la
+            # espera se corta en cuanto un stop() cancela esta tanda o se apaga la voz.
+            audio_item = (audio_data[0], audio_data[1], gen)
+            while not self._stop_event.is_set():
+                with self._lock:
+                    if gen != self._generation:
+                        break
+                    try:
+                        self._audio_queue.put_nowait(audio_item)
+                        break
+                    except queue.Full:
+                        pass
+                self._stop_event.wait(0.05)
 
     def _playback_worker(self) -> None:
         """Hilo trabajador que solo reproduce audio ya sintetizado y listo.
@@ -417,6 +529,10 @@ class VoiceSynthesizer:
             with self._lock:
                 if item_gen != self._generation:
                     # Turno ya cancelado mientras esperaba en cola: descartar.
+                    continue
+                if sd is None:
+                    # [FIX MUL-2] Sin salida de audio: descartar sin dejar el contador colgado.
+                    self._pending_count = max(0, self._pending_count - 1)
                     continue
                 self._is_speaking = True
                 if self.on_state_change:

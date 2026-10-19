@@ -168,9 +168,11 @@ def test_run_react_agent_stops_on_cancel(monkeypatch):
     tokens = list(brain.run_react_agent("hola, cuenta hasta diez", preferred_provider="ollama"))
 
     assert len(tokens) < 10, "el bucle ReAct no se detuvo tras la cancelación"
-    assert not any(m.get("role") == "assistant" for m in brain.history), (
-        "un turno cancelado no debe dejar una respuesta a medias en el historial"
-    )
+    assert not any(
+        m.get("role") == "assistant" and "tok" in m.get("content", "") for m in brain.history
+    ), "un turno cancelado no debe dejar una respuesta a medias en el historial"
+    # CER-13: el turno queda cerrado con una nota, para que la orden cancelada no parezca pendiente.
+    assert brain.history[-1]["content"] == ZaraBrain._CANCELLED_NOTE
 
 
 def test_react_loop_exhaustion_yields_summary_and_keeps_alternation(monkeypatch):

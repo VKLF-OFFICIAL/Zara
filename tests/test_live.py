@@ -80,11 +80,13 @@ def test_gemini_live_build_live_tools():
     assert len(tools) == 1
     assert hasattr(tools[0], "function_declarations")
     decls = tools[0].function_declarations
-    assert len(decls) == len(TOOL_DEFINITIONS)
     names = [d.name for d in decls]
-    assert "run_shell" in names
+    assert set(names) <= {t["name"] for t in TOOL_DEFINITIONS}
     assert "web_search" in names
     assert "os_control" in names
+    # En Live no hay palabra de activación: no se ofrecen herramientas que cambian el sistema
+    assert "run_shell" not in names
+    assert "file_manager" not in names
 
 
 def test_gemini_live_interrupt_and_flush():

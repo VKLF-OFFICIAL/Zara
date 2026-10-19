@@ -209,6 +209,15 @@ QToolTip {{ color: #E2E8F0; background: #121A2A; border: 1px solid rgba(148, 163
 """
 
 
+def uses_native_wayland() -> bool:
+    """True si Qt corre con el plugin wayland nativo (no XWayland).
+
+    Ahí un cliente no puede colocar su ventana: move() se ignora y el arrastre lo hace
+    el compositor con startSystemMove(). En Windows, X11 y XWayland es False.
+    """
+    return QtGui.QGuiApplication.platformName().lower().startswith("wayland")
+
+
 def _lerp(a: QtGui.QColor, b: QtGui.QColor, t: float) -> QtGui.QColor:
     t = max(0.0, min(1.0, t))
     return QtGui.QColor(
@@ -1018,6 +1027,8 @@ class ZaraHUD(QtWidgets.QWidget):
 
         self._maybe_click = False
         self._moving = False
+        self._system_move = False  # arrastre delegado al compositor (Wayland nativo)
+        self._quit_emitted = False
         self._press_pos = QtCore.QPoint()
         self._drag_pos = QtCore.QPoint()
 
@@ -1270,6 +1281,7 @@ class ZaraHUD(QtWidgets.QWidget):
             self.setCursor(QtCore.Qt.ClosedHandCursor)
             self._maybe_click = True
             self._moving = False
+            self._system_move = False
             self._press_pos = event.globalPosition().toPoint()
             self._drag_pos = self._press_pos - self.frameGeometry().topLeft()
             event.accept()
@@ -1280,6 +1292,13 @@ class ZaraHUD(QtWidgets.QWidget):
             if moved > 6:
                 self._moving = True
                 self._maybe_click = False
+            if uses_native_wayland():
+                # [FIX MUL-5/V1_-7] En Wayland nativo move() se ignora: al superar el umbral
+                # de arrastre se cede el movimiento al compositor (el clic sigue funcionando).
+                if self._moving and not self._system_move:
+                    self._system_move = self._start_system_move()
+                event.accept()
+                return
             self.move(event.globalPosition().toPoint() - self._drag_pos)
             if self.panel.isVisible():
                 self._position_panel()
@@ -1295,6 +1314,26 @@ class ZaraHUD(QtWidgets.QWidget):
                 self._toggle_panel()
         self._maybe_click = False
         self._moving = False
+        self._system_move = False
+
+    def _start_system_move(self) -> bool:
+        """Pide al compositor que arrastre la bola (Wayland nativo). True si lo acepta."""
+        handle = self.windowHandle()
+        return bool(handle is not None and handle.startSystemMove())
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # noqa: N802
+        """[FIX V1_-15] Alt+F4 (o el gestor de ventanas) sobre la bola cierra Zara de verdad.
+
+        La bola es una ventana Qt.Tool, que Qt no cuenta para salir al cerrar la última
+        ventana: sin esto se ocultaba y quedaba un proceso invisible con el micrófono abierto
+        y sin forma de salir. Se acepta el cierre (si se ignorase, app.quit() no podría
+        terminar en Qt 6) y se pide el apagado una sola vez.
+        """
+        event.accept()
+        self.panel.hide()
+        if not self._quit_emitted:
+            self._quit_emitted = True
+            self.quit_requested.emit()
 
     def _toggle_panel(self) -> None:
         if self.panel.isVisible():

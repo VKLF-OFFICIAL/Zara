@@ -8,12 +8,16 @@ táctico desplegable).
 
 from __future__ import annotations
 import argparse
+import ctypes
 import logging
+import logging.handlers
+import os
 import queue
 import signal
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -27,14 +31,159 @@ from core.tools import set_confirmation_handler
 from core.voice import VoiceSynthesizer
 from ui.hud import HUDState, ZaraHUD
 
+_LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format=_LOG_FORMAT,
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("zara.main")
 
 CONFIRM_TIMEOUT_S = 25.0  # sin respuesta clara en este tiempo, la acción se cancela
+NO_REPLY_MESSAGE = "Señor VK, el cerebro no devolvió respuesta. Revise el modelo seleccionado."
+LOG_MAX_BYTES = 2_000_000
+LOG_BACKUPS = 5
+
+
+# --- Registro a archivo (diagnóstico en producción) ---
+def _resolve_log_level(name: Optional[str]) -> int:
+    """Traduce ZARA_LOG_LEVEL («debug», «INFO», «20»...) a un nivel de logging (INFO si no vale)."""
+    value = (name or "").strip().upper()
+    if value.isdigit():
+        return int(value)
+    level = logging.getLevelName(value) if value else logging.INFO
+    return level if isinstance(level, int) else logging.INFO
+
+
+def setup_logging(log_dir: Path, level_name: Optional[str] = None) -> Path:
+    """[FIX V1_-12] Log también a archivo con rotación, nivel configurable y excepciones no capturadas.
+
+    Lanzada con doble clic o desde el inicio automático, la consola se cierra al fallar y
+    el traceback se perdía. Ahora queda en DATA_DIR/logs/zara.log (2 MB x 5 copias).
+    """
+    root = logging.getLogger()
+    level = _resolve_log_level(level_name if level_name is not None else os.environ.get("ZARA_LOG_LEVEL"))
+    root.setLevel(level)
+
+    log_dir = Path(log_dir)
+    log_file = log_dir / "zara.log"
+    already = any(getattr(h, "_zara_file_log", False) for h in root.handlers)
+    if not already:
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            handler = logging.handlers.RotatingFileHandler(
+                log_file, maxBytes=LOG_MAX_BYTES, backupCount=LOG_BACKUPS, encoding="utf-8",
+            )
+            handler.setFormatter(logging.Formatter(_LOG_FORMAT, datefmt="%Y-%m-%d %H:%M:%S"))
+            handler._zara_file_log = True  # type: ignore[attr-defined]  # evita duplicarlo
+            root.addHandler(handler)
+        except OSError as exc:
+            log.warning("No se pudo abrir el log en %s: %s", log_file, exc)
+
+    def _log_uncaught(exc_type, exc_value, exc_tb) -> None:  # noqa: ANN001
+        if issubclass(exc_type, KeyboardInterrupt):
+            sys.__excepthook__(exc_type, exc_value, exc_tb)
+            return
+        log.critical("Excepción no capturada", exc_info=(exc_type, exc_value, exc_tb))
+
+    def _log_thread_exception(args) -> None:  # noqa: ANN001
+        if args.exc_type is SystemExit:
+            return
+        name = args.thread.name if args.thread else "?"
+        log.critical("Excepción no capturada en el hilo %s", name,
+                     exc_info=(args.exc_type, args.exc_value, args.exc_traceback))
+
+    sys.excepthook = _log_uncaught
+    threading.excepthook = _log_thread_exception
+    return log_file
+
+
+# --- Instancia única ---
+def acquire_single_instance_lock(lock_path: Path) -> Optional[QtCore.QLockFile]:
+    """[FIX V1_-8] Devuelve el bloqueo si esta es la única Zara en marcha, o None si ya hay otra.
+
+    Dos instancias abrirían el mismo micrófono y ejecutarían cada orden dos veces. Con
+    staleLockTime=0 solo se considera huérfano el bloqueo de un proceso que ya no existe
+    (Windows y Linux).
+    """
+    lock = QtCore.QLockFile(str(lock_path))
+    lock.setStaleLockTime(0)
+    if lock.tryLock(100):
+        return lock
+    return None
+
+
+# --- Plataforma gráfica en Linux (X11 / Wayland) ---
+def _has_xcb_cursor() -> bool:
+    """True si el cargador encuentra libxcb-cursor.so.0, que el plugin xcb de Qt >= 6.5 necesita."""
+    try:
+        import PySide6
+        bundled = Path(PySide6.__file__).resolve().parent / "Qt" / "lib"
+        if any(bundled.glob("libxcb-cursor.so*")):
+            return True
+    except Exception:
+        pass
+    try:
+        ctypes.CDLL("libxcb-cursor.so.0")
+        return True
+    except OSError:
+        return False
+
+
+_XCB_CURSOR_HELP = (
+    "Falta la librería libxcb-cursor, que Qt necesita para abrir ventanas en X11. Instálela con "
+    "«sudo apt install libxcb-cursor0» (Debian, Ubuntu, Kali) o «sudo dnf install xcb-util-cursor» "
+    "(Fedora) y vuelva a lanzar Zara, o use «--cli» para el modo consola."
+)
+
+
+def prepare_qt_platform(env=None, platform: Optional[str] = None, xcb_cursor_ok: Optional[bool] = None) -> Optional[str]:
+    """Ajusta QT_QPA_PLATFORM en Linux ANTES de crear la QApplication.
+
+    Devuelve un mensaje de error si la interfaz gráfica no puede arrancar (Qt abortaría el
+    proceso con qFatal, sin excepción que Python pueda capturar), o None si se puede seguir.
+
+    [FIX MUL-5/V1_-7] En Wayland un cliente no puede colocar su ventana ni quedar siempre
+    encima: move() y WindowStaysOnTopHint se ignoran. Si el usuario no fijó la plataforma y
+    hay XWayland, se usa xcb (con wayland de respaldo si xcb no carga).
+    [FIX MUL-13] En X11, sin libxcb-cursor Qt aborta: se avisa antes con un mensaje claro.
+    En Windows no hace nada (el plugin qwindows no tiene dependencias externas).
+    """
+    env = os.environ if env is None else env
+    platform = sys.platform if platform is None else platform
+    if not platform.startswith("linux"):
+        return None
+
+    def _xcb_ok() -> bool:
+        return _has_xcb_cursor() if xcb_cursor_ok is None else xcb_cursor_ok
+
+    forced = env.get("QT_QPA_PLATFORM", "").strip()
+    if not forced:
+        has_x11 = bool(env.get("DISPLAY"))
+        is_wayland = env.get("XDG_SESSION_TYPE", "").lower() == "wayland" or bool(env.get("WAYLAND_DISPLAY"))
+        if not has_x11 and not env.get("WAYLAND_DISPLAY"):
+            return "No hay sesión gráfica (DISPLAY y WAYLAND_DISPLAY vacíos). Use «--cli» para el modo consola."
+        if is_wayland:
+            if has_x11 and _xcb_ok():
+                env["QT_QPA_PLATFORM"] = "xcb;wayland"
+                log.warning(
+                    "Sesión Wayland: la bola se abre con XWayland (xcb) para poder colocarla, arrastrarla "
+                    "y mantenerla encima. Para forzar Wayland nativo, defina QT_QPA_PLATFORM=wayland."
+                )
+            else:
+                log.warning(
+                    "Sesión Wayland sin XWayland o sin libxcb-cursor: se usa Wayland nativo y la bola no "
+                    "podrá colocarse sola ni quedar siempre encima. Instale libxcb-cursor0 (apt) o "
+                    "xcb-util-cursor (dnf) para usar XWayland."
+                )
+            return None
+        forced = "xcb"  # sesión X11: Qt usará el plugin xcb
+
+    # Solo es fatal si xcb es la ÚNICA plataforma pedida («xcb;wayland» tiene respaldo).
+    candidates = [p.strip().lower() for p in forced.split(";") if p.strip()]
+    if candidates == ["xcb"] and not _xcb_ok():
+        return _XCB_CURSOR_HELP
+    return None
 
 
 class ZaraController(QtCore.QObject):
@@ -47,6 +196,10 @@ class ZaraController(QtCore.QObject):
     sig_user_speech = QtCore.Signal(str)
     sig_assistant_reply = QtCore.Signal(str)
     sig_ollama_models = QtCore.Signal(list, str)
+    # [FIX AUD-4] Línea del panel (prefijo, texto): los widgets Qt solo se tocan en el hilo
+    # de la GUI, así que los hilos del agente y de Live escriben en el panel con esta señal
+    # (conexión en cola automática entre hilos).
+    sig_panel_line = QtCore.Signal(str, str)
 
     def __init__(self, cli_mode: bool = False):
         super().__init__()
@@ -58,6 +211,14 @@ class ZaraController(QtCore.QObject):
         # Confirmación hablada de acciones sensibles (ver core.tools.needs_confirmation)
         self._confirm_queue: Optional[queue.Queue] = None
         self._confirm_lock = threading.Lock()
+        # [FIX AUD-10] Número de la última orden recibida: un turno que espera el lock y ya
+        # ha sido sustituido por otra orden (o por «Parar») no se ejecuta.
+        self._turn_seq = 0
+        self._turn_lock = threading.Lock()
+        # [FIX AUD-2/V1_-6] Estado del consumidor de locuciones del modo clásico.
+        self._worker_lock = threading.Lock()
+        self._worker_running = False
+        self._classic_active = False
 
         # 1. Motor de Voz (TTS) con Sentence Chunking y Barge-in
         self.voice = VoiceSynthesizer(on_state_change=self._on_voice_state_change)
@@ -89,15 +250,27 @@ class ZaraController(QtCore.QObject):
         if not self.cli_mode:
             self.hud = ZaraHUD()
             self._connect_signals()
+        else:
+            self._connect_cli_signals()
 
         set_confirmation_handler(self._ask_confirmation)
 
-        # Hilo de escucha en bucle
+        # Hilo de escucha en bucle (se crea de nuevo en _start_classic_ear si ha terminado)
         self._worker_thread = threading.Thread(target=self._voice_loop_worker, daemon=True)
+
+    def _connect_cli_signals(self) -> None:
+        """[FIX V1_-10] Sin HUD, las respuestas y los avisos (p. ej. CONFIRMAR) salen por la terminal."""
+        self.sig_assistant_reply.connect(lambda text: print(f"ZARA: {text}", flush=True))
+        self.sig_panel_line.connect(lambda prefix, text: print(f"[{prefix}] {text}", flush=True))
+
+    def _panel_line(self, prefix: str, text: str) -> None:
+        """Escribe en el panel (o en la terminal en --cli) desde cualquier hilo."""
+        self.sig_panel_line.emit(prefix, text)
 
     def _connect_signals(self) -> None:
         if not self.hud:
             return
+        self.sig_panel_line.connect(self.hud.panel.log_line)
         self.sig_hud_state.connect(self.hud.set_hud_state)
         self.sig_rms_level.connect(self.hud.set_rms_level)
         self.sig_tool_event.connect(self.hud.update_tool_status)
@@ -123,8 +296,8 @@ class ZaraController(QtCore.QObject):
             self._confirm_queue = answers
             try:
                 log.info("Pidiendo confirmación: %s", description)
-                if self.hud:
-                    self.hud.panel.log_line("CONFIRMAR", f"¿{description}?")
+                # Este método corre en el hilo del agente: nada de widgets directos (AUD-4).
+                self._panel_line("CONFIRMAR", f"¿{description}? Responda «sí» o «no».")
                 self.voice.say(f"Señor VK, necesito su confirmación para {description}.")
                 try:
                     return bool(answers.get(timeout=CONFIRM_TIMEOUT_S))
@@ -134,14 +307,23 @@ class ZaraController(QtCore.QObject):
             finally:
                 self._confirm_queue = None
 
-    def _route_confirmation(self, text: str) -> bool:
+    def _zara_is_speaking(self) -> bool:
+        return self.voice.is_speaking() or self.live_session.is_model_speaking()
+
+    def _route_confirmation(self, text: str, from_voice: bool = False) -> bool:
         """Si hay una confirmación pendiente, consume `text` como respuesta.
 
         Devuelve True si había una pendiente (la frase no debe procesarse como orden nueva).
+        [FIX SEG-10] Por voz, lo que llega mientras Zara habla se descarta (eco o ruido sobre
+        su propia pregunta): la respuesta debe darse con Zara en silencio. Hablarle encima
+        corta su voz (barge-in) y la frase siguiente sí cuenta.
         """
         answers = self._confirm_queue
         if answers is None:
             return False
+        if from_voice and self._zara_is_speaking():
+            log.info("Respuesta de confirmación ignorada (Zara estaba hablando): '%s'", text)
+            return True
         verdict = parse_confirmation(text)
         if verdict is not None:
             try:
@@ -154,8 +336,8 @@ class ZaraController(QtCore.QObject):
         clean = text.strip()
         # Los tool-calls de Live se ejecutan sin palabra de activación: la respuesta a una
         # confirmación llega por aquí. Se ignora lo que se transcribe mientras Zara habla (eco).
-        if clean and not self.voice.is_speaking():
-            self._route_confirmation(clean)
+        if clean:
+            self._route_confirmation(clean, from_voice=True)
         if clean:
             log.info("[LIVE USER] %s", clean)
             self.sig_user_speech.emit(clean)
@@ -175,12 +357,11 @@ class ZaraController(QtCore.QObject):
             self.sig_hud_state.emit(HUDState.LISTENING)
         elif state == "connected":
             self.sig_hud_state.emit(HUDState.IDLE)
-            if self.hud:
-                self.hud.panel.log_line("SISTEMA", "Gemini Live: WebSocket conectado.")
+            # Se llama desde el hilo asyncio de Live: el panel se toca por señal (AUD-4).
+            self._panel_line("SISTEMA", "Gemini Live: WebSocket conectado.")
         elif state in ("connecting", "reconnecting"):
             self.sig_hud_state.emit(HUDState.THINKING)
-            if self.hud:
-                self.hud.panel.log_line("SISTEMA", f"Gemini Live: {state}...")
+            self._panel_line("SISTEMA", f"Gemini Live: {state}...")
         else:
             self.sig_hud_state.emit(HUDState.IDLE)
 
@@ -203,8 +384,7 @@ class ZaraController(QtCore.QObject):
             log.info("Iniciando directamente en modo Gemini Live...")
             self.live_session.start()
         else:
-            self.ear.start()
-            self._worker_thread.start()
+            self._start_classic_ear()
 
         if self.hud:
             self.hud.show()
@@ -234,10 +414,47 @@ class ZaraController(QtCore.QObject):
                 self.brain.ollama.set_model(_pick_default_ollama_model(models))
             self.sig_ollama_models.emit(models, self.brain.ollama.model)
 
+    def _ear_is_running(self) -> bool:
+        """True si la captura del oído clásico está activa."""
+        is_running = getattr(self.ear, "is_running", None)
+        if callable(is_running):
+            return bool(is_running())
+        # Respaldo por si ContinuousEar aún no expone is_running().
+        thread = getattr(self.ear, "_audio_thread", None)
+        stop_event = getattr(self.ear, "_stop_event", None)
+        return bool(thread is not None and thread.is_alive() and not (stop_event and stop_event.is_set()))
+
+    def _start_classic_ear(self) -> None:
+        """[FIX AUD-2/V1_-6] Arranca (o rearranca) el oído clásico Y su consumidor de locuciones.
+
+        Al pasar a Gemini Live, ear.stop() termina listen_utterances() y con él el hilo
+        _voice_loop_worker. Al volver (o si se arrancó en Live) no basta con ear.start():
+        sin consumidor las locuciones se acumulan sin transcribirse y Zara queda sorda.
+        """
+        with self._worker_lock:
+            if not self._ear_is_running():
+                self.ear.start()
+            self._classic_active = True
+            if not self._worker_running or not self._worker_thread.is_alive():
+                self._worker_running = True
+                if self._worker_thread.ident is not None:  # un Thread solo se puede arrancar una vez
+                    self._worker_thread = threading.Thread(target=self._voice_loop_worker, daemon=True)
+                self._worker_thread.start()
+
+    def _stop_classic_ear(self) -> None:
+        """Detiene el oído clásico (paso a Gemini Live); su consumidor termina solo."""
+        with self._worker_lock:
+            self._classic_active = False
+        self.ear.stop()
+
     def shutdown(self) -> None:
-        """Cierre ordenado de todos los hilos y motores."""
+        """Cierre ordenado de todos los hilos y motores (idempotente)."""
+        if self._stop_event.is_set():
+            return
         log.info("Apagando %s...", config.APP_TITLE)
         self._stop_event.set()
+        with self._turn_lock:
+            self._turn_seq += 1  # ningún turno en espera debe arrancar ya
         self.live_session.stop()
         self.ear.stop()
         self.voice.shutdown()
@@ -252,6 +469,7 @@ class ZaraController(QtCore.QObject):
             # Hablar mientras Zara pide confirmación es contestarle, no cancelar el turno.
             return
         # [FIX AUDITORÍA] Detener AUDIO y cancelar el turno del cerebro
+        self._next_turn_id()  # [FIX AUD-10] los turnos que esperaban el lock ya no se ejecutan
         self.brain.cancel_current_turn()
         self.sig_hud_state.emit(HUDState.IDLE if self.ear.is_muted() else HUDState.LISTENING)
 
@@ -308,8 +526,8 @@ class ZaraController(QtCore.QObject):
         if reason:
             # No se activa ni se guarda: el panel vuelve al cerebro que funcionaba.
             log.warning("Cerebro %s no disponible: %s", provider, reason)
+            self._panel_line("ERROR", reason)
             if self.hud:
-                self.hud.panel.log_line("ERROR", reason)
                 self.hud.set_brain(self._preferred_provider)
             return
 
@@ -322,18 +540,18 @@ class ZaraController(QtCore.QObject):
 
         if provider == "gemini_live":
             # Pausar oído clásico para evitar conflicto de captura de micrófono
-            self.ear.stop()
+            self._stop_classic_ear()
             self.voice.stop()
             self.live_session.start()
-            if self.hud:
-                self.hud.panel.log_line("SISTEMA", "Modo Live activado: streaming de audio bidireccional.")
+            self._panel_line("SISTEMA", "Modo Live activado: streaming de audio bidireccional.")
         else:
-            # Si veníamos de Live, detenerlo y arrancar oído clásico
+            # Si veníamos de Live, detenerlo. El oído clásico y su consumidor se (re)arrancan
+            # SIEMPRE: también si se arrancó en Live o si la sesión Live murió sola.
             if self.live_session.is_running():
                 self.live_session.stop()
-                self.ear.start()
+            self._start_classic_ear()
             if self.hud:
-                self.hud.panel.log_line("SISTEMA", f"Cerebro cambiado a: {self.hud.panel.brain_combo.currentText()}")
+                self._panel_line("SISTEMA", f"Cerebro cambiado a: {self.hud.panel.brain_combo.currentText()}")
 
     def _on_model_changed(self, provider: str, model: str) -> None:
         """Cambia en caliente el modelo concreto del proveedor seleccionado y lo persiste."""
@@ -361,19 +579,20 @@ class ZaraController(QtCore.QObject):
             return
 
         log.info("Modelo de %s cambiado a: %s", provider, label)
-        if self.hud:
-            self.hud.panel.log_line("SISTEMA", f"Modelo de {provider} -> {label}")
+        self._panel_line("SISTEMA", f"Modelo de {provider} -> {label}")
 
     def _on_quit_requested(self) -> None:
-        """Cierre limpio solicitado desde el botón 'Salir' del panel táctico."""
+        """Cierre limpio solicitado desde el botón 'Salir' del panel táctico (o al cerrar la bola)."""
+        if self._stop_event.is_set():
+            return  # ya se está cerrando (Ctrl+C, aboutToQuit o un cierre anterior)
         log.info("Cierre solicitado desde el panel táctico.")
         self.shutdown()
-        app = QtWidgets.QApplication.instance()
+        app = QtCore.QCoreApplication.instance()
         if app:
             app.quit()
 
     def _on_text_command(self, text: str) -> None:
-        """Procesa una orden escrita manualmente en el panel táctico."""
+        """Procesa una orden escrita manualmente en el panel táctico (o en la terminal con --cli)."""
         text = text.strip()
         if not text:
             return
@@ -382,7 +601,25 @@ class ZaraController(QtCore.QObject):
         if self._is_busy:
             self.voice.say("Un momento, Señor VK, estoy procesando otra orden.")
             return
-        threading.Thread(target=self._process_query, args=(text,), daemon=True).start()
+        turn_id = self._next_turn_id()
+        threading.Thread(target=self._process_query, args=(text, turn_id), daemon=True).start()
+
+    # --- turnos ---
+    def _next_turn_id(self) -> int:
+        """Registra una orden (o una interrupción) nueva y devuelve su número."""
+        with self._turn_lock:
+            self._turn_seq += 1
+            return self._turn_seq
+
+    def _is_latest_turn(self, turn_id: Optional[int]) -> bool:
+        return turn_id is None or turn_id == self._turn_seq
+
+    def _turn_cancelled(self, turn_id: Optional[int]) -> bool:
+        """True si el turno fue sustituido por otra orden o cancelado (barge-in, «Parar»)."""
+        if not self._is_latest_turn(turn_id):
+            return True
+        cancel_event = getattr(self.brain, "_cancel_event", None)
+        return bool(cancel_event is not None and cancel_event.is_set())
 
     def _voice_loop_worker(self) -> None:
         """Hilo continuo que procesa las locuciones del Señor VK.
@@ -397,45 +634,66 @@ class ZaraController(QtCore.QObject):
         si todavía hay un turno ocupado, se trata como una interrupción
         implícita: se cancela el turno en curso en vez de dejarlo terminar o
         descartar la orden nueva.
+
+        [FIX AUD-2/V1_-6] listen_utterances() termina cuando se detiene el oído (paso a
+        Gemini Live). Si entretanto se ha vuelto al modo clásico se sigue escuchando; si no,
+        el hilo termina y _start_classic_ear() lo relanza al volver.
         """
-        for text in self.ear.listen_utterances():
-            if self._stop_event.is_set():
-                break
+        while True:
+            for text in self.ear.listen_utterances():
+                if self._stop_event.is_set():
+                    break
+                self._handle_utterance(text)
+            with self._worker_lock:
+                if not self._classic_active or self._stop_event.is_set():
+                    self._worker_running = False
+                    return
+            time.sleep(0.2)  # el oído se relanzó (o se paró solo): no girar en vacío
 
-            clean_text = text.strip()
-            if not clean_text:
-                continue
+    def _handle_utterance(self, text: str) -> None:
+        """Decide qué hacer con una locución transcrita del modo clásico."""
+        clean_text = text.strip()
+        if not clean_text:
+            return
 
-            # [FIX] Palabra de activación obligatoria para órdenes de VOZ: el
-            # micrófono escucha de forma continua, así que sin esto cualquier
-            # ruido ambiente (TV, conversaciones, música) con palabras como
-            # "pausa" o "minimiza" podía disparar acciones reales (minimizar
-            # ventanas, pausar/reproducir multimedia...) sin que el Señor VK
-            # se dirigiera a Zara en absoluto. Las órdenes escritas en el
-            # panel táctico (_on_text_command) NO pasan por aquí: teclear ya
-            # es una acción deliberada y no está sujeta a ruido ambiente.
-            # Respuesta a una confirmación pendiente: no exige «Zara» ni inicia otro turno.
-            if self._route_confirmation(clean_text):
-                continue
+        # [FIX] Palabra de activación obligatoria para órdenes de VOZ: el
+        # micrófono escucha de forma continua, así que sin esto cualquier
+        # ruido ambiente (TV, conversaciones, música) con palabras como
+        # "pausa" o "minimiza" podía disparar acciones reales (minimizar
+        # ventanas, pausar/reproducir multimedia...) sin que el Señor VK
+        # se dirigiera a Zara en absoluto. Las órdenes escritas en el
+        # panel táctico (_on_text_command) NO pasan por aquí: teclear ya
+        # es una acción deliberada y no está sujeta a ruido ambiente.
+        # Respuesta a una confirmación pendiente: no exige «Zara» ni inicia otro turno,
+        # pero debe ser un sí/no claro dicho con Zara en silencio (SEG-10).
+        if self._route_confirmation(clean_text, from_voice=True):
+            return
 
-            if not contains_wake_word(clean_text):
-                log.debug("Locución ignorada (sin mencionar a Zara): '%s'", clean_text)
-                continue
+        if not contains_wake_word(clean_text):
+            log.debug("Locución ignorada (sin mencionar a Zara): '%s'", clean_text)
+            return
 
-            if self._is_busy:
-                log.info("Nueva locución mientras se procesaba un turno anterior: cancelándolo.")
-                self.voice.stop()
-                self.brain.cancel_current_turn()
+        if self._is_busy:
+            log.info("Nueva locución mientras se procesaba un turno anterior: cancelándolo.")
+            self.voice.stop()
+            self.brain.cancel_current_turn()
 
-            threading.Thread(target=self._process_query, args=(clean_text,), daemon=True).start()
+        turn_id = self._next_turn_id()
+        threading.Thread(target=self._process_query, args=(clean_text, turn_id), daemon=True).start()
 
-    def _process_query(self, clean_text: str) -> None:
+    def _process_query(self, clean_text: str, turn_id: Optional[int] = None) -> None:
         """Procesa una orden (de voz o texto) a través del agente ReAct y la sintetiza."""
         log.info("Señor VK dijo: '%s'", clean_text)
         self.sig_user_speech.emit(clean_text)
         self.sig_hud_state.emit(HUDState.THINKING)
 
         with self._busy_lock:
+            if not self._is_latest_turn(turn_id):
+                # [FIX AUD-10] Mientras esperaba el lock llegó otra orden (o se pulsó «Parar»):
+                # solo se ejecuta la última. threading.Lock no es FIFO y run_react_agent limpia
+                # la cancelación al empezar, así que sin esto se ejecutaban todas, en desorden.
+                log.info("Orden sustituida por otra posterior; no se ejecuta: '%s'", clean_text)
+                return
             self._is_busy = True
             t_start = time.monotonic()
             try:
@@ -457,31 +715,82 @@ class ZaraController(QtCore.QObject):
                 reply_text = "".join(full_reply_parts).strip()
                 if reply_text:
                     self.sig_assistant_reply.emit(reply_text)
+                elif not self._turn_cancelled(turn_id):
+                    # [FIX V1_-13] Un turno vacío (p. ej. modelo de Ollama borrado y sin claves
+                    # para el respaldo) dejaba a Zara muda y la bola en «PROCESANDO».
+                    log.warning("El turno terminó sin respuesta del cerebro: '%s'", clean_text)
+                    self.sig_assistant_reply.emit(NO_REPLY_MESSAGE)
+                    self.voice.say(NO_REPLY_MESSAGE)
             except Exception as exc:
                 log.exception("Error en procesamiento de orden: %s", exc)
                 self.voice.say(f"Señor VK, ocurrió una anomalía: {exc}")
             finally:
                 self._is_busy = False
+                # [FIX V1_-13] Si no hay voz en curso ni otra orden detrás, la bola vuelve a
+                # reposo (si Zara habla, _on_voice_state_change la devolverá al terminar).
+                if self._is_latest_turn(turn_id) and not self.voice.is_speaking():
+                    self.sig_hud_state.emit(HUDState.IDLE)
+
+
+def read_stdin_commands(controller: ZaraController, stream=None) -> None:
+    """[FIX V1_-10] Modo --cli: cada línea escrita es una orden (o la respuesta a una confirmación)."""
+    stream = sys.stdin if stream is None else stream
+    if stream is None:  # pythonw.exe en Windows no tiene consola
+        return
+    try:
+        for line in stream:
+            if controller._stop_event.is_set():
+                break
+            controller._on_text_command(line)
+    except (OSError, ValueError):
+        pass  # terminal cerrada
+
+
+_INSTANCE_LOCK: Optional[QtCore.QLockFile] = None
 
 
 def main() -> None:
+    global _INSTANCE_LOCK
     parser = argparse.ArgumentParser(description=f"{config.APP_TITLE} - Asistente Táctico de IA Estilo J.A.R.V.I.S.")
     parser.add_argument("--version", action="version", version=config.APP_TITLE)
     parser.add_argument("--cli", action="store_true", help="Ejecutar en modo terminal sin HUD gráfico.")
     args = parser.parse_args()
 
-    app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+    log_file = setup_logging(config.DATA_DIR / "logs")
+    log.info("Registro de %s en %s", config.APP_TITLE, log_file)
+
+    # [FIX V1_-8] Una sola Zara a la vez: dos abrirían el micrófono y duplicarían cada orden.
+    lock_path = config.DATA_DIR / "zara.lock"
+    _INSTANCE_LOCK = acquire_single_instance_lock(lock_path)
+    if _INSTANCE_LOCK is None:
+        log.error("%s ya está en ejecución (bloqueo: %s). Ciérrela antes de abrir otra.", config.APP_TITLE, lock_path)
+        sys.exit(0)
+
+    if args.cli:
+        # [FIX V1_-10] Sin interfaz gráfica: QCoreApplication solo aporta el bucle de eventos,
+        # así que funciona por SSH o en un TTY sin display ni plugin xcb.
+        app = QtCore.QCoreApplication.instance() or QtCore.QCoreApplication(sys.argv)
+    else:
+        platform_error = prepare_qt_platform()
+        if platform_error:
+            log.error(platform_error)
+            sys.exit(1)
+        app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
     app.setApplicationName("ZARA")
     app.setApplicationVersion(config.VERSION_FULL)
-    # [DISEÑO] Icono de aplicación (barra de tareas/Alt+Tab si el SO lo expone
-    # pese a Qt.Tool, y para cualquier ventana futura que herede el icono).
-    icon_path = config.BASE_DIR / "config" / "zara-icon.ico"
-    if not icon_path.is_file():
-        icon_path = config.BASE_DIR / "config" / "zara-icon.png"
-    if icon_path.is_file():
-        app.setWindowIcon(QtGui.QIcon(str(icon_path)))
+    if not args.cli:
+        # [DISEÑO] Icono de aplicación (barra de tareas/Alt+Tab si el SO lo expone
+        # pese a Qt.Tool, y para cualquier ventana futura que herede el icono).
+        icon_path = config.BASE_DIR / "config" / "zara-icon.ico"
+        if not icon_path.is_file():
+            icon_path = config.BASE_DIR / "config" / "zara-icon.png"
+        if icon_path.is_file():
+            app.setWindowIcon(QtGui.QIcon(str(icon_path)))
 
     controller = ZaraController(cli_mode=args.cli)
+    # [FIX V1_-15] Salga como salga el bucle Qt (cierre de sesión, cerrar la bola...),
+    # se apagan micrófono y motores; shutdown() es idempotente.
+    app.aboutToQuit.connect(controller.shutdown)
 
     # Manejar Ctrl+C limpiamente en la terminal
     signal.signal(signal.SIGINT, lambda sig, frame: controller.shutdown() or app.quit())
@@ -492,6 +801,10 @@ def main() -> None:
     sig_timer.start(250)
 
     controller.start()
+
+    if args.cli:
+        print("Modo consola: escriba una orden y pulse Intro (Ctrl+C para salir).", flush=True)
+        threading.Thread(target=read_stdin_commands, args=(controller,), daemon=True, name="zara-stdin").start()
 
     try:
         sys.exit(app.exec())

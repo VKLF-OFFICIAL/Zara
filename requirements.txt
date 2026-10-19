@@ -2,6 +2,9 @@
 sounddevice>=0.5.0,<1
 numpy>=1.26.0,<3
 silero-vad>=6.0.0,<7
+# En Linux sin GPU NVIDIA, setup_and_run instala antes el torch de solo CPU (el de PyPI
+# arrastra varios GB de paquetes nvidia-* de CUDA). A mano, antes de este archivo:
+#   pip install "torch>=2.2.0,<3" --index-url https://download.pytorch.org/whl/cpu
 torch>=2.2.0,<3
 faster-whisper>=1.0.0,<2
 ctranslate2>=4.0.0,<5
@@ -9,7 +12,9 @@ miniaudio>=1.60.0,<2
 
 # Síntesis de Voz (TTS)
 edge-tts>=7.0.0,<8
-kokoro-onnx>=0.6.0,<1
+# Kokoro (TTS local opcional) solo publica versiones para Python < 3.14; en 3.14+ se
+# omite y ZARA usa edge-tts (KokoroEngine ya tolera que no esté instalado).
+kokoro-onnx>=0.6.0,<1; python_version < "3.14"
 
 # Cerebros LLM y Multimodal
 google-genai>=2.0.0,<3
@@ -20,7 +25,8 @@ ddgs>=9.0.0,<10
 # Herramientas del Sistema y Pantalla
 psutil>=6.0.0,<7
 mss>=10.0.0,<11
-pillow>=10.0.0,<11
+# pillow 10.x no tiene wheels para Python 3.14 (la primera con cp314 es la 11.3).
+pillow>=10.0.0,<13
 pycaw>=20240206; sys_platform == 'win32'
 
 # Interfaz Holográfica HUD
