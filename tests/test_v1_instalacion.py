@@ -309,7 +309,7 @@ FAKE_PYTHON3 = textwrap.dedent("""\
         cp "$FAKE_VENV_PY" "$3/bin/python"
         chmod +x "$3/bin/python"
         if [ -n "$FAKE_NO_ENSUREPIP" ]; then
-            touch "$3/nopip"
+            touch "$3/nopip" "$3/noensurepip"
             echo "The virtual environment was not created successfully because ensurepip is not available." >&2
             exit 1
         fi
@@ -326,7 +326,13 @@ FAKE_VENV_PY = textwrap.dedent("""\
         if [ -f "$VENV/nopip" ]; then echo "No module named pip" >&2; exit 1; fi
         exit 0
     fi
-    if [ "$1" = "--version" ]; then echo "Python 3.12.3"; exit 0; fi
+    if [ "$1" = "-m" ] && [ "$2" = "ensurepip" ]; then
+        # Debian/Kali sin python3-venv: ensurepip no existe
+        if [ -f "$VENV/noensurepip" ]; then echo "No module named ensurepip" >&2; exit 1; fi
+        rm -f "$VENV/nopip"; exit 0
+    fi
+    if [ "$1" = "-c" ]; then exit 0; fi
+    if [ "$1" = "--version"; then echo "Python 3.12.3"; exit 0; fi
     echo "LAUNCH $*"
 """)
 
@@ -360,11 +366,15 @@ def sh_sandbox(tmp_path):
         )
         return proc.returncode, proc.stdout + proc.stderr
 
-    def make_venv(with_pip=True):
+    def make_venv(with_pip=True, ensurepip=False, uv=False):
         (app / ".venv" / "bin").mkdir(parents=True)
         shutil.copy(venv_py, app / ".venv" / "bin" / "python")
         if not with_pip:
             (app / ".venv" / "nopip").touch()
+            if not ensurepip:
+                (app / ".venv" / "noensurepip").touch()
+        if uv:
+            (app / ".venv" / "pyvenv.cfg").write_text("home = /usr/bin\nuv = 0.5.0\n", encoding="utf-8")
 
     return SimpleNamespace(app=app, run=run, make_venv=make_venv)
 
@@ -381,6 +391,25 @@ def test_sh_recreates_a_venv_without_pip_and_installs(sh_sandbox):
     assert not (sh_sandbox.app / ".venv" / "nopip").exists()
     launch = _launch_line(out)
     assert "--install" in launch and launch.endswith("--cli")
+
+
+def test_sh_keeps_a_venv_without_pip_when_ensurepip_recovers_it(sh_sandbox):
+    sh_sandbox.make_venv(with_pip=False, ensurepip=True)
+    rc, out = sh_sandbox.run("--cli")
+    assert rc == 0, out
+    assert "Recreándolo" not in out and "Creando entorno" not in out
+    assert "--install" in _launch_line(out)
+
+
+def test_sh_never_deletes_a_uv_venv_without_pip(sh_sandbox):
+    """`uv venv` no instala pip a propósito: borrarlo tiraba todo lo instalado con uv."""
+    sh_sandbox.make_venv(with_pip=False, uv=True)
+    rc, out = sh_sandbox.run("--cli")
+    assert rc == 0, out
+    assert "Recreándolo" not in out and "Creando entorno" not in out
+    assert (sh_sandbox.app / ".venv" / "pyvenv.cfg").exists()
+    launch = _launch_line(out)
+    assert "--install" not in launch and launch.endswith("--cli")
 
 
 def test_sh_removes_half_created_venv_and_explains_python3_venv(sh_sandbox):
@@ -488,13 +517,35 @@ def test_ps1_skips_store_stub_and_uses_py_launcher_with_separate_args(tmp_path):
     assert found["pre"] in (["-3.12"], "-3.12")  # ConvertTo-Json aplana los arrays de un elemento
 
 
-def test_zara_cmd_pauses_on_error_so_double_click_shows_it():
-    text = ZARA_CMD.read_text(encoding="ascii")  # cmd.exe no lee UTF-8 por defecto
+@pytest.mark.parametrize("cmd", [ZARA_CMD, ROOT / "zara-chat.cmd"], ids=lambda p: p.name)
+def test_zara_cmd_pauses_on_error_so_double_click_shows_it(cmd):
+    raw = cmd.read_bytes()
+    assert b"\r\n" in raw and b"\n" not in raw.replace(b"\r\n", b"")  # cmd.exe espera CRLF
+    text = raw.decode("ascii")  # cmd.exe no lee UTF-8 por defecto
     lowered = text.lower()
     assert "setup_and_run.ps1" in lowered
     assert "pause" in lowered and "errorlevel" in lowered and "exit /b" in lowered
     block = lowered.split('if not "%zara_rc%"=="0" (', 1)[1].split("\n)", 1)[0]
     assert ")" not in block.replace("\r", "")  # un ")" sin escapar cerraría el bloque
+
+
+def test_setup_and_run_propagates_the_exit_code_of_main(monkeypatch):
+    """Sin propagar el código de main.py, zara.cmd nunca hacía pause ante un traceback."""
+    calls = []
+
+    def fake_run(cmd, *a, **k):
+        calls.append(cmd)
+        return SimpleNamespace(returncode=1)
+
+    monkeypatch.setattr(sr.subprocess, "run", fake_run)
+    for name in ("print_banner", "check_python_version", "check_os_environment", "check_linux_system_packages",
+                 "ensure_env_file", "check_dependencies", "check_audio_devices", "check_ollama_service"):
+        monkeypatch.setattr(sr, name, lambda *a, **k: True)
+    monkeypatch.setattr(sys, "argv", ["setup_and_run.py"])
+    with pytest.raises(SystemExit) as exc:
+        sr.main()
+    assert exc.value.code == 1
+    assert calls and any("main.py" in str(part) for part in calls[-1])
 
 
 # --- CI (MUL-14/V1_-14) ---------------------------------------------------------------------

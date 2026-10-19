@@ -27,7 +27,8 @@ Set-Location $ScriptDir
 function Test-Exec {
     param([string]$Exe, [string[]]$ExeArgs = @())
     try {
-        & $Exe @ExeArgs 2>$null | Out-Null
+        # stdin vacío: un sondeo nunca debe quedarse esperando una respuesta por consola
+        $null | & $Exe @ExeArgs 2>$null | Out-Null
         return ($LASTEXITCODE -eq 0)
     } catch {
         return $false
@@ -59,6 +60,9 @@ function Find-BasePython {
     # 2) Lanzador py de python.org (instalación sin "Add python.exe to PATH"). Se prefieren
     #    3.13/3.12, que tienen todas las dependencias (Kokoro no existe para 3.14+).
     if (Get-Command py.exe -CommandType Application -ErrorAction SilentlyContinue) {
+        # Con el Python Install Manager, `py -3.13` sin 3.13 lo descargaría e instalaría
+        # durante el sondeo; el lanzador clásico ignora esta variable.
+        $env:PYTHON_MANAGER_AUTOMATIC_INSTALL = 'false'
         foreach ($version in @('-3.13', '-3.12', '-3.11', '-3.10', '-3')) {
             if (Test-Python -Exe 'py' -PreArgs @($version)) {
                 return @{ Exe = 'py'; PreArgs = @($version) }
@@ -85,8 +89,12 @@ if (Test-Path $AppVenvPy) {
     # Entorno que gestiona el usuario: se usa tal cual
     $PythonExe = $AppVenvPy
 } else {
-    # Un .venv roto (copiado de otro equipo o creado con un Python ya desinstalado) se recrea
-    if ((Test-Path $VenvDir) -and -not (Test-Exec -Exe $VenvPy -ExeArgs @('-m', 'pip', '--version'))) {
+    # Un .venv roto (copiado de otro equipo o creado con un Python ya desinstalado) se recrea.
+    # Un venv de uv sin pip no está roto: se conserva y se usa tal cual.
+    $VenvCfg = Join-Path $VenvDir 'pyvenv.cfg'
+    $VenvIsUv = (Test-Path $VenvCfg) -and [bool](Select-String -Path $VenvCfg -Pattern '^uv = ' -Quiet)
+    $VenvHasPip = (Test-Exec -Exe $VenvPy -ExeArgs @('-m', 'pip', '--version')) -or (Test-Exec -Exe $VenvPy -ExeArgs @('-m', 'ensurepip', '--upgrade'))
+    if ((Test-Path $VenvDir) -and (-not (Test-Python -Exe $VenvPy) -or (-not $VenvIsUv -and -not $VenvHasPip))) {
         Write-Host "[!] El entorno virtual .venv está incompleto o roto. Recreándolo..." -ForegroundColor Yellow
         Remove-Item -Recurse -Force $VenvDir -ErrorAction SilentlyContinue
     }
@@ -118,8 +126,8 @@ if (Test-Path $AppVenvPy) {
 
     $PythonExe = $VenvPy
     # setup_and_run.py instala las dependencias o completa una instalación que se cortó;
-    # si ya está todo, no descarga nada.
-    $AutoInstall = $true
+    # si ya está todo, no descarga nada. Un venv de uv sin pip se arranca tal cual.
+    $AutoInstall = Test-Exec -Exe $VenvPy -ExeArgs @('-m', 'pip', '--version')
 }
 
 # Construir argumentos para setup_and_run.py

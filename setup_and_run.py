@@ -607,10 +607,14 @@ def main() -> None:
         cmd.append("--cli")
     cmd.extend(unknown_args)
 
+    rc = 0
     try:
-        subprocess.run(cmd)
+        # El código de salida de main.py se propaga: zara.cmd hace pause si ZARA falló al
+        # arrancar, para que con doble clic se pueda leer el error.
+        rc = subprocess.run(cmd).returncode
     except KeyboardInterrupt:
         print("\n[*] ZARA detenida por el usuario. Buen día, Señor VK.")
+    sys.exit(rc)
 
 
 if __name__ == "__main__":

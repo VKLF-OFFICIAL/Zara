@@ -35,9 +35,20 @@ python_ok() {
     "$1" -c 'import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)' > /dev/null 2>&1
 }
 
-# True si el venv tiene un intérprete que arranca y con pip
+# True si el venv tiene un intérprete que arranca (Python >= 3.10)
 venv_ok() {
-    [ -x "$1/bin/python" ] && "$1/bin/python" -m pip --version > /dev/null 2>&1
+    [ -x "$1/bin/python" ] && python_ok "$1/bin/python"
+}
+
+# True si el venv tiene pip o se le puede poner con ensurepip
+venv_has_pip() {
+    "$1/bin/python" -m pip --version > /dev/null 2>&1 \
+        || "$1/bin/python" -m ensurepip --upgrade > /dev/null 2>&1
+}
+
+# True si el venv lo gestiona uv (`uv venv` no instala pip a propósito)
+venv_is_uv() {
+    grep -q '^uv = ' "$1/pyvenv.cfg" 2> /dev/null
 }
 
 print_python_help() {
@@ -57,7 +68,8 @@ else
     # [FIX MUL-8] Un .venv roto se quedaba para siempre: en Debian/Kali sin python3-venv,
     # `python3 -m venv` deja bin/python sin pip, y tras actualizar el python3 del sistema
     # el venv apunta a un intérprete que ya no existe. Se detecta y se recrea.
-    if [ -e "$VENV_DIR" ] && ! venv_ok "$VENV_DIR"; then
+    # Un venv de uv sin pip no está roto: se conserva y se usa tal cual.
+    if [ -e "$VENV_DIR" ] && { ! venv_ok "$VENV_DIR" || { ! venv_is_uv "$VENV_DIR" && ! venv_has_pip "$VENV_DIR"; }; }; then
         echo "[!] El entorno virtual .venv está incompleto o roto (sin intérprete o sin pip). Recreándolo..."
         rm -rf "$VENV_DIR"
     fi
@@ -77,7 +89,7 @@ else
         fi
 
         echo "[*] Creando entorno virtual .venv con $("$BASE_PYTHON" --version)..."
-        if ! "$BASE_PYTHON" -m venv "$VENV_DIR" || ! venv_ok "$VENV_DIR"; then
+        if ! "$BASE_PYTHON" -m venv "$VENV_DIR" || ! venv_ok "$VENV_DIR" || ! venv_has_pip "$VENV_DIR"; then
             rm -rf "$VENV_DIR"
             echo "[!] Error: No se pudo crear el entorno virtual (falta el módulo venv/ensurepip de Python)."
             echo "    En Kali/Debian/Ubuntu: sudo apt install -y python3-venv"
@@ -92,7 +104,12 @@ else
     PYTHON_BIN="$VENV_DIR/bin/python"
     # setup_and_run.py instala las dependencias (con torch de solo CPU si no hay GPU NVIDIA)
     # o completa una instalación que se cortó; si ya está todo, no descarga nada.
-    INSTALL_ARGS=(--install)
+    if venv_has_pip "$VENV_DIR"; then
+        INSTALL_ARGS=(--install)
+    else
+        # Venv de uv sin pip: las dependencias las gestiona el usuario con `uv pip install`
+        echo "[*] Entorno .venv creado con uv (sin pip): se arranca con lo que ya tiene instalado."
+    fi
 fi
 
 echo "[*] Utilizando Python: $("$PYTHON_BIN" --version) en $PYTHON_BIN"
