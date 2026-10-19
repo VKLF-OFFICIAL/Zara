@@ -44,11 +44,15 @@ def test_gemini_live_availability():
 
 
 def test_gemini_live_model_resolution():
-    session = GeminiLiveSession(api_key="key", model="gemini-2.0-flash-live-001")
-    assert session._resolve_live_model() == "gemini-2.0-flash-live-001"
+    # Modelo explícito vigente: debe mantenerse sin cambios
+    session = GeminiLiveSession(api_key="key", model="gemini-2.5-flash-native-audio-preview-12-2025")
+    assert session._resolve_live_model() == "gemini-2.5-flash-native-audio-preview-12-2025"
 
-    session.set_model("gemini-2.5-flash-preview-native-audio-dialog")
-    assert session._resolve_live_model() == "gemini-2.5-flash-preview-native-audio-dialog"
+    # Modelo retirado: debe redirigir a un modelo vigente sin lanzar excepción
+    session.set_model("gemini-2.0-flash-live-001")
+    resolved = session._resolve_live_model()
+    assert resolved != "gemini-2.0-flash-live-001"
+    assert "gemini" in resolved
 
 
 def test_gemini_live_audio_parameters():
