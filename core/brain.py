@@ -28,10 +28,12 @@ import re
 import shutil
 import subprocess
 import threading
-import urllib.request
+import httpx
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 
+from core.gemini_models import AUTO as AUTO_MODEL, resolve_gemini_model
 from config import (
+    GEMINI_MODEL_FALLBACK,
     ANTHROPIC_API_KEY,
     ANTHROPIC_MODEL,
     CLAUDE_MODEL_OVERRIDE,
@@ -52,12 +54,25 @@ log = logging.getLogger("zara.brain")
 _MAX_HISTORY_MESSAGES = 40
 
 
+# Cliente HTTP compartido (reutiliza conexiones). La carga en frío de un modelo grande
+# puede tardar más de 60 s en dar el primer byte, de ahí el timeout de lectura largo.
+_HTTP_CLIENT: Optional[httpx.Client] = None
+
+
+def _http_post_stream(url: str, payload: Dict[str, Any]) -> httpx.Response:
+    """POST con respuesta en streaming; el llamador debe cerrar la respuesta."""
+    global _HTTP_CLIENT
+    if _HTTP_CLIENT is None:
+        _HTTP_CLIENT = httpx.Client(timeout=httpx.Timeout(180.0, connect=5.0))
+    return _HTTP_CLIENT.send(_HTTP_CLIENT.build_request("POST", url, json=payload), stream=True)
+
+
 def list_ollama_models(host: str = OLLAMA_HOST, timeout: float = 3.0) -> List[str]:
     """Consulta /api/tags de Ollama y devuelve los nombres de los modelos instalados localmente."""
     try:
-        req = urllib.request.Request(f"{host.rstrip('/')}/api/tags", method="GET")
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            data = json.loads(resp.read().decode("utf-8"))
+        resp = httpx.get(f"{host.rstrip('/')}/api/tags", timeout=timeout)
+        resp.raise_for_status()
+        data = resp.json()
         names = [m.get("name", "") for m in data.get("models", []) if m.get("name")]
         return sorted(names)
     except Exception as exc:
@@ -360,8 +375,7 @@ class OllamaProvider:
 
     def is_available(self) -> bool:
         try:
-            with urllib.request.urlopen(f"{self.host}/api/tags", timeout=1.5) as r:
-                return r.status == 200
+            return httpx.get(f"{self.host}/api/tags", timeout=1.5).status_code == 200
         except Exception:
             return False
 
@@ -372,8 +386,6 @@ class OllamaProvider:
         system_prompt: Optional[str] = None,
     ) -> Generator[Dict[str, Any], None, None]:
         """Envía conversación a Ollama /api/chat y produce eventos de texto o tool_calls."""
-        import requests
-
         url = f"{self.host}/api/chat"
 
         known_tool_names = {t.get("name") for t in (tools or [])}
@@ -416,7 +428,7 @@ class OllamaProvider:
             }
             if tools and native_tools_flag:
                 payload["tools"] = [{"type": "function", "function": t} for t in tools]
-            return requests.post(url, json=payload, stream=True, timeout=(5, 180))
+            return _http_post_stream(url, payload)
 
         full_content = ""
         native_tool_call_found = False
@@ -447,10 +459,11 @@ class OllamaProvider:
 
             with resp:
                 if resp.status_code != 200:
+                    resp.read()
                     yield {"type": "error", "error": f"Ollama HTTP {resp.status_code}: {resp.text}"}
                     return
 
-                for line in resp.iter_lines(decode_unicode=True):
+                for line in resp.iter_lines():
                     if not line:
                         continue
                     try:
@@ -513,7 +526,7 @@ class GeminiProvider:
 
     def __init__(self, api_key: str = GEMINI_API_KEY, model: str = GEMINI_MODEL):
         self.api_key = api_key
-        self.model = model
+        self.model = model  # "auto" se resuelve perezosamente en el primer uso
         self._client = None
         if self.api_key:
             self._init_client()
@@ -546,6 +559,10 @@ class GeminiProvider:
 
         try:
             from google.genai import types
+
+            if self.model == AUTO_MODEL:
+                self.model = resolve_gemini_model(self.api_key, AUTO_MODEL, live=False, fallback=GEMINI_MODEL_FALLBACK)
+                log.info("Modelo Gemini resuelto automáticamente: %s", self.model)
 
             contents = []
             for m in messages:

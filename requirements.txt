@@ -14,7 +14,8 @@ kokoro-onnx>=0.6.0,<1
 # Cerebros LLM y Multimodal
 google-genai>=2.0.0,<3
 anthropic>=1.0.0,<2
-requests>=2.31.0,<3
+httpx>=0.28.0,<1
+ddgs>=9.0.0,<10
 
 # Herramientas del Sistema y Pantalla
 psutil>=6.0.0,<7

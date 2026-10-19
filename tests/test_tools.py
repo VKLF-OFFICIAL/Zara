@@ -319,3 +319,27 @@ def test_file_manager_allows_work_inside_home(tmp_path, monkeypatch):
     assert file_manager("write", str(home / "notas.txt"), content="ok")["success"] is True
     assert file_manager("delete", str(home))["blocked"] is True
     assert file_manager("write", str(home / ".ssh" / "id_x"), content="x")["blocked"] is True
+
+
+def test_confirmation_flow(monkeypatch):
+    import core.tools as tools_mod
+    from core.confirm import parse_confirmation
+
+    assert parse_confirmation("Sí, adelante") is True
+    assert parse_confirmation("no, cancela") is False
+    assert parse_confirmation("sí... no") is False  # ante la duda, no se ejecuta
+    assert parse_confirmation("qué tiempo hace") is None
+
+    asked = []
+    tools_mod.set_confirmation_handler(lambda d: asked.append(d) or False)
+    try:
+        res = tools_mod.execute_tool("run_shell", {"command": "sudo apt install nmap"})
+        assert res["blocked"] is True and asked
+        tools_mod.set_confirmation_handler(lambda d: True)
+        assert tools_mod.execute_tool("run_shell", {"command": "echo hola"})["success"] is True
+        asked.clear()
+        tools_mod.set_confirmation_handler(lambda d: asked.append(d) or True)
+        tools_mod.execute_tool("run_shell", {"command": "echo hola"})
+        assert not asked  # un comando inocuo no pide confirmación
+    finally:
+        tools_mod.set_confirmation_handler(None)

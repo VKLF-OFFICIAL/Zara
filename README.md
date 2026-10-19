@@ -58,6 +58,7 @@
 - **ZaraRouter (< 10 ms):** Conmutación ultrarrápida entre Claude (modelo configurable con `ANTHROPIC_MODEL`) / Claude Code, Gemini 2.5 Flash y Ollama (`qwen2.5-coder:7b`). Fallback automático ante caídas de red.
 - **Filosofía YOLO Seguro:** Cero interrupciones para comandos diagnósticos, lectura/edición de ficheros, inspección de red o gestión de procesos.
 - **Guardarraíl Estricto:** Bloqueo de operaciones catastróficas irreversibles en `run_shell` (`rm -rf /`, `rm -rf ~`, `mkfs`, `Format-Volume`, `dd if=`, `shutdown`/`reboot`, escritura en `/etc/fstab`...) y, en `file_manager`, bloqueo de `write`/`append`/`edit`/`delete` sobre rutas protegidas (`/etc`, `/boot`, `/usr`, `~/.ssh`, `~/.gnupg`, `.git`, el propio HOME...). Las listas viven en `config.py` (`FORBIDDEN_COMMANDS_REGEX`, `PROTECTED_TREES`, `PROTECTED_EXACT`). No es un sandbox: es una red de seguridad contra errores del modelo.
+- **Confirmación hablada:** las acciones sensibles (borrar, `sudo`, instalar paquetes, matar procesos, `git push`, cerrar apps, `invoke_claude_code`...) piden un «sí/no» al Señor VK antes de ejecutarse (hablado, escrito en el panel o, en modo Live, por voz). Sin respuesta en 25 s se cancelan. Los patrones están en `CONFIRM_COMMANDS_REGEX` (`config.py`).
 
 ### Interfaz Holográfica (`ui/hud.py`)
 - HUD transparente frameless en **PySide6** con reactividad a 60 FPS:
@@ -110,6 +111,7 @@ No necesitas tocar `OLLAMA_MODEL` en `.env`: si lo dejas vacío (por defecto), Z
 ### Paso 3 — Claves de API (opcionales)
 Edita `.env`:
 - `GEMINI_API_KEY`: para visión de pantalla (`inspect_screen`) y búsqueda web con Gemini 2.5 Flash.
+- `GEMINI_MODEL` / `ZARA_GEMINI_LIVE_MODEL`: por defecto `auto` (Zara consulta la API y elige el Flash estable más reciente; evita que se rompa cuando Google retira modelos). Puedes fijar un ID concreto.
 - `ANTHROPIC_API_KEY`: para tareas de código/seguridad con Claude. Sin esta clave, si tienes el CLI `claude` instalado y en el `PATH`, Zara lo usa automáticamente como alternativa.
 
 Sin ninguna de las dos, Zara funciona igual de bien **100% offline** con `ZARA_DEFAULT_BRAIN="ollama"`.

@@ -266,12 +266,12 @@ def test_ollama_provider_caching_and_tool_injection(monkeypatch):
             self._data_lines = data_lines
             self.text = ""
 
-        def iter_lines(self, decode_unicode=False):
+        def read(self):
+            return b""
+
+        def iter_lines(self):
             for l in self._data_lines:
-                if decode_unicode and isinstance(l, bytes):
-                    yield l.decode("utf-8")
-                else:
-                    yield l
+                yield l.decode("utf-8") if isinstance(l, bytes) else l
 
         def __enter__(self):
             return self
@@ -282,15 +282,15 @@ def test_ollama_provider_caching_and_tool_injection(monkeypatch):
         def close(self):
             pass
 
-    def fake_post(url, json=None, **kwargs):
-        recorded_payloads.append(json)
+    def fake_post(url, payload):
+        recorded_payloads.append(payload)
         # Si incluye "tools", falla con 400 como hacen los modelos locales sin template
-        if "tools" in json:
+        if "tools" in payload:
             return FakeResponse(400, [])
         return FakeResponse(200, [b'{"message": {"role": "assistant", "content": "{\\"tool\\": \\"run_shell\\", \\"command\\": \\"dir\\"}"}}'])
 
-    import requests
-    monkeypatch.setattr(requests, "post", fake_post)
+    import core.brain as brain_mod
+    monkeypatch.setattr(brain_mod, "_http_post_stream", fake_post)
 
     messages = [{"role": "user", "content": "lista archivos"}]
     events = list(provider.stream_chat(messages, tools=TOOL_DEFINITIONS))

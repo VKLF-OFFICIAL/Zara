@@ -32,10 +32,11 @@ import sounddevice as sd
 from config import (
     GEMINI_API_KEY,
     GEMINI_LIVE_MODEL,
+    GEMINI_LIVE_MODEL_FALLBACK,
     GEMINI_LIVE_VOICE,
-    GEMINI_MODEL,
     get_system_prompt,
 )
+from core.gemini_models import resolve_gemini_model
 from core.tools import TOOL_DEFINITIONS, execute_tool
 
 log = logging.getLogger("zara.live")
@@ -47,10 +48,9 @@ LIVE_CHUNK_DURATION_MS = 100     # Tamaño de cada chunk enviado (100 ms)
 LIVE_INPUT_CHUNK_SAMPLES = int(LIVE_INPUT_SAMPLE_RATE * LIVE_CHUNK_DURATION_MS / 1000)
 
 # Modelo por defecto para sesiones Live (debe soportar la API Live)
+# (gemini-2.0-flash-live-001 y gemini-live-2.5-flash-preview se retiraron en dic-2025)
 LIVE_MODEL_CANDIDATES = [
-    "gemini-2.5-flash-preview-native-audio-dialog",
-    "gemini-2.0-flash-live-001",
-    "gemini-2.0-flash-exp",
+    "gemini-2.5-flash-native-audio-preview-12-2025",
 ]
 
 # Voces disponibles en Gemini Live (español: Aoede y Fenrir suenan bien)
@@ -222,7 +222,7 @@ class GeminiLiveSession:
         )
 
         # Determinar modelo Live
-        model_id = self._resolve_live_model()
+        model_id = await asyncio.to_thread(self._resolve_live_model)
 
         while self._running:
             try:
@@ -539,9 +539,8 @@ class GeminiLiveSession:
 
     def _resolve_live_model(self) -> str:
         """Determina el modelo a usar para la sesión Live."""
-        if self.model:
-            return self.model
-        configured = GEMINI_MODEL
-        if configured and any(kw in configured.lower() for kw in ("live", "flash", "exp")):
-            return configured
-        return LIVE_MODEL_CANDIDATES[0]
+        resolved = resolve_gemini_model(
+            self._api_key, self.model, live=True,
+            fallback=GEMINI_LIVE_MODEL_FALLBACK or LIVE_MODEL_CANDIDATES[0],
+        )
+        return resolved or LIVE_MODEL_CANDIDATES[0]

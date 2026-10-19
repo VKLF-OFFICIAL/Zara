@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import psutil
 
 from config import (
+    CONFIRM_COMMANDS_REGEX,
     FORBIDDEN_COMMANDS_REGEX,
     PROTECTED_EXACT,
     PROTECTED_TREES,
@@ -33,6 +34,36 @@ def is_command_forbidden(cmd: str) -> Optional[str]:
     for pattern in FORBIDDEN_COMMANDS_REGEX:
         if re.search(pattern, cmd, re.IGNORECASE):
             return pattern
+    return None
+
+
+# --- Confirmación de acciones sensibles ---------------------------------------
+# El micrófono está siempre abierto: cualquier voz que diga «Zara» (TV, otra persona)
+# podría disparar herramientas. Las acciones destructivas o de alto impacto piden un
+# «sí» explícito al Señor VK. El manejador lo registra la capa de UI/voz (main.py);
+# sin manejador (tests, uso como librería) no se pide confirmación.
+_confirm_handler: Optional[Callable[[str], bool]] = None
+
+
+def set_confirmation_handler(handler: Optional[Callable[[str], bool]]) -> None:
+    """Registra la función que pregunta al usuario (descripción -> ¿confirmado?)."""
+    global _confirm_handler
+    _confirm_handler = handler
+
+
+def needs_confirmation(name: str, args: Dict[str, Any]) -> Optional[str]:
+    """Devuelve una descripción hablable si la llamada requiere confirmación, o None."""
+    if name == "run_shell":
+        cmd = str(args.get("command", ""))
+        for pattern in CONFIRM_COMMANDS_REGEX:
+            if re.search(pattern, cmd, re.IGNORECASE):
+                return f"ejecutar el comando {cmd[:80]}"
+    elif name == "file_manager" and str(args.get("action", "")).lower() == "delete":
+        return f"eliminar {args.get('path', '')}"
+    elif name == "os_control" and str(args.get("action", "")).lower() == "close_app":
+        return f"cerrar la aplicación {args.get('target', '')}"
+    elif name == "invoke_claude_code":
+        return "delegar una tarea de programación en Claude Code con permisos completos"
     return None
 
 
@@ -807,68 +838,29 @@ def invoke_claude_code(project_path: str, instruction: str) -> Dict[str, Any]:
 # =============================================================================
 
 def web_search(query: str, max_results: int = 5) -> Dict[str, Any]:
-    """Busca en la web en tiempo real para obtener información actualizada."""
-    import html
-    import json as _json
-    import urllib.parse
-    import urllib.request
-
+    """Busca en la web en tiempo real para obtener información actualizada (paquete `ddgs`)."""
     q = query.strip()
     if not q:
         return {"success": False, "error": "Consulta de búsqueda vacía."}
+    try:
+        max_results = max(1, min(int(max_results), 10))
+    except (TypeError, ValueError):
+        max_results = 5
 
     log.info("Buscando en la web: '%s'", q)
     try:
-        url = f"https://html.duckduckgo.com/html/?q={urllib.parse.quote_plus(q)}"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-        }
-        req = urllib.request.Request(url, headers=headers)
-        with urllib.request.urlopen(req, timeout=8.0) as resp:
-            raw = resp.read().decode("utf-8", errors="replace")
+        from ddgs import DDGS
 
-        raw = html.unescape(raw)
-        results = []
-        snippets = re.findall(r'class="result__snippet[^"]*"[^>]*>(.*?)</a>', raw, re.DOTALL)
-        titles = re.findall(r'class="result__a"[^>]*href="([^"]*)"[^>]*>(.*?)</a>', raw, re.DOTALL)
-
-        clean_tag = re.compile(r"<[^>]+>")
-        for idx, snip in enumerate(snippets[:max_results]):
-            snippet_text = clean_tag.sub("", snip).strip()
-            title_text = ""
-            link = ""
-            if idx < len(titles):
-                link = titles[idx][0]
-                if "uddg=" in link:
-                    link = urllib.parse.unquote(urllib.parse.parse_qs(urllib.parse.urlparse(link).query).get("uddg", [link])[0])
-                title_text = clean_tag.sub("", titles[idx][1]).strip()
-            results.append({
-                "title": title_text or f"Resultado {idx+1}",
-                "snippet": snippet_text,
-                "url": link,
-            })
-
-        if not results:
-            api_url = f"https://api.duckduckgo.com/?q={urllib.parse.quote_plus(q)}&format=json&no_html=1&skip_disambig=1"
-            req_api = urllib.request.Request(api_url, headers=headers)
-            with urllib.request.urlopen(req_api, timeout=5.0) as resp:
-                data = _json.loads(resp.read().decode("utf-8", errors="replace"))
-                answer = data.get("AbstractText") or data.get("Answer")
-                if answer:
-                    results.append({
-                        "title": data.get("Heading", "Respuesta"),
-                        "snippet": answer,
-                        "url": data.get("AbstractURL", ""),
-                    })
-
-        return {
-            "success": True,
-            "query": q,
-            "results_count": len(results),
-            "results": results,
-        }
+        raw = DDGS(timeout=8).text(q, region="es-es", max_results=max_results) or []
+        results = [
+            {
+                "title": r.get("title", "") or f"Resultado {i + 1}",
+                "snippet": r.get("body", ""),
+                "url": r.get("href", ""),
+            }
+            for i, r in enumerate(raw)
+        ]
+        return {"success": True, "query": q, "results_count": len(results), "results": results}
     except Exception as exc:
         log.warning("Fallo en web_search ('%s'): %s", q, exc)
         return {
@@ -1022,6 +1014,21 @@ def _get_action_alias_map() -> Dict[str, Tuple[str, str]]:
 
 def execute_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
     """Enrutador de ejecución de herramientas."""
+    if _confirm_handler is not None:
+        description = needs_confirmation(name, args)
+        if description:
+            try:
+                confirmed = bool(_confirm_handler(description))
+            except Exception as exc:  # ante la duda, no ejecutar
+                log.warning("Fallo pidiendo confirmación: %s", exc)
+                confirmed = False
+            if not confirmed:
+                log.info("Acción no confirmada, cancelada: %s %s", name, description)
+                return {
+                    "success": False,
+                    "blocked": True,
+                    "error": f"Acción cancelada: el Señor VK no confirmó {description}.",
+                }
     name = name.strip()
     # [FIX] Hallazgo de Gemini: si un proveedor nativo (Gemini/Claude) alucina
     # una llamada sin parámetros, `args`/`input` puede llegar como None en vez

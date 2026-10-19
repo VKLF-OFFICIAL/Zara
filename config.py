@@ -133,8 +133,12 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "")
 
 # Gemini API & Live
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_LIVE_MODEL = os.environ.get("ZARA_GEMINI_LIVE_MODEL", "gemini-2.5-flash-native-audio-preview-12-2025")
+# "auto" = descubrir con models.list() el Flash estable más reciente (core/gemini_models.py).
+# Los *_FALLBACK se usan solo si la API no responde al listar.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "auto")
+GEMINI_MODEL_FALLBACK = "gemini-2.5-flash"
+GEMINI_LIVE_MODEL = os.environ.get("ZARA_GEMINI_LIVE_MODEL", "auto")
+GEMINI_LIVE_MODEL_FALLBACK = "gemini-2.5-flash-native-audio-preview-12-2025"
 GEMINI_LIVE_VOICE = os.environ.get("ZARA_GEMINI_LIVE_VOICE", "Aoede")
 
 # Anthropic API
@@ -196,6 +200,16 @@ FORBIDDEN_COMMANDS_REGEX = [
     r"\bStop-Computer\b|\bRestart-Computer\b",
     r"(>|\btee\b|\bmv\b|\bcp\b).*?/etc/(fstab|passwd|shadow|sudoers)\b",
     r"(>|\bof=)\s*/dev/(sd|nvme|vd|hd)\w+",
+]
+
+# Comandos que NO se bloquean pero piden confirmación hablada (si hay manejador registrado).
+CONFIRM_COMMANDS_REGEX = [
+    r"\bsudo\b", r"(^|[;&|]\s*)su\b", r"\brm\b", r"\brmdir\b", r"\bRemove-Item\b", r"\bdel\s",
+    r"\bkill(all)?\b", r"\bpkill\b", r"\bStop-Process\b", r"\btaskkill\b",
+    r"\b(pip3?|npm|apt|apt-get|dnf|yum|pacman|winget|choco)\s+(install|remove|uninstall|upgrade)\b",
+    r"\bsystemctl\b", r"\bchmod\b\s+-R", r"\bchown\b", r"\bgit\s+(push|reset\s+--hard|clean)\b",
+    r"\b(curl|wget)\b.*(\|\s*(ba)?sh|-o\b|-O\b)", r"\bInvoke-Expression\b|\biex\b",
+    r"\bSet-ExecutionPolicy\b", r"\breg\s+(add|delete)\b", r"\bpasswd\b", r"\.ssh/|id_rsa|id_ed25519",
 ]
 
 # Rutas que las herramientas de ficheros nunca pueden modificar ni borrar.

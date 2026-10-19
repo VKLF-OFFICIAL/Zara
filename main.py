@@ -9,6 +9,7 @@ táctico desplegable).
 from __future__ import annotations
 import argparse
 import logging
+import queue
 import signal
 import sys
 import threading
@@ -17,9 +18,11 @@ from typing import Optional
 from PySide6 import QtCore, QtGui, QtWidgets
 
 import config
+from core.confirm import parse_confirmation
 from core.brain import ZaraBrain, list_ollama_models, _pick_default_ollama_model
 from core.ear import ContinuousEar, contains_wake_word
 from core.live import GeminiLiveSession
+from core.tools import set_confirmation_handler
 from core.voice import VoiceSynthesizer
 from ui.hud import HUDState, ZaraHUD
 
@@ -29,6 +32,8 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger("zara.main")
+
+CONFIRM_TIMEOUT_S = 25.0  # sin respuesta clara en este tiempo, la acción se cancela
 
 
 class ZaraController(QtCore.QObject):
@@ -49,6 +54,9 @@ class ZaraController(QtCore.QObject):
         self._is_busy = False
         self._busy_lock = threading.Lock()
         self._preferred_provider = config.DEFAULT_BRAIN
+        # Confirmación hablada de acciones sensibles (ver core.tools.needs_confirmation)
+        self._confirm_queue: Optional[queue.Queue] = None
+        self._confirm_lock = threading.Lock()
 
         # 1. Motor de Voz (TTS) con Sentence Chunking y Barge-in
         self.voice = VoiceSynthesizer(on_state_change=self._on_voice_state_change)
@@ -81,6 +89,8 @@ class ZaraController(QtCore.QObject):
             self.hud = ZaraHUD()
             self._connect_signals()
 
+        set_confirmation_handler(self._ask_confirmation)
+
         # Hilo de escucha en bucle
         self._worker_thread = threading.Thread(target=self._voice_loop_worker, daemon=True)
 
@@ -100,8 +110,51 @@ class ZaraController(QtCore.QObject):
         self.hud.quit_requested.connect(self._on_quit_requested)
         self.hud.text_command_submitted.connect(self._on_text_command)
 
+    def _ask_confirmation(self, description: str) -> bool:
+        """Pide al Señor VK un sí/no hablado (o escrito) antes de una acción sensible.
+
+        Se ejecuta en el hilo del agente; bloquea hasta la respuesta, el timeout
+        o un cierre. La frase evita las palabras «sí/no» para que el eco del
+        propio altavoz no se interprete como respuesta.
+        """
+        with self._confirm_lock:
+            answers: queue.Queue = queue.Queue(maxsize=1)
+            self._confirm_queue = answers
+            try:
+                log.info("Pidiendo confirmación: %s", description)
+                if self.hud:
+                    self.hud.panel.log_line("CONFIRMAR", f"¿{description}?")
+                self.voice.say(f"Señor VK, necesito su confirmación para {description}.")
+                try:
+                    return bool(answers.get(timeout=CONFIRM_TIMEOUT_S))
+                except queue.Empty:
+                    self.voice.say("Sin confirmación. Acción cancelada.")
+                    return False
+            finally:
+                self._confirm_queue = None
+
+    def _route_confirmation(self, text: str) -> bool:
+        """Si hay una confirmación pendiente, consume `text` como respuesta.
+
+        Devuelve True si había una pendiente (la frase no debe procesarse como orden nueva).
+        """
+        answers = self._confirm_queue
+        if answers is None:
+            return False
+        verdict = parse_confirmation(text)
+        if verdict is not None:
+            try:
+                answers.put_nowait(verdict)
+            except queue.Full:
+                pass
+        return True
+
     def _on_live_transcript_in(self, text: str) -> None:
         clean = text.strip()
+        # Los tool-calls de Live se ejecutan sin palabra de activación: la respuesta a una
+        # confirmación llega por aquí. Se ignora lo que se transcribe mientras Zara habla (eco).
+        if clean and not self.voice.is_speaking():
+            self._route_confirmation(clean)
         if clean:
             log.info("[LIVE USER] %s", clean)
             self.sig_user_speech.emit(clean)
@@ -146,7 +199,7 @@ class ZaraController(QtCore.QObject):
             self.hud.set_brain(self._preferred_provider)
             self.hud.set_model_selection("ollama", self.brain.ollama.model)
             self.hud.set_model_selection("claude", self.brain.claude.cli_model_override)
-            self.hud.set_model_selection("gemini", config.GEMINI_MODEL)
+            self.hud.set_model_selection("gemini", self.brain.gemini.model)
             self.hud.set_model_selection("gemini_live", config.GEMINI_LIVE_MODEL)
             threading.Thread(target=self._load_ollama_models, daemon=True).start()
 
@@ -181,6 +234,9 @@ class ZaraController(QtCore.QObject):
         if self.live_session.is_running():
             self.live_session.interrupt()
         self.voice.stop()
+        if self._confirm_queue is not None:
+            # Hablar mientras Zara pide confirmación es contestarle, no cancelar el turno.
+            return
         # [FIX AUDITORÍA] Detener AUDIO y cancelar el turno del cerebro
         self.brain.cancel_current_turn()
         self.sig_hud_state.emit(HUDState.IDLE if self.ear.is_muted() else HUDState.LISTENING)
@@ -276,6 +332,8 @@ class ZaraController(QtCore.QObject):
         text = text.strip()
         if not text:
             return
+        if self._route_confirmation(text):
+            return
         if self._is_busy:
             self.voice.say("Un momento, Señor VK, estoy procesando otra orden.")
             return
@@ -311,6 +369,10 @@ class ZaraController(QtCore.QObject):
             # se dirigiera a Zara en absoluto. Las órdenes escritas en el
             # panel táctico (_on_text_command) NO pasan por aquí: teclear ya
             # es una acción deliberada y no está sujeta a ruido ambiente.
+            # Respuesta a una confirmación pendiente: no exige «Zara» ni inicia otro turno.
+            if self._route_confirmation(clean_text):
+                continue
+
             if not contains_wake_word(clean_text):
                 log.debug("Locución ignorada (sin mencionar a Zara): '%s'", clean_text)
                 continue
