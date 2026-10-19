@@ -146,6 +146,8 @@ class ZaraController(QtCore.QObject):
             self.hud.set_brain(self._preferred_provider)
             self.hud.set_model_selection("ollama", self.brain.ollama.model)
             self.hud.set_model_selection("claude", self.brain.claude.cli_model_override)
+            self.hud.set_model_selection("gemini", config.GEMINI_MODEL)
+            self.hud.set_model_selection("gemini_live", config.GEMINI_LIVE_MODEL)
             threading.Thread(target=self._load_ollama_models, daemon=True).start()
 
         # Saludo inicial táctico

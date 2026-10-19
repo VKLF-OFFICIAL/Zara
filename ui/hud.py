@@ -133,47 +133,50 @@ QComboBox {{
     color: #E5EDF7;
     border: 1px solid #30445F;
     border-radius: 8px;
-    padding: 7px 8px;
+    padding: 7px 28px 7px 10px;
     font-family: {_FONT_UI};
     font-size: 12px;
-    min-width: 140px;
+}}
+QComboBox:hover {{
+    border: 1px solid #4B6382;
 }}
 QComboBox:focus {{ border: 1px solid #2EF2E6; }}
+QComboBox:disabled {{
+    background-color: #0B111C;
+    color: #556B88;
+    border: 1px solid #1E293B;
+}}
 QComboBox::drop-down {{
-    border: none;
-    width: 20px;
+    subcontrol-origin: padding;
+    subcontrol-position: top right;
+    width: 24px;
+    border-left: none;
 }}
 QComboBox::down-arrow {{
     image: none;
     border-left: 4px solid transparent;
     border-right: 4px solid transparent;
     border-top: 5px solid #2EF2E6;
-    margin-right: 6px;
+    margin-right: 8px;
 }}
 QComboBox QAbstractItemView {{
-    background-color: #101725;
+    background-color: #0E1624;
     color: #E5EDF7;
     border: 1px solid #30445F;
-    border-radius: 8px;
-    selection-background-color: rgba(46, 242, 230, 35);
+    selection-background-color: rgba(46, 242, 230, 45);
     selection-color: #FFFFFF;
     font-family: {_FONT_UI};
     font-size: 12px;
     outline: none;
-    padding: 4px;
+    padding: 2px 0px;
 }}
 QComboBox QAbstractItemView::item {{
     min-height: 26px;
     padding: 4px 8px;
-    border-radius: 6px;
-}}
-QComboBox QAbstractItemView::item:hover {{
-    background-color: rgba(46, 242, 230, 25);
-    color: #FFFFFF;
 }}
 QComboBox QAbstractItemView::item:selected {{
     background-color: rgba(46, 242, 230, 50);
-    color: #FFFFFF;
+    color: #2EF2E6;
 }}
 QScrollBar:vertical {{
     background: #0B111C;
@@ -312,6 +315,31 @@ def build_icon(draw_fn, color: QtGui.QColor, px: int = 40) -> QtGui.QIcon:
     return QtGui.QIcon(pm)
 
 
+class TacticalComboBox(QtWidgets.QComboBox):
+    """ComboBox táctico adaptado a paneles holográficos flotantes.
+
+    1. Ignora la rueda de ratón (wheelEvent) cuando está cerrado para evitar cambios
+       accidentales de modelo/cerebro al hacer scroll sobre el chat o la consola.
+    2. Fuerza elidado central (ElideMiddle) y desactiva el scroll horizontal en el popup.
+    3. Asegura altura y espaciado táctil/clickeable adecuado.
+    """
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        self.setFocusPolicy(QtCore.Qt.StrongFocus)
+        self.setMaxVisibleItems(10)
+        view = self.view()
+        view.setTextElideMode(QtCore.Qt.ElideMiddle)
+        view.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
+        view.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+
+    def wheelEvent(self, event: QtGui.QWheelEvent) -> None:  # noqa: N802
+        if not self.view().isVisible():
+            event.ignore()
+        else:
+            super().wheelEvent(event)
+
+
 class ZaraPanel(QtWidgets.QWidget):
     """Panel táctico desplegable: consola de eventos, entrada de texto y controles rápidos."""
 
@@ -367,6 +395,8 @@ class ZaraPanel(QtWidgets.QWidget):
         bg = QtWidgets.QFrame(self)
         bg.setObjectName("bg")
         bg.setStyleSheet(_PANEL_STYLE)
+        self.setStyleSheet(_PANEL_STYLE)
+
         # [DISEÑO] Sombra suave para dar profundidad ("glassmorphism" ligero)
         # sin abusar de efectos: un único halo moderado, no uno por widget.
         shadow = QtWidgets.QGraphicsDropShadowEffect(bg)
@@ -380,7 +410,7 @@ class ZaraPanel(QtWidgets.QWidget):
         layout.setContentsMargins(12, 10, 12, 10)
         layout.setSpacing(8)
 
-        # Cabecera
+        # 1. Cabecera (Título y botón cerrar)
         header = QtWidgets.QHBoxLayout()
         title = QtWidgets.QLabel("ZARA // PANEL TÁCTICO")
         title.setObjectName("title")
@@ -394,19 +424,55 @@ class ZaraPanel(QtWidgets.QWidget):
         header.addWidget(close_btn)
         layout.addLayout(header)
 
-        # Estado
+        # 2. Estado
         self.status_lbl = QtWidgets.QLabel("ESTADO: EN ESPERA // MIC ACTIVO")
         self.status_lbl.setObjectName("status")
         layout.addWidget(self.status_lbl)
 
-        # Consola de eventos
+        # 3. Selectores de IA en la parte superior (alineados en cuadrícula para
+        # que ambos desplegables tengan idéntico ancho y se abran hacia abajo
+        # sobre el área amplia de la consola, sin desbordar la pantalla).
+        selectors_grid = QtWidgets.QGridLayout()
+        selectors_grid.setContentsMargins(0, 0, 0, 0)
+        selectors_grid.setHorizontalSpacing(8)
+        selectors_grid.setVerticalSpacing(6)
+
+        brain_lbl = QtWidgets.QLabel("Cerebro:")
+        self.brain_combo = TacticalComboBox()
+        for label, value in self._BRAIN_OPTIONS:
+            self.brain_combo.addItem(label, value)
+        self.brain_combo.currentIndexChanged.connect(self._on_provider_changed)
+        self.brain_combo.activated.connect(self._on_provider_changed)
+        selectors_grid.addWidget(brain_lbl, 0, 0)
+        selectors_grid.addWidget(self.brain_combo, 0, 1)
+
+        self.model_lbl = QtWidgets.QLabel("Modelo:")
+        self.model_combo = TacticalComboBox()
+        self.model_combo.currentIndexChanged.connect(self._on_model_changed)
+        self.model_combo.activated.connect(self._on_model_changed)
+        selectors_grid.addWidget(self.model_lbl, 1, 0)
+        selectors_grid.addWidget(self.model_combo, 1, 1)
+
+        layout.addLayout(selectors_grid)
+
+        # 4. Buscador / filtro rápido de modelos locales (aparece para Ollama)
+        self.model_search_input = QtWidgets.QLineEdit()
+        self.model_search_input.setPlaceholderText("🔍 Filtrar modelos locales (ej: qwen, deepseek)...")
+        self.model_search_input.textChanged.connect(self._on_model_filter_changed)
+        self.model_search_input.returnPressed.connect(self._on_model_filter_return_pressed)
+        self.model_search_input.hide()
+        layout.addWidget(self.model_search_input)
+
+        self._refresh_model_options()
+
+        # 5. Consola de eventos y chat (área principal en el centro)
         self.console = QtWidgets.QPlainTextEdit()
         self.console.setObjectName("console")
         self.console.setReadOnly(True)
         self.console.setMaximumBlockCount(300)
         layout.addWidget(self.console, stretch=1)
 
-        # Entrada de texto manual
+        # 6. Entrada de texto manual (justo debajo del chat)
         input_row = QtWidgets.QHBoxLayout()
         self.input_box = QtWidgets.QLineEdit()
         self.input_box.setPlaceholderText("Escribe una orden para Zara...")
@@ -418,42 +484,7 @@ class ZaraPanel(QtWidgets.QWidget):
         input_row.addWidget(send_btn)
         layout.addLayout(input_row)
 
-        # Selector de cerebro (proveedor)
-        brain_row = QtWidgets.QHBoxLayout()
-        brain_row.addWidget(QtWidgets.QLabel("Cerebro:"))
-        self.brain_combo = QtWidgets.QComboBox()
-        for label, value in self._BRAIN_OPTIONS:
-            self.brain_combo.addItem(label, value)
-        self.brain_combo.currentIndexChanged.connect(self._on_provider_changed)
-        brain_row.addWidget(self.brain_combo, stretch=1)
-        layout.addLayout(brain_row)
-
-        # Selector de modelo (depende del proveedor elegido arriba)
-        model_row = QtWidgets.QHBoxLayout()
-        self.model_lbl = QtWidgets.QLabel("Modelo:")
-        model_row.addWidget(self.model_lbl)
-        self.model_combo = QtWidgets.QComboBox()
-        self.model_combo.setFocusPolicy(QtCore.Qt.WheelFocus)
-        self.model_combo.view().setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
-        self.model_combo.view().setAutoScroll(True)
-        self.model_combo.view().setMinimumWidth(380)
-        self.model_combo.currentIndexChanged.connect(self._on_model_changed)
-        self.model_combo.activated.connect(self._on_model_changed)
-        model_row.addWidget(self.model_combo, stretch=1)
-        layout.addLayout(model_row)
-
-        # Buscador / filtro rápido de modelos locales (aparece para Ollama)
-        self.model_search_input = QtWidgets.QLineEdit()
-        self.model_search_input.setPlaceholderText("🔍 Filtrar modelos locales (ej: qwen, deepseek)...")
-        self.model_search_input.textChanged.connect(self._on_model_filter_changed)
-        self.model_search_input.returnPressed.connect(self._on_model_filter_return_pressed)
-        self.model_search_input.hide()
-        layout.addWidget(self.model_search_input)
-
-        self._refresh_model_options()
-
-        # [DISEÑO] Botones rápidos como iconos circulares vectoriales (nada de
-        # emojis): el texto descriptivo pasa a tooltip, por accesibilidad.
+        # 7. Botones rápidos como iconos circulares vectoriales (tooltip descriptivo)
         btn_row = QtWidgets.QHBoxLayout()
         btn_row.setSpacing(10)
         btn_row.addStretch()
@@ -501,12 +532,20 @@ class ZaraPanel(QtWidgets.QWidget):
         return self.brain_combo.currentData() or "auto"
 
     def _on_provider_changed(self, _idx: int) -> None:
-        self.brain_changed.emit(self._current_provider())
+        provider = self._current_provider()
+        self.brain_changed.emit(provider)
         # Limpiar filtro al cambiar proveedor
         self.model_search_input.blockSignals(True)
         self.model_search_input.clear()
         self.model_search_input.blockSignals(False)
         self._refresh_model_options()
+
+        # Sincronizar de inmediato el modelo activo del nuevo proveedor con el backend
+        current_model = self.model_combo.currentData()
+        if current_model is not None and self.model_combo.isEnabled():
+            if self._desired_model.get(provider) != current_model:
+                self._desired_model[provider] = current_model
+                self.model_changed.emit(provider, current_model)
 
     def _on_model_filter_changed(self, _text: str) -> None:
         self._refresh_model_options()
@@ -514,19 +553,27 @@ class ZaraPanel(QtWidgets.QWidget):
     def _on_model_filter_return_pressed(self) -> None:
         """Al pulsar Enter en el buscador de modelos, activa de inmediato el primer modelo filtrado."""
         if self.model_combo.count() > 0 and self.model_combo.isEnabled():
-            self.model_combo.setCurrentIndex(0)
-            self._on_model_changed(0)
-            display_name = self.model_combo.currentText()
-            self.log_line("SISTEMA", f"Modelo activado: {display_name}")
-            self.input_box.setFocus()
+            model = self.model_combo.itemData(0)
+            if model is not None:
+                provider = self._current_provider()
+                self.model_combo.setCurrentIndex(0)
+                if self._desired_model.get(provider) != model:
+                    self._desired_model[provider] = model
+                    self.model_changed.emit(provider, model)
+                display_name = self.model_combo.currentText()
+                self.log_line("SISTEMA", f"Modelo activado: {display_name}")
+                self.input_box.setFocus()
 
     def _on_model_changed(self, idx: int) -> None:
         if idx < 0:
             return
         model = self.model_combo.itemData(idx)
-        if model is None or model == "":
+        if model is None:
             return
         provider = self._current_provider()
+        # Evitar re-emisiones idénticas duplicadas (disparadas a la vez por currentIndexChanged y activated)
+        if self._desired_model.get(provider) == model:
+            return
         self._desired_model[provider] = model
         self.model_changed.emit(provider, model)
 

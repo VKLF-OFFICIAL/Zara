@@ -925,7 +925,7 @@ class ZaraBrain:
         # Herramientas solo disponibles si NO es modo conversacional puro
         tools_to_pass = None if is_chat_only else TOOL_DEFINITIONS
 
-        if provider_name == "gemini" and self.gemini.is_available():
+        if provider_name in ("gemini", "gemini_live") and self.gemini.is_available():
             # [FIX] Antes no se pasaban las herramientas a Gemini: nunca podía
             # ejecutar acciones reales sobre el sistema, solo responder en texto.
             yield from self.gemini.stream_chat(

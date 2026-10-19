@@ -140,3 +140,64 @@ def test_model_selection_activation_and_return_pressed(qapp):
     assert emitted[0] == ("ollama", "huihui_ai/qwen2.5-coder-abliterate:14b-instruct")
     assert panel._desired_model.get("ollama") == "huihui_ai/qwen2.5-coder-abliterate:14b-instruct"
 
+
+def test_tactical_combobox_wheel_protection(qapp):
+    from ui.hud import TacticalComboBox
+    from PySide6 import QtGui
+
+    combo = TacticalComboBox()
+    combo.addItems(["Opción 1", "Opción 2", "Opción 3"])
+    combo.setCurrentIndex(0)
+
+    # Evento de rueda de ratón con popup cerrado: debe ignorarse
+    wheel_ev = QtGui.QWheelEvent(
+        QtCore.QPointF(10, 10),
+        QtCore.QPointF(10, 10),
+        QtCore.QPoint(0, 120),
+        QtCore.QPoint(0, 120),
+        QtCore.Qt.NoButton,
+        QtCore.Qt.NoModifier,
+        QtCore.Qt.ScrollUpdate,
+        False,
+    )
+    combo.wheelEvent(wheel_ev)
+    assert not wheel_ev.isAccepted()
+    assert combo.currentIndex() == 0
+
+
+def test_dropdown_sync_and_duplicate_suppression(qapp):
+    from ui.hud import ZaraPanel
+
+    panel = ZaraPanel()
+    panel.set_ollama_models(["m1", "m2"], current="m1")
+
+    brain_emitted = []
+    model_emitted = []
+    panel.brain_changed.connect(lambda p: brain_emitted.append(p))
+    panel.model_changed.connect(lambda p, m: model_emitted.append((p, m)))
+
+    # 1. Cambiar a Claude debe emitir brain_changed y sincronizar el modelo de Claude
+    panel.brain_combo.setCurrentIndex(3)  # Claude
+    panel.brain_combo.activated.emit(3)
+
+    assert "claude" in brain_emitted
+    assert any(p == "claude" for p, _ in model_emitted)
+
+    # 2. Seleccionar "sonnet" y luego "Por defecto" ("") en Claude debe funcionar
+    model_emitted.clear()
+    panel.model_combo.setCurrentIndex(1)  # Sonnet
+    panel.model_combo.activated.emit(1)
+    assert ("claude", "sonnet") in model_emitted
+
+    model_emitted.clear()
+    panel.model_combo.setCurrentIndex(0)  # Por defecto ("")
+    panel.model_combo.activated.emit(0)
+    assert ("claude", "") in model_emitted
+
+    # 3. Disparos repetidos con el mismo modelo no deben duplicar eventos
+    model_emitted.clear()
+    panel.model_combo.activated.emit(0)
+    panel._on_model_changed(0)
+    assert len(model_emitted) == 0
+
+
