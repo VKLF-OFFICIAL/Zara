@@ -27,6 +27,8 @@ import logging
 import re
 import os
 import shutil
+import signal
+import sys
 from pathlib import Path
 import subprocess
 import tempfile
@@ -54,12 +56,14 @@ from config import (
     SYSTEM_PROMPT,
     get_system_prompt,
 )
+from core.workspace import describe_user_folders
 from core.tools import TOOL_DEFINITIONS, cli_safe_arg, execute_tool, format_tools_for_local_prompt
 
 log = logging.getLogger("zara.brain")
 
 # Ventana deslizante máxima del historial de conversación
 _MAX_HISTORY_MESSAGES = 40
+_MAX_OBSERVATION_CHARS = 12000  # por herramienta y paso, en el historial
 
 
 # Cliente HTTP compartido (reutiliza conexiones). La carga en frío de un modelo grande
@@ -149,16 +153,19 @@ def _extract_embedded_tool_calls(
     if not text or not text.strip():
         return calls
 
-    recognized = set(known_tool_names)
+    recognized = {n for n in known_tool_names if isinstance(n, str)}
     for t in tool_definitions or []:
         props = (t.get("parameters", {}) or {}).get("properties", {}) or {}
         for schema in props.values():
-            recognized.update(schema.get("enum") or [])
+            if isinstance(schema, dict):
+                recognized.update(v for v in (schema.get("enum") or []) if isinstance(v, str))
 
     seen = set()
 
     def _maybe_add(name: Any, arguments: Any) -> None:
-        if not name or name not in recognized:
+        # Un JSON de ejemplo como {"name": {"first": "Ana"}} traía un dict como nombre y
+        # `name not in recognized` lanzaba TypeError (unhashable), tumbando el turno entero.
+        if not isinstance(name, str) or name not in recognized:
             return
         if not isinstance(arguments, dict):
             arguments = {}
@@ -171,11 +178,21 @@ def _extract_embedded_tool_calls(
     def _parse_and_add_obj(obj: Any) -> None:
         if not isinstance(obj, dict):
             return
-        name = obj.get("name") or obj.get("tool") or obj.get("function") or obj.get("herramienta")
-        args = obj.get("arguments") or obj.get("args") or obj.get("parameters") or obj.get("argumentos")
+        fn = obj.get("function")
+        if isinstance(fn, dict):
+            # Formato OpenAI (Qwen/Hermes): {"type": "function", "function": {"name": ..., "arguments": "..."}}
+            name, args = fn.get("name"), fn.get("arguments")
+        else:
+            name = obj.get("name") or obj.get("tool") or fn or obj.get("herramienta")
+            args = obj.get("arguments") or obj.get("args") or obj.get("parameters") or obj.get("argumentos")
+        if isinstance(args, str):
+            try:
+                args = json.loads(args)
+            except Exception:
+                args = {}
 
         # Si el modelo no especificó 'name', pero puso 'action' que coincide con un enum reconocido:
-        if not name and "action" in obj and obj["action"] in recognized:
+        if not name and isinstance(obj.get("action"), str) and obj["action"] in recognized:
             name = obj["action"]
             args = {k: v for k, v in obj.items() if k != "action"}
 
@@ -200,10 +217,208 @@ def _extract_embedded_tool_calls(
             continue
         _parse_and_add_obj(obj)
 
+    # Los tags ya procesados se quitan antes de buscar JSON suelto: si no, el JSON del
+    # atributo `arguments` de <function .../> se leía otra vez como segunda llamada
+    # (os_control + open_app) y la aplicación se abría dos veces.
+    text = _TOOL_CALL_TAG_RE.sub(" ", _FUNCTION_TAG_RE.sub(" ", text))
     for obj in _iter_json_objects(text):
         _parse_and_add_obj(obj)
 
     return calls
+
+
+# Inicio de una llamada a herramienta escrita como texto: lo que venga detrás no se lee en voz alta.
+# [FIX CER-12] Cualquier objeto JSON, no solo los que empiezan por "name"/"tool"/...: el
+# extractor también acepta {"arguments": ..., "name": ...} o {"action": "open_app", ...} (y
+# las claves aplanadas en cualquier orden). Si al final no era una llamada, rest() lo devuelve
+# y se lee igual, solo que al terminar la respuesta.
+_TOOL_MARKUP_RE = re.compile(r'\{\s*"[^"\\\n]{1,24}"\s*:|<tool_call|<function\b')
+
+
+class _ToolMarkupGate:
+    """Filtro del texto que va al TTS en los proveedores que escriben las llamadas como texto.
+
+    Deja pasar la respuesta normal y retiene todo a partir del primer marcador de llamada a
+    herramienta («Claro, abro el bloc de notas. {"name": ...}»). Antes ese JSON se leía en voz
+    alta y además se ejecutaba. Un posible marcador a medias al final del trozo se retiene
+    hasta el siguiente trozo.
+    """
+
+    _HOLD = 32  # caracteres que se retienen tras un '{' o '<' hasta saber si es un marcador
+
+    def __init__(self) -> None:
+        self.text = ""
+        self.emitted = 0
+        self.blocked = False
+
+    def feed(self, chunk: str) -> str:
+        self.text += chunk
+        if self.blocked:
+            return ""
+        m = _TOOL_MARKUP_RE.search(self.text, self.emitted)
+        if m:
+            self.blocked = True
+            return self._take(m.start())
+        safe = len(self.text)
+        tail = max(self.text.rfind("{", self.emitted), self.text.rfind("<", self.emitted))
+        if tail != -1 and len(self.text) - tail < self._HOLD:
+            safe = tail
+        return self._take(safe)
+
+    def rest(self) -> str:
+        """Lo retenido, cuando al final resulta que no había ninguna llamada que ejecutar."""
+        return self._take(len(self.text))
+
+    def _take(self, end: int) -> str:
+        out = self.text[self.emitted:end]
+        self.emitted = max(self.emitted, end)
+        return out
+
+
+def _final_text_events(
+    parsed_calls: List[Dict[str, Any]],
+    full: str,
+    streamed: Optional[bool],
+    gate: _ToolMarkupGate,
+) -> Generator[Dict[str, Any], None, None]:
+    """Cierre común de los proveedores de texto: llamadas extraídas o el texto pendiente."""
+    if parsed_calls:
+        for pc in parsed_calls:
+            yield {"type": "tool_call", "name": pc.get("name", ""), "args": pc.get("arguments") or pc.get("args") or {}}
+    elif streamed is False:
+        rest = gate.rest()  # no había llamada: lo retenido era texto normal
+        if rest:
+            yield {"type": "token", "token": rest}
+    elif full.strip():
+        yield {"type": "token", "token": full}
+
+
+def _kill_process_tree(proc: subprocess.Popen) -> None:
+    """Mata el CLI y sus hijos.
+
+    En Windows los CLI de npm (claude, agy) son shims `.cmd`: matar solo cmd.exe deja vivo el
+    node.exe hijo con la tubería abierta y la lectura de stdout seguiría bloqueada.
+    """
+    try:
+        if sys.platform == "win32":
+            subprocess.run(
+                ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, timeout=10,
+            )
+        else:
+            os.killpg(proc.pid, signal.SIGKILL)  # el CLI arranca en su propio grupo
+    except Exception:
+        pass
+    try:
+        proc.kill()
+    except Exception:
+        pass
+
+
+def _run_cli_stream(
+    cmd: List[str],
+    cwd: Path,
+    tools: Optional[List[Dict[str, Any]]],
+    timeout: float,
+    label: str,
+    error_hint: Optional[Callable[[str], str]] = None,
+    stdin_text: Optional[str] = None,
+) -> Generator[Dict[str, Any], None, None]:
+    """Ejecuta un CLI headless (agy, claude) y convierte su salida en eventos.
+
+    - `stdin_text`: el prompt va por la entrada estándar en vez de en la línea de comandos
+      (shims `.cmd` de Windows, que cmd.exe corta a 8191 caracteres).
+
+    - Watchdog: si el CLI se cuelga (red, sesión caducada) se mata a los `timeout` segundos;
+      sin él, `for line in proc.stdout` bloqueaba el turno (y el barge-in) sin límite.
+    - Código de salida distinto de 0 sin salida: evento de error con el final de stderr, para
+      que el bucle ReAct active el respaldo en lugar de quedarse mudo.
+    - Las llamadas a herramienta escritas como texto se extraen y no se leen en voz alta.
+    """
+    known_tool_names = {t.get("name") for t in (tools or [])}
+    cwd.mkdir(parents=True, exist_ok=True)
+    full = ""
+    is_tool_stream: Optional[bool] = None
+    gate = _ToolMarkupGate()
+    timed_out = threading.Event()
+    with tempfile.TemporaryFile() as err:
+        try:
+            proc = subprocess.Popen(
+                cmd,
+                cwd=str(cwd),
+                stdout=subprocess.PIPE,
+                stderr=err,  # a fichero: un PIPE sin leer podría bloquear el proceso
+                stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                start_new_session=(sys.platform != "win32"),  # grupo propio: se mata con sus hijos
+            )
+        except Exception as exc:
+            yield {"type": "error", "error": f"No se pudo lanzar {label}: {exc}"}
+            return
+
+        def _expire() -> None:
+            timed_out.set()
+            _kill_process_tree(proc)
+
+        watchdog = threading.Timer(timeout, _expire)
+        watchdog.daemon = True
+        watchdog.start()
+        if stdin_text is not None:
+            # En un hilo: si el CLI escribe antes de leerlo todo, escribir aquí bloquearía
+            # con las dos tuberías llenas.
+            def _feed_stdin() -> None:
+                try:
+                    proc.stdin.write(stdin_text)
+                    proc.stdin.close()
+                except Exception:
+                    pass  # el CLI terminó o se mató antes de leer: lo informa su salida
+
+            threading.Thread(target=_feed_stdin, daemon=True).start()
+        try:
+            for line in proc.stdout:
+                full += line
+                out = ""
+                if is_tool_stream is None:
+                    stripped = full.strip()
+                    if stripped.startswith(("{", "```", "<")):
+                        is_tool_stream = True
+                    elif len(stripped) >= 15:
+                        is_tool_stream = False
+                        out = gate.feed(full)
+                elif not is_tool_stream:
+                    out = gate.feed(line)
+                if out:
+                    yield {"type": "token", "token": out}
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                _kill_process_tree(proc)
+                proc.wait()
+        finally:
+            watchdog.cancel()
+            # También si el generador se cierra por barge-in: no dejar procesos huérfanos.
+            if proc.poll() is None:
+                _kill_process_tree(proc)
+                proc.wait()
+
+        if not full.strip() and (proc.returncode != 0 or timed_out.is_set()):
+            err.seek(0)
+            detail = err.read().decode("utf-8", errors="replace").strip()[-400:]
+            if timed_out.is_set():
+                msg = f"{label} no respondió en {int(timeout)} s y se ha detenido."
+            else:
+                msg = f"{label} falló (código {proc.returncode}): {detail}"
+            if error_hint:
+                msg += error_hint(detail)
+            yield {"type": "error", "error": msg}
+            return
+        if timed_out.is_set():
+            log.warning("%s se detuvo por tiempo (%d s) con la respuesta a medias.", label, int(timeout))
+
+    parsed = _extract_embedded_tool_calls(full, known_tool_names, tools) if tools else []
+    yield from _final_text_events(parsed, full, is_tool_stream, gate)
 
 
 def _extract_embedded_tool_call(
@@ -281,6 +496,29 @@ def find_agy() -> Optional[str]:
     return None
 
 
+# [FIX CER-14] Un `.cmd`/`.bat` (los CLI instalados con npm en Windows) se ejecuta a través
+# de cmd.exe, que corta la línea entera a 8191 caracteres, no a los 32767 de CreateProcess.
+_CMD_EXE_LINE_LIMIT = 8191
+
+
+def _runs_through_cmd_exe(executable: str) -> bool:
+    return sys.platform == "win32" and Path(executable).suffix.lower() in (".cmd", ".bat")
+
+
+def _fit_cmd_exe_line(build: Callable[[int], List[str]], limit: int) -> List[str]:
+    """Construye la orden con `build(max_chars)` reduciendo el prompt hasta que la línea que
+    verá cmd.exe (comillas escapadas y la ruta de node que añade el shim incluidas) quepa."""
+    budget = limit
+    margin = 600  # «"C:\Program Files\nodejs\node.exe" "...\cli.js"» que añade el shim
+    for _ in range(8):
+        cmd = build(budget)
+        overflow = len(subprocess.list2cmdline(cmd)) - (limit - margin)
+        if overflow <= 0:
+            return cmd
+        budget = max(budget - overflow - 64, 500)
+    return cmd
+
+
 _FALLBACK_NEXT = {
     "gemini": "antigravity",
     "gemini_live": "antigravity",
@@ -326,18 +564,45 @@ class ZaraRouter:
         "busca en la web", "noticias", "tiempo que hace", "clima", "resumen web"
     }
 
+    # Palabra de activación y muletillas al principio («Oye Zara, ...», «Hola Zara, ...») y
+    # «Zara» al final («Gracias, Zara»): no dicen nada sobre si la orden necesita herramientas.
+    # [FIX CER-6] También los saludos de varias palabras («buenos días», «buenas tardes»,
+    # «qué tal», «cómo estás») y antes o después de «Zara»: «Buenas tardes Zara, investiga…»
+    # se juzga por «investiga…», no por el saludo.
+    _GREETING = (
+        r"(?:hola|hey|oye|ey|buen[oa]s(?:\s+(?:d[ií]as|tardes|noches))?"
+        r"|qu[ée]\s+tal|c[óo]mo\s+est[áa]s|c[óo]mo\s+te\s+va)\b[\W_]*"
+    )
+    _WAKE_PREFIX_RE = re.compile(rf"^(?:{_GREETING})*(?:zara\b[\W_]*)?(?:{_GREETING})*")
+    # Únicos patrones de cortesía que admiten continuación («qué hora es en Tokio»): el
+    # resto exige igualdad, para que «de nada, investiga…» o «cuándo es el partido» no se
+    # traten como charla y pierdan la orden.
+    _CONTINUABLE_PATTERNS = ("qué hora es", "que hora es", "qué día es", "que dia es", "qué fecha", "que fecha")
+    _WAKE_SUFFIX_RE = re.compile(r"[\W_]*\bzara$")
+
     @staticmethod
     def is_conversational(query: str) -> bool:
         """Devuelve True si la consulta es puramente conversacional/trivial."""
-        low = query.lower().strip().rstrip("?.!")
+        low = query.lower().strip().strip("¿¡?.!,;: ")
+        # [FIX] La palabra de activación es obligatoria y main.py pasa el texto con «Zara»:
+        # como «zara» era un patrón de cortesía, toda orden «Zara, haz...» se trataba como
+        # charla (1 paso y sin herramientas).
+        low = ZaraRouter._WAKE_PREFIX_RE.sub("", low, count=1)
+        low = ZaraRouter._WAKE_SUFFIX_RE.sub("", low).strip("¿¡?.!,;: ")
+        if not low:
+            return True  # «Zara», «Hola Zara», «Oye Zara»
 
         # Si contiene cualquier término de acción o control del sistema, NO es conversacional.
         words = set(re.findall(r"\w+", low))
         if any(w in words for w in ZaraRouter.SYSTEM_COMMAND_KEYWORDS):
             return False
+        # Pantalla y web («qué ves», «noticias», «clima») también necesitan herramientas.
+        if any(k in low for k in ZaraRouter.GEMINI_KEYWORDS):
+            return False
 
-        # Coincidencia con patrones de cortesía y conversación general
-        if any(low == pat or low.startswith(pat) for pat in ZaraRouter.CONVERSATIONAL_PATTERNS):
+        # Coincidencia con patrones de cortesía: exigen igualdad («hola»), salvo la hora y la
+        # fecha, que admiten continuación («qué hora es en Tokio»).
+        if low in ZaraRouter.CONVERSATIONAL_PATTERNS or low.startswith(ZaraRouter._CONTINUABLE_PATTERNS):
             return True
 
         return len(words) <= 2 and not any(k in low for k in ZaraRouter.SYSTEM_COMMAND_KEYWORDS)
@@ -359,7 +624,9 @@ class ZaraRouter:
                 return "antigravity"
 
         if any(w in low for w in ZaraRouter.CLAUDE_KEYWORDS):
-            if ANTHROPIC_API_KEY or shutil.which("claude"):
+            # El CLI 'claude' es más lento y no tiene herramientas nativas: solo se prefiere
+            # por palabra clave si no hay Gemini (API o agy) disponible.
+            if ANTHROPIC_API_KEY or (shutil.which("claude") and not GEMINI_API_KEY and not agy_available):
                 return "claude"
 
         # Orden por defecto: APIs (más rápidas) → suscripción Gemini vía agy → Claude CLI → local.
@@ -483,7 +750,7 @@ class OllamaProvider:
         full_content = ""
         native_tool_call_found = False
         is_tool_call_stream = None
-        tokens_yielded = False
+        gate = _ToolMarkupGate()
 
         try:
             resp = _post(use_native_tools)
@@ -535,16 +802,19 @@ class OllamaProvider:
                             # Si no se detectó tool-call nativo, comprobar si es conversación normal para streaming de voz
                             if not native_tool_call_found:
                                 stripped = full_content.strip()
+                                out = ""
                                 if is_tool_call_stream is None:
                                     if stripped.startswith(("{", "```", "<")):
                                         is_tool_call_stream = True
                                     elif len(stripped) >= 15:
                                         is_tool_call_stream = False
-                                        tokens_yielded = True
-                                        yield {"type": "token", "token": full_content}
+                                        out = gate.feed(full_content)
                                 elif not is_tool_call_stream:
-                                    tokens_yielded = True
-                                    yield {"type": "token", "token": chunk}
+                                    # [FIX] «Claro, abro el bloc de notas. {"name": ...}»: el JSON
+                                    # ya no se manda al TTS (antes se leía y además se ejecutaba).
+                                    out = gate.feed(chunk)
+                                if out:
+                                    yield {"type": "token", "token": out}
                     except Exception:
                         pass
         except Exception as exc:
@@ -554,17 +824,10 @@ class OllamaProvider:
         if native_tool_call_found:
             return
 
-        # [FIX] Extraer llamadas embebidas soportando aliases, sintaxis aplanada y tags
-        parsed_calls = _extract_embedded_tool_calls(full_content, known_tool_names, tools)
-        if parsed_calls:
-            for pc in parsed_calls:
-                yield {
-                    "type": "tool_call",
-                    "name": pc.get("name", ""),
-                    "args": pc.get("arguments") or pc.get("args") or {},
-                }
-        elif full_content and not tokens_yielded:
-            yield {"type": "token", "token": full_content}
+        # [FIX] Extraer llamadas embebidas soportando aliases, sintaxis aplanada y tags.
+        # Solo con herramientas: en modo charla un JSON en la respuesta es solo texto.
+        parsed_calls = _extract_embedded_tool_calls(full_content, known_tool_names, tools) if tools else []
+        yield from _final_text_events(parsed_calls, full_content, is_tool_call_stream, gate)
 
 
 # =============================================================================
@@ -680,8 +943,20 @@ class GeminiProvider:
 # PROVEEDOR 3: CLAUDE (Anthropic API / Claude Code CLI)
 # =============================================================================
 
+def _short_error(text: Optional[str], limit: int = 300) -> str:
+    detail = (text or "").strip()
+    return detail[:limit].rstrip() + "..." if len(detail) > limit else detail
+
+
+def _claude_cli_hint(detail: str) -> str:
+    low = detail.lower()
+    if any(k in low for k in ("login", "log in", "auth", "api key", "credential")):
+        return " Abra una terminal y ejecute «claude» una vez para iniciar sesión."
+    return ""
+
+
 class ClaudeProvider:
-    """Proveedor de alto nivel con Claude 3.7 Sonnet / Claude Code CLI."""
+    """Proveedor de alto nivel con Claude (Anthropic API) / Claude Code CLI."""
 
     CLI_MODEL_ALIASES = ["sonnet", "opus", "haiku", "fable"]
 
@@ -689,6 +964,7 @@ class ClaudeProvider:
         self.api_key = api_key
         self.model = model
         self.cli_model_override: str = CLAUDE_MODEL_OVERRIDE
+        self._workdir = DATA_DIR / "claude-workspace"
         self._client = None
         if self.api_key:
             self._init_client()
@@ -733,14 +1009,17 @@ class ClaudeProvider:
                     if m["role"] in ("user", "assistant"):
                         formatted_msgs.append({"role": m["role"], "content": m["content"]})
 
-                with self._client.messages.stream(
-                    model=self.model,
-                    max_tokens=2048,
-                    system=effective_prompt,
-                    messages=formatted_msgs,
-                    tools=anthropic_tools if anthropic_tools else None,
-                    temperature=0.2,
-                ) as stream:
+                # [FIX] El SDK anthropic 1.x no acepta `temperature` en messages.stream (TypeError
+                # antes de enviar nada) y `tools=None` se serializaba como "tools": null.
+                stream_kwargs: Dict[str, Any] = {
+                    "model": self.model,
+                    "max_tokens": 2048,
+                    "system": effective_prompt,
+                    "messages": formatted_msgs,
+                }
+                if anthropic_tools:
+                    stream_kwargs["tools"] = anthropic_tools
+                with self._client.messages.stream(**stream_kwargs) as stream:
                     # [BUG-10 FIX] El evento de streaming de Anthropic SDK es
                     # `RawTextDeltaEvent` con `.delta.text`, no `.text` directamente.
                     # Usar la iteración por texto plano vía `stream.text_stream`.
@@ -768,33 +1047,29 @@ class ClaudeProvider:
 
         claude_bin = shutil.which("claude")
         if claude_bin:
-            try:
-                user_msg = messages[-1]["content"] if messages else ""
-                full_prompt = f"{effective_prompt}\n\nPetición del Señor VK:\n{user_msg}"
+            # [FIX] Antes el CLI solo recibía messages[-1]: sin historial ni herramientas (nunca
+            # podía actuar) y, en el paso 2, solo la observación sin la petición original.
+            full_prompt = AntigravityProvider.build_prompt(messages, tools, effective_prompt)
+            stdin_text: Optional[str] = None
+            if _runs_through_cmd_exe(claude_bin):
+                # [FIX CER-14] claude.cmd (npm) pasa por cmd.exe, que corta a 8191 caracteres:
+                # `claude -p` sin prompt lo lee de la entrada estándar, entero y sin aplanar.
+                cmd = [claude_bin, "-p", "--setting-sources", "project"]
+                stdin_text = full_prompt
+            else:
                 cmd = [claude_bin, "-p", cli_safe_arg(claude_bin, full_prompt), "--setting-sources", "project"]
-                if self.cli_model_override:
-                    cmd += ["--model", self.cli_model_override]
-                proc = subprocess.Popen(
-                    cmd,
-                    stdout=subprocess.PIPE,
-                    stderr=subprocess.DEVNULL,  # PIPE sin leer puede bloquear el proceso
-                    stdin=subprocess.DEVNULL,
-                    text=True,
-                    errors="replace",
-                )
-                try:
-                    for line in proc.stdout:
-                        yield {"type": "token", "token": line}
-                    proc.wait(timeout=30)
-                finally:
-                    # También si el generador se cierra por barge-in: no dejar el CLI huérfano.
-                    if proc.poll() is None:
-                        proc.kill()
-                        proc.wait()
-                return
-            except Exception as exc2:
-                yield {"type": "error", "error": f"Fallo en Claude CLI: {exc2}"}
-                return
+            if self.cli_model_override:
+                cmd += ["--model", self.cli_model_override]
+            yield from _run_cli_stream(
+                cmd,
+                cwd=self._workdir,  # carpeta vacía: el CLI no debe leer el repositorio de Zara
+                tools=tools,
+                timeout=AGY_TIMEOUT,
+                label="Claude CLI",
+                error_hint=_claude_cli_hint,
+                stdin_text=stdin_text,
+            )
+            return
 
         yield {"type": "error", "error": "No hay credenciales de Claude ni binario instalado."}
 
@@ -838,8 +1113,10 @@ class AntigravityProvider:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]],
         system_prompt: str,
+        max_chars: Optional[int] = None,
     ) -> str:
         """Un único prompt de texto: instrucciones + herramientas + historial reciente."""
+        max_chars = max_chars or cls.MAX_PROMPT_CHARS
         parts = [system_prompt.strip()]
         parts.append(
             "MODO DE TRABAJO: eres el cerebro de Zara, un asistente de voz. NO uses tus propias "
@@ -859,11 +1136,13 @@ class AntigravityProvider:
         parts.append("CONVERSACIÓN:\n" + "\n".join(history))
         parts.append("Responde ahora como Zara al último mensaje.")
         prompt = "\n\n".join(parts)
-        if len(prompt) > cls.MAX_PROMPT_CHARS:
+        if len(prompt) > max_chars:
             # Se recorta por el principio del historial: lo último es lo que importa.
             head = "\n\n".join(parts[:3]) if tools else "\n\n".join(parts[:2])
-            tail = prompt[-(cls.MAX_PROMPT_CHARS - len(head) - 10):]
-            prompt = head + "\n\n[...]\n" + tail
+            keep = max_chars - len(head) - 10
+            if keep <= 0:  # ni las instrucciones caben: prompt[-0:] devolvería el prompt entero
+                return prompt[-max_chars:]
+            prompt = head + "\n\n[...]\n" + prompt[-keep:]
         return prompt
 
     def stream_chat(
@@ -877,72 +1156,32 @@ class AntigravityProvider:
             yield {"type": "error", "error": "Antigravity CLI (agy) no está instalado o no está en el PATH."}
             return
 
-        prompt = self.build_prompt(messages, tools, system_prompt or SYSTEM_PROMPT)
-        cmd = [agy, "-p", cli_safe_arg(agy, prompt)]
-        if self.model:
-            cmd += ["--model", self.model]
-        self._workdir.mkdir(parents=True, exist_ok=True)
-        known_tool_names = {t.get("name") for t in (tools or [])}
+        def build(max_chars: Optional[int] = None) -> List[str]:
+            prompt = self.build_prompt(messages, tools, system_prompt or SYSTEM_PROMPT, max_chars)
+            cmd = [agy, "-p", cli_safe_arg(agy, prompt)]
+            if self.model:
+                cmd += ["--model", self.model]
+            return cmd
 
-        full = ""
-        is_tool_stream: Optional[bool] = None
-        tokens_yielded = False
-        with tempfile.TemporaryFile() as err:
-            try:
-                proc = subprocess.Popen(
-                    cmd,
-                    cwd=str(self._workdir),
-                    stdout=subprocess.PIPE,
-                    stderr=err,  # a fichero: un PIPE sin leer podría bloquear el proceso
-                    stdin=subprocess.DEVNULL,
-                    text=True,
-                    encoding="utf-8",
-                    errors="replace",
-                )
-            except Exception as exc:
-                yield {"type": "error", "error": f"No se pudo lanzar Antigravity CLI: {exc}"}
-                return
-            watchdog = threading.Timer(AGY_TIMEOUT, proc.kill)
-            watchdog.start()
-            try:
-                for line in proc.stdout:
-                    full += line
-                    stripped = full.strip()
-                    if is_tool_stream is None:
-                        if stripped.startswith(("{", "```", "<")):
-                            is_tool_stream = True
-                        elif len(stripped) >= 15:
-                            is_tool_stream = False
-                            tokens_yielded = True
-                            yield {"type": "token", "token": full}
-                    elif not is_tool_stream:
-                        tokens_yielded = True
-                        yield {"type": "token", "token": line}
-                proc.wait(timeout=10)
-            finally:
-                watchdog.cancel()
-                # También si el generador se cierra por barge-in: no dejar procesos huérfanos.
-                if proc.poll() is None:
-                    proc.kill()
-                    proc.wait()
+        # [FIX CER-14] Un agy.cmd pasaría por cmd.exe (8191 caracteres): recortar a lo que cabe.
+        cmd = _fit_cmd_exe_line(build, _CMD_EXE_LINE_LIMIT) if _runs_through_cmd_exe(agy) else build()
+        yield from _run_cli_stream(
+            cmd,
+            cwd=self._workdir,
+            tools=tools,
+            timeout=AGY_TIMEOUT,
+            label="Antigravity CLI",
+            error_hint=_agy_hint,
+        )
 
-            if proc.returncode != 0 and not full.strip():
-                err.seek(0)
-                detail = err.read().decode("utf-8", errors="replace").strip()[-400:]
-                hint = ""
-                if any(k in detail.lower() for k in ("auth", "login", "sign in", "credential")):
-                    hint = " Abra una terminal y ejecute «agy» una vez para iniciar sesión con su cuenta de Google."
-                elif any(k in detail.lower() for k in ("quota", "eligible", "rate limit", "1002")):
-                    hint = " Su cuenta no tiene cuota de Antigravity ahora mismo (límite o cuenta no elegible)."
-                yield {"type": "error", "error": f"Antigravity CLI falló (código {proc.returncode}): {detail}{hint}"}
-                return
 
-        parsed = _extract_embedded_tool_calls(full, known_tool_names, tools) if tools else []
-        if parsed:
-            for pc in parsed:
-                yield {"type": "tool_call", "name": pc.get("name", ""), "args": pc.get("arguments") or pc.get("args") or {}}
-        elif full.strip() and not tokens_yielded:
-            yield {"type": "token", "token": full}
+def _agy_hint(detail: str) -> str:
+    low = detail.lower()
+    if any(k in low for k in ("auth", "login", "sign in", "credential")):
+        return " Abra una terminal y ejecute «agy» una vez para iniciar sesión con su cuenta de Google."
+    if any(k in low for k in ("quota", "eligible", "rate limit", "1002")):
+        return " Su cuenta no tiene cuota de Antigravity ahora mismo (límite o cuenta no elegible)."
+    return ""
 
 
 # =============================================================================
@@ -981,13 +1220,35 @@ class ZaraBrain:
                 pass
 
     def _trim_history(self) -> None:
-        """[BUG-12 FIX] Mantiene el historial dentro de la ventana máxima."""
+        """[BUG-12 FIX] Mantiene el historial dentro de la ventana máxima.
+
+        La petición del turno en curso (self._task_message) nunca se pierde: en tareas de
+        muchos pasos, el recorte la expulsaba y el modelo olvidaba qué le habían pedido.
+        """
+        task = getattr(self, "_task_message", None)
         if len(self.history) > _MAX_HISTORY_MESSAGES:
             self.history = self.history[-_MAX_HISTORY_MESSAGES:]
+            if task is not None and not any(m is task for m in self.history):
+                while self.history and self.history[0].get("role") == "user":
+                    self.history.pop(0)  # tras la tarea fijada debe venir un turno del asistente
+                self.history.insert(0, task)
         # Anthropic y Gemini exigen que la conversación empiece con un mensaje de
         # usuario: el recorte puede dejar un "assistant" al principio y provocar HTTP 400.
         while self.history and self.history[0].get("role") != "user":
             self.history.pop(0)
+
+    _CANCELLED_NOTE = "[Turno interrumpido por el Señor VK; petición descartada, no la ejecutes]"
+
+    def _close_cancelled_turn(self) -> None:
+        """Cierra en el historial un turno cancelado por barge-in.
+
+        Sin esto, la petición cancelada quedaba como último mensaje 'user' sin respuesta y el
+        turno siguiente enviaba dos peticiones seguidas: el modelo veía la orden cancelada
+        como pendiente y podía ejecutarla.
+        """
+        if self.history and self.history[-1].get("role") == "user":
+            self.history.append({"role": "assistant", "content": self._CANCELLED_NOTE})
+            self._trim_history()
 
     def run_react_agent(
         self,
@@ -1002,10 +1263,18 @@ class ZaraBrain:
         # turno anterior ya resuelto no debe afectar a este.
         self._cancel_event.clear()
 
-        # Refrescar el system prompt con la fecha/hora real del momento actual.
-        current_system_prompt = get_system_prompt()
+        # Refrescar el system prompt con la fecha/hora real del momento actual y con las
+        # carpetas reales de este equipo (Windows/Linux), para que use rutas correctas.
+        current_system_prompt = (
+            get_system_prompt()
+            + "\nENTORNO: " + describe_user_folders()
+            + "\nARCHIVOS: usa rutas absolutas o que empiecen por Documentos/Escritorio/Descargas. "
+            "Para editar un archivo, léelo antes y sustituye un fragmento exacto; para crear varios "
+            "archivos, escribe cada uno completo con file_manager (write) y comprueba el resultado con tree.\n"
+        )
 
-        self.history.append({"role": "user", "content": user_query})
+        self._task_message = {"role": "user", "content": user_query}
+        self.history.append(self._task_message)
         self._trim_history()
 
         chosen_provider = ZaraRouter.classify(user_query, preferred_provider)
@@ -1037,6 +1306,7 @@ class ZaraBrain:
             # herramientas de un turno que ya no interesa a nadie.
             if self._cancel_event.is_set():
                 log.info("Turno cancelado por barge-in antes del paso %d. Descartando el resto.", step)
+                self._close_cancelled_turn()
                 return
 
             log.info("Bucle ReAct - Paso %d/%d", step, max_steps)
@@ -1052,10 +1322,12 @@ class ZaraBrain:
             full_thought_text = ""
             tool_calls_to_run: List[Dict[str, Any]] = []
             has_error = False
+            last_error: Optional[str] = None
 
             for event in events:
                 if self._cancel_event.is_set():
                     log.info("Turno cancelado por barge-in a mitad de la respuesta. Descartando el resto.")
+                    self._close_cancelled_turn()
                     return
                 if not first_event_logged:
                     first_event_logged = True
@@ -1069,20 +1341,28 @@ class ZaraBrain:
                     tool_calls_to_run.append(event)
                 elif etype == "error":
                     has_error = True
+                    last_error = str(event.get("error") or "") or last_error
                     log.warning("Fallo en proveedor %s: %s", chosen_provider, event.get("error"))
 
             if has_error and not full_thought_text and not tool_calls_to_run:
                 # Cascada: gemini → antigravity → claude → ollama → gemini
+                failed_provider = chosen_provider
+                # [FIX CER-13] El error del cerebro PRINCIPAL lleva la pista útil («ejecute agy
+                # una vez para iniciar sesión»): el del respaldo ya no la sustituye.
+                primary_error = last_error
+                fallback_error: Optional[str] = None
                 chosen_provider = _FALLBACK_NEXT.get(chosen_provider, "gemini")
                 log.info("Activando fallback automático a: %s", chosen_provider)
                 events2 = self._execute_stream_with_fallback(
                     chosen_provider, screen_b64,
                     is_chat_only=is_chat_only,
                     system_prompt=current_system_prompt,
+                    failed_provider=failed_provider,
                 )
                 for event in events2:
                     if self._cancel_event.is_set():
                         log.info("Turno cancelado por barge-in durante el fallback. Descartando el resto.")
+                        self._close_cancelled_turn()
                         return
                     if event.get("type") == "token":
                         t = event.get("token", "")
@@ -1090,6 +1370,21 @@ class ZaraBrain:
                         yield t
                     elif event.get("type") == "tool_call":
                         tool_calls_to_run.append(event)
+                    elif event.get("type") == "error":
+                        # [FIX] Antes se ignoraba: turno mudo y se perdían pistas como
+                        # «ejecute agy una vez para iniciar sesión».
+                        fallback_error = str(event.get("error") or "") or fallback_error
+                        log.warning("Fallo también en el respaldo %s: %s", chosen_provider, event.get("error"))
+
+                if not tool_calls_to_run and not full_thought_text:
+                    detail = _short_error(primary_error or fallback_error)
+                    if primary_error and fallback_error:
+                        detail += f" Tampoco respondió el respaldo: {_short_error(fallback_error, 160)}"
+                    msg = f"No he podido obtener respuesta, Señor VK. {detail}".strip()
+                    self.history.append({"role": "assistant", "content": msg})
+                    self._trim_history()
+                    yield msg
+                    break
 
             if not tool_calls_to_run:
                 if full_thought_text:
@@ -1099,6 +1394,7 @@ class ZaraBrain:
 
             if self._cancel_event.is_set():
                 log.info("Turno cancelado por barge-in justo antes de ejecutar herramientas. Abortando.")
+                self._close_cancelled_turn()
                 return
 
             current_signature = tuple(sorted(
@@ -1155,10 +1451,30 @@ class ZaraBrain:
                 log.info("Agente ejecutando: %s(%s)", name, json.dumps(args)[:80])
                 result = execute_tool(name, args)
 
+                if name == "inspect_screen" and isinstance(result, dict) and result.get("base64_data"):
+                    # [FIX] El JPEG en base64 (cientos de KB) llenaba el historial y rompía el
+                    # contexto de los turnos siguientes. Se adjunta como imagen al siguiente paso
+                    # (la observación es el último mensaje 'user', donde Gemini la añade).
+                    result = dict(result)
+                    screen_b64 = result.pop("base64_data")
+                    # [FIX CER-7] Solo GeminiProvider adjunta screen_b64: a agy, Claude u Ollama
+                    # no les llega la imagen y no deben inventarse lo que «ven».
+                    if chosen_provider in ("gemini", "gemini_live") and self.gemini.is_available():
+                        result["imagen"] = "captura adjunta a este mensaje como imagen (no como texto)"
+                    else:
+                        result["imagen"] = (
+                            "captura hecha, pero este cerebro no puede ver imágenes (solo Gemini con "
+                            "GEMINI_API_KEY): no describas la pantalla; dile al Señor VK que no puedes verla"
+                        )
+
                 if name == "run_shell" and not result.get("success"):
                     log.info("Comando falló (código %s). Enviando stderr para autocorrección.", result.get("exit_code"))
 
-                observations.append(f"Resultado de {name}: {json.dumps(result, ensure_ascii=False)}")
+                serialized = json.dumps(result, ensure_ascii=False)
+                if len(serialized) > _MAX_OBSERVATION_CHARS:
+                    # Un archivo grande o una salida larga no debe llenar el contexto del modelo.
+                    serialized = serialized[:_MAX_OBSERVATION_CHARS] + f"... [recortado, {len(serialized)} caracteres en total]"
+                observations.append(f"Resultado de {name}: {serialized}")
                 self._emit_tool_event(name, "Completado.")
 
             last_observations = observations
@@ -1209,8 +1525,13 @@ class ZaraBrain:
         screen_b64: Optional[str] = None,
         is_chat_only: bool = False,
         system_prompt: Optional[str] = None,
+        failed_provider: Optional[str] = None,
     ) -> Generator[Dict[str, Any], None, None]:
-        """Invoca el generador correspondiente según el proveedor."""
+        """Invoca el generador correspondiente según el proveedor.
+
+        `failed_provider` es el cerebro que acaba de fallar en este paso: si el respaldo no está
+        disponible, no se vuelve a llamar a ese mismo cerebro (antes se repetía el mismo Ollama).
+        """
         # Herramientas solo disponibles si NO es modo conversacional puro
         tools_to_pass = None if is_chat_only else TOOL_DEFINITIONS
 
@@ -1234,10 +1555,26 @@ class ZaraBrain:
             )
             return
 
+        if failed_provider == "ollama" and provider_name != "ollama":
+            yield {
+                "type": "error",
+                "error": f"El cerebro de respaldo ({provider_name}) no está disponible y Ollama acaba de fallar.",
+            }
+            return
+
         if self.ollama.is_available():
             yield from self.ollama.stream_chat(
                 self.history, tools=tools_to_pass, system_prompt=system_prompt
             )
+            return
+
+        if failed_provider:
+            # [FIX CER-13] Respaldo sin cerebro disponible: solo un error. El aviso genérico
+            # («compruebe Ollama o una clave de API») tapaba el motivo real del principal.
+            yield {
+                "type": "error",
+                "error": f"El cerebro de respaldo ({provider_name}) no está disponible.",
+            }
             return
 
         # Sin ningún cerebro disponible: NUNCA ejecutar el texto del usuario como

@@ -168,9 +168,11 @@ def test_run_react_agent_stops_on_cancel(monkeypatch):
     tokens = list(brain.run_react_agent("hola, cuenta hasta diez", preferred_provider="ollama"))
 
     assert len(tokens) < 10, "el bucle ReAct no se detuvo tras la cancelación"
-    assert not any(m.get("role") == "assistant" for m in brain.history), (
-        "un turno cancelado no debe dejar una respuesta a medias en el historial"
-    )
+    assert not any(
+        m.get("role") == "assistant" and "tok" in m.get("content", "") for m in brain.history
+    ), "un turno cancelado no debe dejar una respuesta a medias en el historial"
+    # CER-13: el turno queda cerrado con una nota, para que la orden cancelada no parezca pendiente.
+    assert brain.history[-1]["content"] == ZaraBrain._CANCELLED_NOTE
 
 
 def test_react_loop_exhaustion_yields_summary_and_keeps_alternation(monkeypatch):
@@ -391,3 +393,20 @@ def test_system_prompt_date_is_spanish_regardless_of_locale():
     prompt = get_system_prompt()
     assert any(m in prompt for m in ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
                                      "agosto", "septiembre", "octubre", "noviembre", "diciembre"))
+
+
+def test_long_task_keeps_original_request_after_trimming():
+    """En tareas de muchos pasos, el recorte del historial no debe olvidar la petición."""
+    from core.brain import ZaraBrain, _MAX_HISTORY_MESSAGES
+
+    brain = ZaraBrain()
+    task = {"role": "user", "content": "Crea una web en Documentos/mi-web"}
+    brain._task_message = task
+    brain.history = [task]
+    for i in range(_MAX_HISTORY_MESSAGES + 10):
+        brain.history.append({"role": "assistant", "content": f"Ejecutando acción {i}"})
+        brain.history.append({"role": "user", "content": f"[OBSERVACIÓN DEL SISTEMA]: paso {i}"})
+        brain._trim_history()
+    assert brain.history[0] is task
+    assert brain.history[1]["role"] == "assistant"  # la alternancia user/assistant se mantiene
+    assert len(brain.history) <= _MAX_HISTORY_MESSAGES + 1

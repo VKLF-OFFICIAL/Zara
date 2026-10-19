@@ -139,17 +139,14 @@ def test_os_control_network_info():
 
 
 def test_os_control_media_and_desktop_commands():
-    # Play/Pause
-    res_media = os_control("media_play_pause")
-    assert res_media["success"] is True
-
-    # Next track
-    res_next = os_control("media_next")
-    assert res_next["success"] is True
-
-    # Show desktop
-    res_desk = os_control("show_desktop")
-    assert res_desk["success"] is True
+    # En Linux, sin playerctl/wmctrl (o sin reproductor ni sesión gráfica) ya no se finge
+    # éxito: se devuelve success=False con un error que dice qué falta.
+    for action in ("media_play_pause", "media_next", "show_desktop"):
+        res = os_control(action)
+        if sys.platform == "win32":
+            assert res["success"] is True
+        else:
+            assert res["success"] is True or res.get("error"), res
 
 
 def test_action_alias_map_resolves_known_enum_values():

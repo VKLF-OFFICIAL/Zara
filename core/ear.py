@@ -15,6 +15,13 @@ BUGS CORREGIDOS:
     bloques menores y los rellena con ceros (padding) en vez de descartarlos.
   - [BUG-4] listen_utterances() consumía el hilo principal bloqueando el VAD si
     la transcripción era lenta. Ahora se transcribe en el propio hilo del worker.
+  - [MUL-1] La GPU se detecta con ctranslate2.get_cuda_device_count() (la API
+    anterior no existía y tumbaba el arranque en Linux con NVIDIA) y, si CUDA no
+    sirve de verdad (faltan cuBLAS/cuDNN), Whisper pasa a CPU en vez de quedar sordo.
+  - [V1_-5] Sin red y sin el modelo descargado ya no se cae la app: se usa un
+    modelo en caché si lo hay o el oído queda sin STT con un aviso claro.
+  - [AUD-7/V1_-9] El micrófono se reintenta con espera si falta, se desconecta o
+    deja de dar audio, y se captura a su frecuencia nativa si no admite 16 kHz.
 """
 
 from __future__ import annotations
@@ -22,8 +29,10 @@ import collections
 import logging
 import queue
 import re
+import sys
 import threading
 import time
+from pathlib import Path
 from typing import Callable, Generator, Optional
 import numpy as np
 import torch
@@ -49,6 +58,207 @@ from config import (
 )
 
 log = logging.getLogger("zara.ear")
+
+# [FIX AUD-7/V1_-9] Reintentos del micrófono: espera creciente entre intentos y
+# tiempo máximo sin recibir audio antes de dar el dispositivo por perdido.
+_MIC_RETRY_MIN_S = 1.0
+_MIC_RETRY_MAX_S = 10.0
+_MIC_STALL_S = 4.0
+# [FIX AUD-7] Mínimo entre reinicializaciones de PortAudio buscando un micrófono nuevo.
+_PA_REFRESH_INTERVAL_S = 60.0
+
+
+class _AudioBackendError(RuntimeError):
+    """sounddevice/PortAudio no disponibles (el mensaje ya explica cómo resolverlo)."""
+
+
+def _import_sounddevice():
+    """[FIX MUL-2] Importa sounddevice con un error claro en vez de matar el hilo.
+
+    En Linux sin la librería de sistema PortAudio (libportaudio2), `import sounddevice`
+    lanza OSError, no ImportError. Se reintenta en cada intento de abrir el micrófono,
+    así que si el usuario instala PortAudio con Zara abierta, el oído se recupera solo.
+    """
+    try:
+        import sounddevice as sd
+    except OSError as exc:
+        raise _AudioBackendError(
+            f"PortAudio no está instalado ({exc}): Zara no puede usar el micrófono. En Linux: "
+            "sudo apt install libportaudio2 (Debian/Kali/Ubuntu) o sudo dnf install portaudio (Fedora)."
+        ) from exc
+    except ImportError as exc:
+        raise _AudioBackendError(
+            f"Falta el paquete sounddevice ({exc}): ejecute pip install -r requirements.txt."
+        ) from exc
+    return sd
+
+
+def _describe_mic_error(exc: BaseException) -> str:
+    """Mensaje para el log y el panel cuando el micrófono no se puede usar."""
+    if isinstance(exc, _AudioBackendError):
+        return str(exc)
+    if sys.platform == "win32":
+        hint = ("Compruebe que hay un micrófono predeterminado y que en Configuración > Privacidad > "
+                "Micrófono las aplicaciones de escritorio pueden usarlo.")
+    else:
+        hint = ("Compruebe que el micrófono está conectado y sin silenciar, y que PipeWire/PulseAudio "
+                "está activo (pavucontrol).")
+    return f"Micrófono no disponible ({exc}). {hint}"
+
+
+def _pick_input_samplerate(sd) -> int:  # noqa: ANN001
+    """[FIX V1_-9] 16 kHz si el micrófono lo admite; si no, su frecuencia nativa.
+
+    Un dispositivo ALSA «hw» directo (sin PipeWire/Pulse) o algunos USB/Bluetooth no
+    admiten 16 kHz y antes el hilo de captura moría. Si no hay micrófono por defecto,
+    `query_devices` lanza la excepción y la gestiona el bucle de reintentos.
+    """
+    try:
+        sd.check_input_settings(samplerate=SAMPLE_RATE, channels=1, dtype="float32")
+        return SAMPLE_RATE
+    except Exception as exc:
+        info = sd.query_devices(kind="input")
+        native = int(round(float(info.get("default_samplerate") or 0)))
+        if native <= 0 or native == SAMPLE_RATE:
+            raise
+        log.info("El micrófono no admite %d Hz (%s): se captura a %d Hz y se remuestrea.",
+                 SAMPLE_RATE, exc, native)
+        return native
+
+
+class _StreamResampler:
+    """[FIX V1_-9] Remuestreo en streaming de la frecuencia nativa del micrófono a 16 kHz.
+
+    Media móvil como paso bajo sencillo (contra el aliasing al diezmar) e interpolación
+    lineal, conservando el estado entre bloques. Entrega bloques exactos de FRAME_SIZE
+    muestras, que es lo que espera Silero VAD.
+    """
+
+    def __init__(self, src_rate: int, dst_rate: int = SAMPLE_RATE, frame_size: int = FRAME_SIZE):
+        self._step = float(src_rate) / float(dst_rate)  # muestras de entrada por muestra de salida
+        taps = int(self._step) if self._step >= 2.0 else 1
+        self._kernel = np.full(taps, 1.0 / taps, dtype=np.float32)
+        self._fir_hist = np.zeros(taps - 1, dtype=np.float32)
+        self._tail = np.zeros(0, dtype=np.float32)
+        self._pos = 0.0  # posición de la siguiente muestra de salida, relativa a _tail[0]
+        self._pending = np.zeros(0, dtype=np.float32)
+        self._frame_size = frame_size
+
+    def process(self, block: np.ndarray) -> list[np.ndarray]:
+        block = np.asarray(block, dtype=np.float32)
+        if self._kernel.size > 1:
+            ext = np.concatenate([self._fir_hist, block])
+            filtered = np.convolve(ext, self._kernel, mode="valid").astype(np.float32)
+            self._fir_hist = ext[-(self._kernel.size - 1):]
+        else:
+            filtered = block
+        x = np.concatenate([self._tail, filtered])
+        n = x.size
+        next_pos = self._pos
+        if n >= 2 and self._pos <= n - 1:
+            count = int((n - 1 - self._pos) // self._step) + 1
+            positions = self._pos + self._step * np.arange(count)
+            out = np.interp(positions, np.arange(n), x).astype(np.float32)
+            self._pending = np.concatenate([self._pending, out])
+            next_pos = self._pos + self._step * count
+        # Conservar desde la última muestra necesaria para interpolar el siguiente bloque.
+        drop = min(int(next_pos), max(n - 1, 0))
+        self._tail = x[drop:]
+        self._pos = next_pos - drop
+        frames = []
+        while self._pending.size >= self._frame_size:
+            frames.append(self._pending[: self._frame_size].copy())
+            self._pending = self._pending[self._frame_size:]
+        return frames
+
+
+def _drain_queue(q: queue.Queue) -> None:
+    try:
+        while True:
+            q.get_nowait()
+    except queue.Empty:
+        pass
+
+
+def _cuda_runtime_libraries() -> list[str]:
+    """Librerías de CUDA que ctranslate2 carga al transcribir en GPU, según su versión.
+
+    ctranslate2 4.x usa CUDA 12; desde la 4.5, cuDNN 9 (antes, cuDNN 8).
+    [FIX MUL-1] Desde la 4.6.3 la Conv1d de Whisper es CUDA pura y cuDNN es opcional
+    (CHANGELOG de ctranslate2 v4.6.3): exigirlo dejaba en CPU, sin motivo, a quien solo
+    tiene cuBLAS (p. ej. pip install nvidia-cublas-cu12 sin nvidia-cudnn-cu12).
+    """
+    try:
+        import ctranslate2
+        parts = [int(re.match(r"\d*", p).group() or 0) for p in ctranslate2.__version__.split(".")[:3]]
+        major, minor, patch = (parts + [0, 0, 0])[:3]
+    except Exception:
+        major, minor, patch = 4, 5, 0
+    cuda = "12" if major >= 4 else "11"
+    if (major, minor, patch) >= (4, 6, 3):
+        return [f"cublas64_{cuda}.dll"] if sys.platform == "win32" else [f"libcublas.so.{cuda}"]
+    if (major, minor) >= (4, 5):
+        if sys.platform == "win32":
+            return [f"cublas64_{cuda}.dll", "cudnn64_9.dll", "cudnn_ops64_9.dll", "cudnn_cnn64_9.dll"]
+        return [f"libcublas.so.{cuda}", "libcudnn.so.9", "libcudnn_ops.so.9", "libcudnn_cnn.so.9"]
+    if sys.platform == "win32":
+        return [f"cublas64_{cuda}.dll", "cudnn64_8.dll", "cudnn_ops_infer64_8.dll", "cudnn_cnn_infer64_8.dll"]
+    return [f"libcublas.so.{cuda}", "libcudnn.so.8", "libcudnn_ops_infer.so.8", "libcudnn_cnn_infer.so.8"]
+
+
+def _can_load_library(name: str) -> bool:
+    """Indica si el sistema puede cargar la librería dinámica `name`."""
+    import ctypes
+    import ctypes.util
+
+    try:
+        ctypes.CDLL(name)
+        return True
+    except OSError:
+        pass
+    if sys.platform == "win32":
+        # Desde Python 3.8, ctypes no busca en el PATH de Windows, pero ctranslate2.dll sí
+        # (ahí suelen estar CUDA y cuDNN): se localiza a mano y se carga por ruta completa.
+        path = ctypes.util.find_library(name)
+        if path:
+            try:
+                ctypes.CDLL(path)
+                return True
+            except OSError:
+                pass
+    return False
+
+
+def _missing_cuda_libs() -> list[str]:
+    """Librerías de CUDA necesarias para Whisper que no se pueden cargar."""
+    return [name for name in _cuda_runtime_libraries() if not _can_load_library(name)]
+
+
+def _detect_whisper_device() -> tuple[str, str]:
+    """[FIX MUL-1] Elige dispositivo y tipo de cómputo para faster-whisper.
+
+    Antes se llamaba a `ctranslate2.get_supported_devices()`, que no existe: en Linux con
+    NVIDIA (el torch de PyPI trae CUDA) lanzaba AttributeError y Zara no arrancaba; en
+    Windows (torch de PyPI solo CPU) Whisper quedaba siempre en CPU aunque hubiera una RTX.
+    Ahora se pregunta a ctranslate2, que es quien ejecuta Whisper, sin depender de torch.
+    Además se comprueba que cuBLAS/cuDNN se pueden cargar: si faltan, faster-whisper puede
+    abortar el proceso entero al transcribir (no es una excepción capturable).
+    """
+    try:
+        import ctranslate2
+        if ctranslate2.get_cuda_device_count() <= 0:
+            return "cpu", "int8"
+    except Exception as exc:
+        log.debug("Sin GPU CUDA para Whisper: %s", exc)
+        return "cpu", "int8"
+    missing = _missing_cuda_libs()
+    if missing:
+        log.warning(
+            "Hay GPU NVIDIA, pero faltan librerías de CUDA para Whisper (%s): se usa la CPU. "
+            "Instale cuBLAS y cuDNN para CUDA 12 para usar la GPU.", ", ".join(missing),
+        )
+        return "cpu", "int8"
+    return "cuda", "float16"
 
 # [FIX] Palabra de activación obligatoria: sin escucha continua filtrada por
 # una palabra clave, cualquier ruido ambiente (TV, conversaciones, música)
@@ -126,13 +336,23 @@ class ContinuousEar:
         barge_in_callback: Optional[Callable[[], None]] = None,
         is_speaking_fn: Optional[Callable[[], bool]] = None,
         rms_callback: Optional[Callable[[float], None]] = None,
+        status_callback: Optional[Callable[[str, str], None]] = None,
     ):
         self.barge_in_cb = barge_in_callback
         self.is_speaking_fn = is_speaking_fn or (lambda: False)
         self.rms_cb = rms_callback
+        # [FIX AUD-7/V1_-9] Avisos para el panel: status_callback(nivel, mensaje) con nivel
+        # "ERROR" (micrófono o STT no disponibles) o "SISTEMA" (micrófono recuperado).
+        self.status_cb = status_callback
+        self.mic_error = ""  # último problema del micrófono ("" si funciona)
+        self.stt_error = ""  # motivo por el que no hay reconocimiento de voz ("" si lo hay)
+        self._mic_opened = False
+        self._last_pa_refresh: Optional[float] = None  # [FIX AUD-7] ver _refresh_audio_devices
+        self._device = "cpu"
 
         self._muted = threading.Event()
         self._stop_event = threading.Event()
+        self._run_lock = threading.Lock()
         self._raw_queue: queue.Queue[np.ndarray] = queue.Queue()
         # La utterance queue almacena arrays de audio raw (float32) sin transcribir
         self._utterance_queue: queue.Queue[np.ndarray] = queue.Queue()
@@ -209,60 +429,149 @@ class ContinuousEar:
         self._was_speaking = False
         self._speaking_started_at = 0.0
 
+    def _notify_status(self, level: str, message: str) -> None:
+        if self.status_cb:
+            try:
+                self.status_cb(level, message)
+            except Exception:
+                pass
+
+    def stt_available(self) -> bool:
+        """Indica si hay modelo Whisper cargado (si no, ver `stt_error`)."""
+        return self._whisper_model is not None
+
     def _init_whisper(self) -> None:
-        """Inicializa faster-whisper en GPU CUDA o con fallback transparente a CPU."""
-        from faster_whisper import WhisperModel
-        import ctranslate2
+        """Inicializa faster-whisper en GPU CUDA o con fallback transparente a CPU.
 
-        device = "cpu"
-        compute_type = "int8"
-        if torch.cuda.is_available() and "cuda" in ctranslate2.get_supported_devices():
-            device = "cuda"
-            compute_type = "float16"
+        [FIX MUL-1/V1_-5] Nunca lanza: si CUDA no transcribe de verdad se pasa a CPU; si no
+        se puede descargar el modelo (sin red o con un proxy que bloquea Hugging Face) se usa
+        cualquier modelo ya descargado; y si no hay ninguno, el oído queda sin STT
+        (`stt_available()` es False) en vez de tumbar la app, que sigue sirviendo para el chat
+        escrito o Gemini Live.
+        """
+        self._whisper_model = None
+        try:
+            from faster_whisper import WhisperModel
+        except Exception as exc:
+            self._set_stt_unavailable(
+                f"Reconocimiento de voz no disponible: no se pudo cargar faster-whisper ({exc}). "
+                "Ejecute pip install -r requirements.txt; mientras tanto puede usar el chat escrito."
+            )
+            return
 
+        device, compute_type = _detect_whisper_device()
         log.info("Inicializando STT faster-whisper en dispositivo: %s (%s)", device, compute_type)
         self._device = device
+        if device == "cuda":
+            if self._load_whisper(WhisperModel, "cuda", compute_type):
+                return
+            log.warning("CUDA no utilizable para Whisper (faltan cuBLAS/cuDNN de CUDA 12 o no hay memoria); usando CPU.")
+            self._device = "cpu"
+        if self._load_whisper(WhisperModel, "cpu", "int8"):
+            return
+        if self._load_cached_whisper(WhisperModel):
+            return
+        self._set_stt_unavailable(
+            "Reconocimiento de voz no disponible: no hay ningún modelo Whisper descargado y no se pudo "
+            "descargar (¿sin conexión o con un proxy que bloquea huggingface.co?). Conéctese a internet "
+            "una vez y reinicie Zara para descargarlo; mientras tanto puede usar el chat escrito."
+        )
+
+    def _set_stt_unavailable(self, message: str) -> None:
+        self._whisper_model = None
+        self.stt_error = message
+        log.error(message)
+        self._notify_status("ERROR", message)
+
+    def _whisper_candidates(self, device: str) -> list[str]:
+        """Modelos a probar en `device`, de mejor a más ligero."""
         chosen = resolve_whisper_model(WHISPER_MODEL_PRIMARY, device)
         if WHISPER_MODEL_PRIMARY not in ("auto", chosen):
             log.warning(
                 "ZARA_WHISPER_MODEL=%s es demasiado pesado para %s: usando '%s'. "
                 "Para forzarlo, define ZARA_WHISPER_FORCE=1.", WHISPER_MODEL_PRIMARY, device.upper(), chosen,
             )
-        model_candidates = [chosen] + ([WHISPER_MODEL_FALLBACK] if chosen != WHISPER_MODEL_FALLBACK else [])
+        names = [chosen, WHISPER_MODEL_FALLBACK]
+        if device == "cpu":
+            names.append("small")  # el antiguo «último fallback forzado»
+        return list(dict.fromkeys(names))
+
+    def _load_whisper(self, whisper_cls, device: str, compute_type: str) -> bool:  # noqa: ANN001
+        """Carga el primer candidato que funcione en `device`. Devuelve True si lo consigue."""
         # Hilos de CPU: faster-whisper usa 4 por defecto; aprovechar todos los núcleos
         # reduce la transcripción de forma casi lineal.
         extra = {"cpu_threads": WHISPER_CPU_THREADS} if device == "cpu" else {}
-
-        for cand in model_candidates:
+        for cand in self._whisper_candidates(device):
             try:
                 log.info("Intentando cargar modelo Whisper: %s", cand)
-                self._whisper_model = WhisperModel(
+                model = whisper_cls(
                     cand,
                     device=device,
                     compute_type=compute_type,
                     download_root=str(MODELS_DIR / "whisper"),
                     **extra,
                 )
-                log.info("Modelo Whisper cargado exitosamente: %s", cand)
-                self._warm_up_whisper()
-                return
             except Exception as exc:
                 log.warning("No se pudo cargar %s en %s (%s): %s", cand, device, compute_type, exc)
+                continue
+            log.info("Modelo Whisper cargado exitosamente: %s", cand)
+            self._whisper_model = model
+            if self._warm_up_whisper() or device != "cuda":
+                return True
+            # [FIX MUL-1] En CUDA el modelo puede cargarse y fallar al transcribir (faltan
+            # cuBLAS/cuDNN de CUDA 12, driver antiguo...): así Zara quedaba sorda. Se
+            # descarta y se pasa a CPU; otro candidato en CUDA fallaría igual.
+            self._whisper_model = None
+            return False
+        return False
 
-        # Último fallback forzado en CPU int8
-        log.warning("Activando fallback forzado en CPU con modelo 'small'")
-        self._whisper_model = WhisperModel(
-            "small",
-            device="cpu",
-            compute_type="int8",
-            cpu_threads=WHISPER_CPU_THREADS,
-            download_root=str(MODELS_DIR / "whisper"),
-        )
-        self._warm_up_whisper()
+    def _cached_whisper_dirs(self) -> list[Path]:
+        """Modelos Whisper completos ya descargados en la caché local, por preferencia."""
+        root = MODELS_DIR / "whisper"
+        found: list[Path] = []
+        try:
+            for model_bin in root.glob("models--*/snapshots/*/model.bin"):
+                snap = model_bin.parent
+                # Sin tokenizer.json, faster-whisper lo pediría a internet.
+                if model_bin.is_file() and (snap / "tokenizer.json").is_file():
+                    found.append(snap)
+        except OSError:
+            return []
+        prefs = [resolve_whisper_model(WHISPER_MODEL_PRIMARY, "cpu"), WHISPER_MODEL_FALLBACK, "small"]
 
-    def _warm_up_whisper(self) -> None:
+        def _rank(snap: Path) -> tuple[int, str]:
+            repo = snap.parent.parent.name.lower()  # p. ej. models--systran--faster-whisper-small
+            for i, name in enumerate(prefs):
+                name = name.lower()
+                key = name.replace("/", "--") if "/" in name else f"-{name}"
+                if repo.endswith(key):
+                    return i, repo
+            return len(prefs), repo
+
+        return sorted(found, key=_rank)
+
+    def _load_cached_whisper(self, whisper_cls) -> bool:  # noqa: ANN001
+        """[FIX V1_-5] Sin red: carga en CPU cualquier modelo que ya esté descargado."""
+        for snap in self._cached_whisper_dirs():
+            try:
+                log.warning("Sin poder descargar el modelo elegido: usando el modelo en caché %s", snap.parent.parent.name)
+                self._whisper_model = whisper_cls(
+                    str(snap), device="cpu", compute_type="int8", cpu_threads=WHISPER_CPU_THREADS,
+                )
+            except Exception as exc:
+                log.warning("No se pudo cargar el modelo en caché %s: %s", snap, exc)
+                continue
+            self._device = "cpu"
+            self._warm_up_whisper()
+            return True
+        return False
+
+    def _warm_up_whisper(self) -> bool:
         """Una transcripción de prueba al arrancar: la primera llamada real carga kernels
-        y reserva memoria, y sin esto se pagaba en la primera orden del Señor VK."""
+        y reserva memoria, y sin esto se pagaba en la primera orden del Señor VK.
+
+        [FIX MUL-1] Devuelve False si falla: en CUDA eso indica que la GPU no sirve.
+        """
         try:
             t0 = time.monotonic()
             noise = (np.random.default_rng(0).standard_normal(SAMPLE_RATE) * 0.01).astype(np.float32)
@@ -270,26 +579,52 @@ class ContinuousEar:
                 noise, language=WHISPER_LANGUAGE, beam_size=1, without_timestamps=True, vad_filter=False,
             )[0])
             log.info("Whisper precalentado en %.2f s.", time.monotonic() - t0)
+            return True
         except Exception as exc:
-            log.debug("Precalentamiento de Whisper omitido: %s", exc)
+            log.warning("Fallo en la transcripción de prueba de Whisper: %s", exc)
+            return False
 
     def start(self) -> None:
-        """Inicia los hilos continuos de captura y detección de voz."""
-        self._stop_event.clear()
-        self._audio_thread = threading.Thread(target=self._capture_audio_worker, daemon=True)
-        self._vad_thread = threading.Thread(target=self._vad_processing_worker, daemon=True)
+        """Inicia los hilos continuos de captura y detección de voz.
 
-        self._audio_thread.start()
-        self._vad_thread.start()
+        [FIX] Se puede repetir: main.py vuelve a llamarlo tras stop() al salir de Gemini
+        Live. Cada arranque usa un evento de parada NUEVO (un hilo rezagado de la tanda
+        anterior sigue viendo el suyo activado y termina, en vez de revivir), vacía las
+        colas para no procesar audio ni locuciones viejas y crea hilos nuevos.
+        """
+        with self._run_lock:
+            if self.is_running():
+                log.debug("El oído ya estaba activo.")
+                return
+            for t in (self._audio_thread, self._vad_thread):
+                if t is not None and t.is_alive() and t is not threading.current_thread():
+                    t.join(timeout=2.0)
+            self._stop_event = threading.Event()
+            _drain_queue(self._raw_queue)
+            _drain_queue(self._utterance_queue)
+            stop_event = self._stop_event
+            self._audio_thread = threading.Thread(
+                target=self._capture_audio_worker, args=(stop_event,), name="zara-ear-capture", daemon=True,
+            )
+            self._vad_thread = threading.Thread(
+                target=self._vad_processing_worker, args=(stop_event,), name="zara-ear-vad", daemon=True,
+            )
+            self._audio_thread.start()
+            self._vad_thread.start()
         log.info("Oído de Zara activo y escuchando...")
 
+    def is_running(self) -> bool:
+        """True si la captura está activa (entre start() y stop())."""
+        thread = self._audio_thread
+        return bool(thread is not None and thread.is_alive() and not self._stop_event.is_set())
+
     def stop(self) -> None:
-        """Detiene de forma segura los hilos de escucha."""
-        self._stop_event.set()
-        if self._audio_thread and self._audio_thread.is_alive():
-            self._audio_thread.join(timeout=1.0)
-        if self._vad_thread and self._vad_thread.is_alive():
-            self._vad_thread.join(timeout=1.0)
+        """Detiene de forma segura los hilos de escucha (se puede volver a llamar a start())."""
+        with self._run_lock:
+            self._stop_event.set()
+            for t in (self._audio_thread, self._vad_thread):
+                if t is not None and t.is_alive() and t is not threading.current_thread():
+                    t.join(timeout=1.0)
         log.info("Oído de Zara detenido.")
 
     def set_muted(self, muted: bool) -> None:
@@ -303,34 +638,127 @@ class ContinuousEar:
     def is_muted(self) -> bool:
         return self._muted.is_set()
 
-    def _capture_audio_worker(self) -> None:
-        """Lee bloques continuos de 16 kHz desde sounddevice."""
-        import sounddevice as sd
+    def _capture_audio_worker(self, stop_event: Optional[threading.Event] = None) -> None:
+        """Lee bloques continuos de 16 kHz desde sounddevice.
+
+        [FIX AUD-7/V1_-9] Antes, cualquier fallo al abrir el micrófono (no hay, está
+        desactivado, PipeWire aún no arrancó, VM sin entrada, no admite 16 kHz) se
+        registraba y el hilo moría: Zara quedaba sorda en silencio hasta reiniciar, aunque
+        luego se conectara un micrófono. Ahora se reintenta con espera creciente (1 s a
+        10 s), se avisa una vez por log y al panel (status_callback) y se reabre también si
+        el dispositivo se desconecta en marcha o deja de enviar audio.
+        """
+        stop_event = stop_event or self._stop_event
+        backoff = _MIC_RETRY_MIN_S
+        while not stop_event.is_set():
+            self._mic_opened = False
+            try:
+                self._run_input_stream(stop_event)
+            except Exception as exc:
+                if stop_event.is_set():
+                    break
+                if self._mic_opened:
+                    backoff = _MIC_RETRY_MIN_S  # funcionaba y se ha caído: reintentar enseguida
+                self._report_mic_error(exc)
+                stop_event.wait(backoff)
+                backoff = min(backoff * 2.0, _MIC_RETRY_MAX_S)
+
+    def _report_mic_error(self, exc: BaseException) -> None:
+        message = _describe_mic_error(exc)
+        if message != self.mic_error:
+            log.warning("%s Se reintentará automáticamente.", message)
+            self._notify_status("ERROR", message)
+        else:
+            log.debug("Micrófono sigue sin estar disponible: %s", exc)
+        self.mic_error = message
+
+    def _refresh_audio_devices(self, sd) -> None:  # noqa: ANN001
+        """PortAudio solo enumera los dispositivos al inicializarse: si Zara arrancó sin
+        micrófono, uno conectado después no aparece (sobre todo en Windows) hasta
+        reinicializarlo. Solo se hace si no hay ningún micrófono visible y Zara no está
+        hablando, porque reinicializar PortAudio corta cualquier reproducción en curso.
+
+        [FIX AUD-7] Como mucho una vez cada _PA_REFRESH_INTERVAL_S: antes se hacía en cada
+        reintento (cada 10 s, indefinidamente, en un PC sin dispositivo de grabación), y
+        cada reinicialización vuelve a enumerar todos los dispositivos (lento en Windows) y
+        puede cortar una voz que empiece justo entonces."""
+        try:
+            sd.query_devices(kind="input")
+            return  # hay micrófono por defecto: no hace falta
+        except Exception:
+            pass
+        now = time.monotonic()
+        last = self._last_pa_refresh
+        if last is not None and now - last < _PA_REFRESH_INTERVAL_S:
+            return
+        try:
+            if self.is_speaking_fn():
+                return
+            self._last_pa_refresh = now
+            sd.stop()  # cierra el stream de sd.play() antes de terminar PortAudio
+            try:
+                sd._terminate()
+            finally:
+                sd._initialize()
+            log.debug("PortAudio reinicializado para buscar micrófonos nuevos.")
+        except Exception as exc:
+            log.debug("No se pudo reinicializar PortAudio: %s", exc)
+
+    def _run_input_stream(self, stop_event: threading.Event) -> None:
+        """Abre el micrófono y lo mantiene hasta stop(). Lanza una excepción si no se puede
+        abrir, si el stream se detiene o si deja de llegar audio (dispositivo desconectado)."""
+        sd = _import_sounddevice()
+        if self.mic_error:
+            self._refresh_audio_devices(sd)
+        rate = _pick_input_samplerate(sd)
+        resampler = _StreamResampler(rate) if rate != SAMPLE_RATE else None
+        blocksize = FRAME_SIZE if resampler is None else max(1, round(FRAME_SIZE * rate / SAMPLE_RATE))
+        last_audio = [time.monotonic()]
 
         def callback(indata, frames, time_info, status):  # noqa: ANN001
             if status:
                 log.debug("Estado de captura sounddevice: %s", status)
-            if not self._stop_event.is_set():
-                self._raw_queue.put(indata[:, 0].copy())
+            if stop_event.is_set():
+                return
+            last_audio[0] = time.monotonic()
+            mono = indata[:, 0].copy()
+            if resampler is None:
+                self._raw_queue.put(mono)
+            else:
+                for frame in resampler.process(mono):
+                    self._raw_queue.put(frame)
 
-        try:
-            with sd.InputStream(
-                samplerate=SAMPLE_RATE,
-                channels=1,
-                dtype="float32",
-                blocksize=FRAME_SIZE,
-                callback=callback,
-            ):
-                while not self._stop_event.is_set():
-                    time.sleep(0.05)
-        except Exception as exc:
-            log.exception("Fallo en la captura de audio continua: %s", exc)
+        with sd.InputStream(
+            samplerate=rate,
+            channels=1,
+            dtype="float32",
+            blocksize=blocksize,
+            callback=callback,
+        ) as stream:
+            self._mic_opened = True
+            last_audio[0] = time.monotonic()
+            if self.mic_error:
+                log.info("Micrófono disponible de nuevo (%d Hz).", rate)
+                self._notify_status("SISTEMA", "Micrófono disponible de nuevo.")
+                self.mic_error = ""
+            while not stop_event.is_set():
+                stop_event.wait(0.1)
+                if stop_event.is_set():
+                    break
+                if not stream.active:
+                    raise RuntimeError("el stream del micrófono se ha detenido")
+                if time.monotonic() - last_audio[0] > _MIC_STALL_S:
+                    raise RuntimeError("el micrófono dejó de enviar audio (¿desconectado?)")
 
-    def _vad_processing_worker(self) -> None:
+    def _vad_processing_worker(self, stop_event: Optional[threading.Event] = None) -> None:
         """Procesa frames con Silero VAD continuo, pre-roll ring buffer y Barge-in."""
+        stop_event = stop_event or self._stop_event
         self._reset_segmentation_state()
+        if self._vad_iterator is not None:
+            self._vad_iterator.reset_states()  # tras un stop()/start() se empieza de cero
+        last_error = ""
 
-        while not self._stop_event.is_set():
+        while not stop_event.is_set():
             try:
                 frame = self._raw_queue.get(timeout=0.1)
             except queue.Empty:
@@ -352,7 +780,14 @@ class ContinuousEar:
                 self._vad_iterator.reset_states()
                 continue
 
-            self._process_frame(frame)
+            # [FIX V1_-9] Un fallo inesperado en un frame no debe matar el hilo VAD para
+            # siempre (Zara quedaría sorda sin aviso): se registra y se sigue.
+            try:
+                self._process_frame(frame)
+            except Exception as exc:
+                if str(exc) != last_error:
+                    log.exception("Fallo procesando un frame de audio: %s", exc)
+                last_error = str(exc)
 
     def _process_frame(self, frame: np.ndarray) -> None:
         """[FIX, extraído para testabilidad] Procesa UN frame de audio: RMS
@@ -435,10 +870,22 @@ class ContinuousEar:
                 self._is_speech_active = True
                 self._pre_roll_buffer.clear()
                 self._bargein_preroll_buffer.clear()
+                # [FIX AUD-14] El VADIterator no recibió los frames de la interrupción
+                # (mientras Zara habla se retorna antes del bloque 2), así que seguía con
+                # triggered=False y solo emite "end" si estaba triggered: tras un «¡basta!»
+                # corto, la locución acumulaba silencio hasta el límite de 25 s. Se marca
+                # como dentro de una locución para que cierre tras VAD_MIN_SILENCE_MS.
+                self._vad_iterator.reset_states()
+                self._vad_iterator.triggered = True
             else:
                 self._speech_frames.clear()
                 self._pre_roll_buffer.clear()
                 self._is_speech_active = False
+                # [FIX AUD-14] Si el VADIterator quedó dentro de una locución (barge-in
+                # confirmado y Zara vuelve a hablar antes del "end"), hay que reiniciarlo:
+                # con triggered=True no emite "start" y la siguiente orden se perdería.
+                if getattr(self._vad_iterator, "triggered", False):
+                    self._vad_iterator.reset_states()
             return
         else:
             self._was_speaking = False
@@ -492,6 +939,10 @@ class ContinuousEar:
         """Transcribe un array float32 16 kHz con faster-whisper optimizado."""
         if audio.size == 0:
             return ""
+        if self._whisper_model is None:
+            # [FIX V1_-5] Sin modelo Whisper (sin red en el primer arranque): sin texto.
+            log.debug("Locución descartada: reconocimiento de voz no disponible.")
+            return ""
 
         peak = float(np.max(np.abs(audio)))
         rms = float(np.sqrt(np.mean(audio ** 2)))
@@ -531,8 +982,12 @@ class ContinuousEar:
 
         [BUG-4 FIX] La transcripción ocurre en este generador (llamado desde
         el hilo worker de main.py), no bloqueando el hilo de VAD.
+
+        Termina al llamar a stop(); tras un nuevo start() se puede volver a iterar
+        (cada generador se queda con el evento de parada del arranque en curso).
         """
-        while not self._stop_event.is_set():
+        stop_event = self._stop_event
+        while not stop_event.is_set():
             try:
                 utt = self._utterance_queue.get(timeout=0.2)
             except queue.Empty:

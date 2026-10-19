@@ -37,14 +37,17 @@ def test_sentence_chunker_long_monologue():
         assert len(chunk) > 10
 
 
-def test_file_manager_edge_cases():
+def test_file_manager_edge_cases(tmp_path):
     # Intento de leer archivo inexistente
     res_no = file_manager("read", "non_existent_path_xyz_123.bin")
     assert res_no["success"] is False
     assert "no existe" in res_no["error"]
 
-    # Intento de editar sin encontrar el texto previo (debe fallar limpiamente sin excepción)
-    res_edit_bad = file_manager("edit", "config.py", old_str="TEXTO_IMPOSIBLE_DE_ENCONTRAR_XYZ", new_str="NADA")
+    # Intento de editar sin encontrar el texto previo (debe fallar limpiamente sin excepción).
+    # Sobre un archivo temporal: la carpeta de Zara (código, .env) está protegida contra escritura.
+    target = tmp_path / "config.py"
+    target.write_text("VALOR = 1\n", encoding="utf-8")
+    res_edit_bad = file_manager("edit", str(target), old_str="TEXTO_IMPOSIBLE_DE_ENCONTRAR_XYZ", new_str="NADA")
     assert res_edit_bad["success"] is False
     assert "no fue encontrado" in res_edit_bad["error"]
 
