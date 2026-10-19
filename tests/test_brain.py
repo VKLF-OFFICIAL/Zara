@@ -391,3 +391,20 @@ def test_system_prompt_date_is_spanish_regardless_of_locale():
     prompt = get_system_prompt()
     assert any(m in prompt for m in ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
                                      "agosto", "septiembre", "octubre", "noviembre", "diciembre"))
+
+
+def test_long_task_keeps_original_request_after_trimming():
+    """En tareas de muchos pasos, el recorte del historial no debe olvidar la petición."""
+    from core.brain import ZaraBrain, _MAX_HISTORY_MESSAGES
+
+    brain = ZaraBrain()
+    task = {"role": "user", "content": "Crea una web en Documentos/mi-web"}
+    brain._task_message = task
+    brain.history = [task]
+    for i in range(_MAX_HISTORY_MESSAGES + 10):
+        brain.history.append({"role": "assistant", "content": f"Ejecutando acción {i}"})
+        brain.history.append({"role": "user", "content": f"[OBSERVACIÓN DEL SISTEMA]: paso {i}"})
+        brain._trim_history()
+    assert brain.history[0] is task
+    assert brain.history[1]["role"] == "assistant"  # la alternancia user/assistant se mantiene
+    assert len(brain.history) <= _MAX_HISTORY_MESSAGES + 1

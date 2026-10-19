@@ -54,12 +54,14 @@ from config import (
     SYSTEM_PROMPT,
     get_system_prompt,
 )
+from core.workspace import describe_user_folders
 from core.tools import TOOL_DEFINITIONS, cli_safe_arg, execute_tool, format_tools_for_local_prompt
 
 log = logging.getLogger("zara.brain")
 
 # Ventana deslizante máxima del historial de conversación
 _MAX_HISTORY_MESSAGES = 40
+_MAX_OBSERVATION_CHARS = 12000  # por herramienta y paso, en el historial
 
 
 # Cliente HTTP compartido (reutiliza conexiones). La carga en frío de un modelo grande
@@ -981,9 +983,18 @@ class ZaraBrain:
                 pass
 
     def _trim_history(self) -> None:
-        """[BUG-12 FIX] Mantiene el historial dentro de la ventana máxima."""
+        """[BUG-12 FIX] Mantiene el historial dentro de la ventana máxima.
+
+        La petición del turno en curso (self._task_message) nunca se pierde: en tareas de
+        muchos pasos, el recorte la expulsaba y el modelo olvidaba qué le habían pedido.
+        """
+        task = getattr(self, "_task_message", None)
         if len(self.history) > _MAX_HISTORY_MESSAGES:
             self.history = self.history[-_MAX_HISTORY_MESSAGES:]
+            if task is not None and not any(m is task for m in self.history):
+                while self.history and self.history[0].get("role") == "user":
+                    self.history.pop(0)  # tras la tarea fijada debe venir un turno del asistente
+                self.history.insert(0, task)
         # Anthropic y Gemini exigen que la conversación empiece con un mensaje de
         # usuario: el recorte puede dejar un "assistant" al principio y provocar HTTP 400.
         while self.history and self.history[0].get("role") != "user":
@@ -1002,10 +1013,18 @@ class ZaraBrain:
         # turno anterior ya resuelto no debe afectar a este.
         self._cancel_event.clear()
 
-        # Refrescar el system prompt con la fecha/hora real del momento actual.
-        current_system_prompt = get_system_prompt()
+        # Refrescar el system prompt con la fecha/hora real del momento actual y con las
+        # carpetas reales de este equipo (Windows/Linux), para que use rutas correctas.
+        current_system_prompt = (
+            get_system_prompt()
+            + "\nENTORNO: " + describe_user_folders()
+            + "\nARCHIVOS: usa rutas absolutas o que empiecen por Documentos/Escritorio/Descargas. "
+            "Para editar un archivo, léelo antes y sustituye un fragmento exacto; para crear varios "
+            "archivos, escribe cada uno completo con file_manager (write) y comprueba el resultado con tree.\n"
+        )
 
-        self.history.append({"role": "user", "content": user_query})
+        self._task_message = {"role": "user", "content": user_query}
+        self.history.append(self._task_message)
         self._trim_history()
 
         chosen_provider = ZaraRouter.classify(user_query, preferred_provider)
@@ -1158,7 +1177,11 @@ class ZaraBrain:
                 if name == "run_shell" and not result.get("success"):
                     log.info("Comando falló (código %s). Enviando stderr para autocorrección.", result.get("exit_code"))
 
-                observations.append(f"Resultado de {name}: {json.dumps(result, ensure_ascii=False)}")
+                serialized = json.dumps(result, ensure_ascii=False)
+                if len(serialized) > _MAX_OBSERVATION_CHARS:
+                    # Un archivo grande o una salida larga no debe llenar el contexto del modelo.
+                    serialized = serialized[:_MAX_OBSERVATION_CHARS] + f"... [recortado, {len(serialized)} caracteres en total]"
+                observations.append(f"Resultado de {name}: {serialized}")
                 self._emit_tool_event(name, "Completado.")
 
             last_observations = observations

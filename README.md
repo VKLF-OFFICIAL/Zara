@@ -167,6 +167,22 @@ chmod +x setup_and_run.sh
 
 ---
 
+## 4b. Trabajar con tus carpetas y archivos
+
+Zara entiende tus carpetas reales en Windows y en Linux (incluida la redirección de Documentos a OneDrive y los nombres XDG en español: `Documentos`, `Escritorio`, `Descargas`…). Puedes pedirle cosas como:
+
+- «Zara, crea en Documentos una carpeta `mi-web` con un `index.html` y una hoja de estilos».
+- «Zara, abre `Documentos/mi-web/index.html` y cambia el título por "Bienvenido"».
+- «Zara, ¿dónde se usa la palabra `login` en mi proyecto de Documentos/mi-app?».
+
+Herramientas que usa por debajo:
+- `file_manager`: `read` (por tramos de líneas), `write`, `append`, `edit` (sustituye un fragmento exacto y **único**; si aparece varias veces pide más contexto o `replace_all`), `mkdir`, `list`, `tree` (árbol del proyecto, sin `vendor/`, `node_modules/`…), `search`, `delete` (con confirmación hablada) y `exists`.
+- `run_shell`: ejecuta comandos en la carpeta que indique (`cwd`), por defecto en Documentos; admite tareas largas como `composer install` (hasta 900 s) o procesos en segundo plano (servidores de desarrollo).
+
+Las rutas relativas se resuelven contra **Documentos** (o `ZARA_WORKSPACE`), nunca contra la carpeta desde la que arrancaste Zara. Las rutas del sistema (`C:\Windows`, `/etc`, `~/.ssh`…) siguen protegidas.
+
+> Para proyectos grandes en muchos pasos puedes subir `ZARA_MAX_REACT_STEPS` (8 por defecto) en `config/ajustes.env`.
+
 ## 5. Configuración
 
 Zara lee sus ajustes de dos archivos (y de las variables de entorno del sistema, que mandan sobre ambos):

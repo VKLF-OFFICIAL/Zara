@@ -44,7 +44,8 @@ def test_file_manager_edge_cases():
     assert "no existe" in res_no["error"]
 
     # Intento de editar sin encontrar el texto previo (debe fallar limpiamente sin excepción)
-    res_edit_bad = file_manager("edit", "config.py", old_str="TEXTO_IMPOSIBLE_DE_ENCONTRAR_XYZ", new_str="NADA")
+    import config
+    res_edit_bad = file_manager("edit", str(config.BASE_DIR / "config.py"), old_str="TEXTO_IMPOSIBLE_DE_ENCONTRAR_XYZ", new_str="NADA")
     assert res_edit_bad["success"] is False
     assert "no fue encontrado" in res_edit_bad["error"]
 

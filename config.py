@@ -297,6 +297,7 @@ def persist_env_var(key: str, value: str) -> None:
 # --- AGENTE AUTÓNOMO (REACT) ---
 MAX_REACT_STEPS = int(os.environ.get("ZARA_MAX_REACT_STEPS", "8"))
 SHELL_TIMEOUT = int(os.environ.get("ZARA_SHELL_TIMEOUT", "60"))
+SHELL_TIMEOUT_MAX = 900  # composer/npm install pueden tardar varios minutos
 
 # Guardarraíl de comandos destructivos catastróficos prohibidos en código
 FORBIDDEN_COMMANDS_REGEX = [

@@ -18,7 +18,9 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 import psutil
 
+from core.workspace import resolve_user_path, workspace_dir
 from config import (
+    SHELL_TIMEOUT_MAX,
     CONFIRM_COMMANDS_REGEX,
     FORBIDDEN_COMMANDS_REGEX,
     PROTECTED_EXACT,
@@ -121,8 +123,29 @@ def _normalize_windows_command(cmd: str) -> str:
 # 1. HERRAMIENTA: EJECUCIÓN EN SHELL (run_shell)
 # =============================================================================
 
-def run_shell(command: str, timeout: int = SHELL_TIMEOUT, background: bool = False) -> Dict[str, Any]:
-    """Ejecuta un comando en PowerShell (Windows) o Bash (Linux)."""
+def _as_int(value: Any, default: int, low: int, high: int) -> int:
+    """Los LLM mandan números como texto, null o decimales: normalizar sin lanzar."""
+    try:
+        return max(low, min(high, int(float(value))))
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_bool(value: Any) -> bool:
+    if isinstance(value, str):
+        return value.strip().lower() in ("1", "true", "sí", "si", "yes")
+    return bool(value)
+
+
+def run_shell(command: str, timeout: Any = SHELL_TIMEOUT, background: Any = False, cwd: str = "") -> Dict[str, Any]:
+    """Ejecuta un comando en PowerShell (Windows) o Bash (Linux) dentro de `cwd`.
+
+    Sin `cwd`, se usa la carpeta de trabajo (Documentos o ZARA_WORKSPACE), nunca la
+    carpeta desde la que se lanzó Zara.
+    """
+    command = str(command or "")
+    timeout = _as_int(timeout, SHELL_TIMEOUT, 1, SHELL_TIMEOUT_MAX)
+    background = _as_bool(background)
     blocked_pattern = is_command_forbidden(command)
     if blocked_pattern:
         log.warning("Comando bloqueado por guardarraíl catastrófico: %s (patrón: %s)", command, blocked_pattern)
@@ -134,10 +157,19 @@ def run_shell(command: str, timeout: int = SHELL_TIMEOUT, background: bool = Fal
             "exit_code": 126,
         }
 
+    workdir = resolve_user_path(cwd) if cwd else workspace_dir()
+    if not workdir.is_dir():
+        return {
+            "success": False,
+            "stdout": "",
+            "stderr": f"La carpeta de trabajo '{workdir}' no existe. Créala antes con file_manager (mkdir).",
+            "exit_code": 2,
+        }
+
     if sys.platform == "win32":
         command = _normalize_windows_command(command)
 
-    log.info("Ejecutando shell [%s]: %s", "Windows/PowerShell" if sys.platform == "win32" else "Linux/Bash", command)
+    log.info("Ejecutando shell [%s] en %s: %s", "Windows/PowerShell" if sys.platform == "win32" else "Linux/Bash", workdir, command)
 
     if sys.platform == "win32":
         shell_cmd = ["powershell.exe", "-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", command]
@@ -148,6 +180,7 @@ def run_shell(command: str, timeout: int = SHELL_TIMEOUT, background: bool = Fal
         try:
             proc = subprocess.Popen(
                 shell_cmd,
+                cwd=str(workdir),
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 stdin=subprocess.DEVNULL,
@@ -158,6 +191,7 @@ def run_shell(command: str, timeout: int = SHELL_TIMEOUT, background: bool = Fal
                 "stdout": f"Proceso iniciado en segundo plano con PID {proc.pid}.",
                 "stderr": "",
                 "exit_code": 0,
+                "cwd": str(workdir),
             }
         except Exception as exc:
             return {"success": False, "stdout": "", "stderr": str(exc), "exit_code": 1}
@@ -165,27 +199,27 @@ def run_shell(command: str, timeout: int = SHELL_TIMEOUT, background: bool = Fal
     try:
         res = subprocess.run(
             shell_cmd,
+            cwd=str(workdir),
             capture_output=True,
             text=True,
             timeout=timeout,
             stdin=subprocess.DEVNULL,
+            encoding="utf-8",
             errors="replace",
         )
-        stdout = res.stdout.strip()
-        stderr = res.stderr.strip()
-        exit_code = res.returncode
         return {
-            "success": exit_code == 0,
+            "success": res.returncode == 0,
             "blocked": False,
-            "stdout": stdout,
-            "stderr": stderr,
-            "exit_code": exit_code,
+            "stdout": _clip(res.stdout.strip(), MAX_TOOL_OUTPUT_CHARS),
+            "stderr": _clip(res.stderr.strip(), MAX_TOOL_OUTPUT_CHARS // 2),
+            "exit_code": res.returncode,
+            "cwd": str(workdir),
         }
     except subprocess.TimeoutExpired:
         return {
             "success": False,
             "stdout": "",
-            "stderr": f"Tiempo de espera agotado ({timeout} s).",
+            "stderr": f"Tiempo de espera agotado ({timeout} s). Para tareas largas usa background=true o un timeout mayor (máx. {SHELL_TIMEOUT_MAX}).",
             "exit_code": 124,
         }
     except Exception as exc:
@@ -201,18 +235,40 @@ def run_shell(command: str, timeout: int = SHELL_TIMEOUT, background: bool = Fal
 # 2. HERRAMIENTA: GESTOR DE ARCHIVOS QUIRÚRGICO (file_manager)
 # =============================================================================
 
+MAX_TOOL_OUTPUT_CHARS = 20000   # lo que se devuelve al modelo por llamada
+MAX_READ_LINES = 400            # líneas por lectura (se puede paginar con start_line)
+_SKIP_DIRS = {".git", "node_modules", "vendor", "__pycache__", ".venv", "venv", ".idea", ".vscode", "storage", "dist", "build"}
+_MUTATING_ACTIONS = ("write", "append", "edit", "delete", "mkdir")
+_FILE_ACTIONS = ("read", "write", "append", "edit", "mkdir", "list", "tree", "search", "delete", "exists")
+
+
+def _clip(text: str, limit: int) -> str:
+    if len(text) <= limit:
+        return text
+    return text[:limit] + f"\n[... recortado: {len(text) - limit} caracteres más]"
+
+
 def file_manager(
     action: str,
     path: str,
     content: str = "",
     old_str: str = "",
     new_str: str = "",
+    replace_all: Any = False,
+    start_line: Any = 1,
+    max_lines: Any = MAX_READ_LINES,
+    pattern: str = "",
 ) -> Dict[str, Any]:
-    """Lectura, escritura, edición quirúrgica y listado de archivos multiplataforma."""
-    target = Path(path).resolve()
-    action = action.lower().strip()
+    """Archivos y carpetas como un editor de código: leer por tramos, escribir, editar con
+    precisión, crear carpetas, ver el árbol de un proyecto y buscar texto.
 
-    if action in ("write", "append", "edit", "delete"):
+    Las rutas pueden ser absolutas, con ~ o variables de entorno, empezar por una carpeta
+    personal («Documentos/mi-web») o ser relativas a la carpeta de trabajo.
+    """
+    action = str(action or "").lower().strip()
+    target = resolve_user_path(str(path or ""))
+
+    if action in _MUTATING_ACTIONS:
         protected = is_path_protected(target)
         if protected:
             log.warning("file_manager '%s' bloqueado sobre ruta protegida: %s", action, target)
@@ -226,42 +282,125 @@ def file_manager(
         if action == "read":
             if not target.is_file():
                 return {"success": False, "error": f"El archivo '{target}' no existe o es un directorio."}
-            text = target.read_text(encoding="utf-8", errors="replace")
-            return {"success": True, "content": text, "path": str(target), "lines": len(text.splitlines())}
+            lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+            first = _as_int(start_line, 1, 1, max(1, len(lines)))
+            count = _as_int(max_lines, MAX_READ_LINES, 1, 2000)
+            chunk = lines[first - 1:first - 1 + count]
+            numbered = "\n".join(f"{first + i:>5}  {line}" for i, line in enumerate(chunk))
+            result = {
+                "success": True,
+                "path": str(target),
+                "total_lines": len(lines),
+                "lines": len(lines),
+                "start_line": first,
+                "content": _clip(numbered, MAX_TOOL_OUTPUT_CHARS),
+            }
+            if first - 1 + count < len(lines):
+                result["next_start_line"] = first + count
+            return result
 
         elif action == "write":
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_text(content, encoding="utf-8")
-            return {"success": True, "message": f"Archivo '{target}' escrito correctamente ({len(content)} caracteres)."}
+            existed = target.exists()
+            target.write_text(str(content), encoding="utf-8", newline="\n")
+            verb = "sobrescrito" if existed else "creado"
+            return {"success": True, "message": f"Archivo '{target}' {verb} ({len(str(content))} caracteres)."}
 
         elif action == "append":
             target.parent.mkdir(parents=True, exist_ok=True)
-            with open(target, "a", encoding="utf-8") as f:
-                f.write(content)
+            with open(target, "a", encoding="utf-8", newline="\n") as f:
+                f.write(str(content))
             return {"success": True, "message": f"Contenido añadido a '{target}'."}
 
         elif action == "edit":
             if not target.is_file():
                 return {"success": False, "error": f"El archivo '{target}' no existe."}
+            if not old_str:
+                return {"success": False, "error": "Para editar indica old_str (texto exacto a sustituir)."}
             text = target.read_text(encoding="utf-8", errors="replace")
-            if old_str not in text:
-                return {"success": False, "error": f"El fragmento a reemplazar no fue encontrado en '{target}'."}
             count = text.count(old_str)
-            updated = text.replace(old_str, new_str)
-            target.write_text(updated, encoding="utf-8")
+            if count == 0:
+                return {"success": False, "error": f"El fragmento a reemplazar no fue encontrado en '{target}'. Léelo de nuevo y copia el texto exacto."}
+            if count > 1 and not _as_bool(replace_all):
+                return {
+                    "success": False,
+                    "error": f"El fragmento aparece {count} veces en '{target}'. Añade más contexto para que sea único o usa replace_all=true.",
+                }
+            updated = text.replace(old_str, str(new_str))
+            target.write_text(updated, encoding="utf-8", newline="\n")
             return {"success": True, "message": f"Reemplazo quirúrgico aplicado en '{target}' ({count} ocurrencias)."}
+
+        elif action == "mkdir":
+            target.mkdir(parents=True, exist_ok=True)
+            return {"success": True, "message": f"Carpeta '{target}' lista.", "path": str(target)}
 
         elif action == "list":
             if not target.is_dir():
                 return {"success": False, "error": f"'{target}' no es un directorio válido."}
             items = []
-            for item in sorted(target.iterdir()):
+            for item in sorted(target.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))[:500]:
                 items.append({
                     "name": item.name,
                     "is_dir": item.is_dir(),
                     "size_bytes": item.stat().st_size if item.is_file() else None,
                 })
             return {"success": True, "directory": str(target), "items": items}
+
+        elif action == "tree":
+            if not target.is_dir():
+                return {"success": False, "error": f"'{target}' no es un directorio válido."}
+            lines_out: List[str] = []
+            limit = 400
+
+            def walk(folder: Path, depth: int) -> None:
+                if depth > 4 or len(lines_out) >= limit:
+                    return
+                try:
+                    entries = sorted(folder.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower()))
+                except OSError:
+                    return
+                for entry in entries:
+                    if len(lines_out) >= limit:
+                        return
+                    indent = "  " * depth
+                    if entry.is_dir():
+                        skipped = entry.name in _SKIP_DIRS
+                        lines_out.append(f"{indent}{entry.name}/" + (" (omitida)" if skipped else ""))
+                        if not skipped:
+                            walk(entry, depth + 1)
+                    else:
+                        lines_out.append(f"{indent}{entry.name}")
+
+            walk(target, 0)
+            return {"success": True, "directory": str(target), "tree": "\n".join(lines_out), "truncated": len(lines_out) >= limit}
+
+        elif action == "search":
+            if not pattern:
+                return {"success": False, "error": "Para buscar indica pattern (texto o expresión regular)."}
+            try:
+                regex = re.compile(pattern, re.IGNORECASE)
+            except re.error:
+                regex = re.compile(re.escape(pattern), re.IGNORECASE)
+            files = [target] if target.is_file() else []
+            if target.is_dir():
+                for root, dirs, names in os.walk(target):
+                    dirs[:] = [d for d in dirs if d not in _SKIP_DIRS]
+                    files.extend(Path(root) / n for n in names)
+            matches = []
+            for file in files:
+                if len(matches) >= 100:
+                    break
+                try:
+                    if file.stat().st_size > 1_000_000:
+                        continue
+                    for number, line in enumerate(file.read_text(encoding="utf-8", errors="ignore").splitlines(), 1):
+                        if regex.search(line):
+                            matches.append(f"{file}:{number}: {line.strip()[:200]}")
+                            if len(matches) >= 100:
+                                break
+                except OSError:
+                    continue
+            return {"success": True, "matches": matches, "count": len(matches), "truncated": len(matches) >= 100}
 
         elif action == "delete":
             if target.is_file():
@@ -274,10 +413,10 @@ def file_manager(
                 return {"success": False, "error": f"Ruta '{target}' no encontrada."}
 
         elif action == "exists":
-            return {"success": True, "exists": target.exists(), "is_file": target.is_file(), "is_dir": target.is_dir()}
+            return {"success": True, "path": str(target), "exists": target.exists(), "is_file": target.is_file(), "is_dir": target.is_dir()}
 
         else:
-            return {"success": False, "error": f"Acción desconocida '{action}'. Válidas: read, write, append, edit, list, delete, exists."}
+            return {"success": False, "error": f"Acción desconocida '{action}'. Válidas: {', '.join(_FILE_ACTIONS)}."}
 
     except Exception as exc:
         log.exception("Error en file_manager (%s sobre %s): %s", action, path, exc)
@@ -901,23 +1040,33 @@ TOOL_DEFINITIONS = [
             "type": "object",
             "properties": {
                 "command": {"type": "string", "description": "Comando exacto a ejecutar."},
-                "timeout": {"type": "integer", "description": "Tiempo límite en segundos (por defecto 60)."},
-                "background": {"type": "boolean", "description": "True para lanzar procesos de segundo plano."},
+                "cwd": {"type": "string", "description": "Carpeta donde ejecutarlo (por defecto, Documentos). Admite «Documentos/mi-web»."},
+                "timeout": {"type": "integer", "description": "Tiempo límite en segundos (por defecto 60, máximo 900)."},
+                "background": {"type": "boolean", "description": "True para lanzar procesos de segundo plano (servidores)."},
             },
             "required": ["command"],
         },
     },
     {
         "name": "file_manager",
-        "description": "Lectura, escritura, reemplazo quirúrgico y listado de archivos y directorios.",
+        "description": (
+            "Archivos y carpetas como un editor de código. Rutas absolutas, con ~ o empezando por "
+            "Documentos/Escritorio/Descargas. Acciones: read (por tramos de líneas), write (crea o "
+            "sobrescribe), append, edit (sustituye old_str EXACTO y único por new_str), mkdir, list, "
+            "tree (árbol del proyecto), search (busca pattern en archivos), delete, exists."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
-                "action": {"type": "string", "enum": ["read", "write", "append", "edit", "list", "delete", "exists"]},
-                "path": {"type": "string", "description": "Ruta absoluta o relativa del archivo o directorio."},
-                "content": {"type": "string", "description": "Contenido para acciones write o append."},
-                "old_str": {"type": "string", "description": "Texto exacto a reemplazar para la acción edit."},
-                "new_str": {"type": "string", "description": "Nuevo texto de reemplazo para la acción edit."},
+                "action": {"type": "string", "enum": ["read", "write", "append", "edit", "mkdir", "list", "tree", "search", "delete", "exists"]},
+                "path": {"type": "string", "description": "Ruta del archivo o carpeta (p. ej. Documentos/mi-web/index.html)."},
+                "content": {"type": "string", "description": "Contenido completo para write o append."},
+                "old_str": {"type": "string", "description": "Texto exacto a reemplazar (edit). Debe ser único salvo replace_all."},
+                "new_str": {"type": "string", "description": "Texto nuevo (edit)."},
+                "replace_all": {"type": "boolean", "description": "edit: reemplazar todas las apariciones."},
+                "start_line": {"type": "integer", "description": "read: primera línea (1 por defecto)."},
+                "max_lines": {"type": "integer", "description": "read: número de líneas (400 por defecto)."},
+                "pattern": {"type": "string", "description": "search: texto o expresión regular a buscar."},
             },
             "required": ["action", "path"],
         },
@@ -1071,14 +1220,19 @@ def execute_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
             command=args.get("command", ""),
             timeout=args.get("timeout", SHELL_TIMEOUT),
             background=args.get("background", False),
+            cwd=args.get("cwd") or "",
         )
     elif name == "file_manager":
         return file_manager(
             action=args.get("action", "read"),
             path=args.get("path", ""),
-            content=args.get("content", ""),
-            old_str=args.get("old_str", ""),
-            new_str=args.get("new_str", ""),
+            content=args.get("content") or "",
+            old_str=args.get("old_str") or "",
+            new_str=args.get("new_str") or "",
+            replace_all=args.get("replace_all", False),
+            start_line=args.get("start_line", 1),
+            max_lines=args.get("max_lines", MAX_READ_LINES),
+            pattern=args.get("pattern") or "",
         )
     elif name == "os_control":
         return os_control(
