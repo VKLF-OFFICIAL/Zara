@@ -191,6 +191,7 @@ def test_claude_code_expande_rutas_y_describe_carpeta_y_tarea(tmp_path, monkeypa
     proyecto = tmp_path / "miweb"
     proyecto.mkdir()
     monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("USERPROFILE", str(tmp_path))
     args = {"project_path": "~/miweb", "instruction": "crea una web Laravel con login"}
     descripcion = tools.needs_confirmation("invoke_claude_code", args)
     assert str(proyecto) in descripcion and "crea una web Laravel con login" in descripcion
