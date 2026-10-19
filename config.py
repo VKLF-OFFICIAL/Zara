@@ -49,7 +49,10 @@ def _write_private(path: Path, text: str) -> None:
     otros usuarios ni durante un instante. En Windows el modo apenas tiene efecto.
     """
     tmp_path = path.with_name(path.name + ".tmp")
-    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    # [FIX NUEVO] O_BINARY en Windows: sin él, os.open (_wopen) abre el descriptor en modo
+    # texto del CRT y cada \n que ya traduce Python sale como \r\r\n. En POSIX no existe (0).
+    flags = os.O_WRONLY | os.O_CREAT | os.O_TRUNC | getattr(os, "O_BINARY", 0)
+    fd = os.open(tmp_path, flags, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(text)
     if os.name != "nt":
@@ -383,16 +386,53 @@ SHELL_TIMEOUT = _env_num("ZARA_SHELL_TIMEOUT", 60, minimum=1)
 SHELL_TIMEOUT_MAX = 900  # composer/npm install pueden tardar varios minutos
 
 # Guardarraíl de comandos destructivos catastróficos prohibidos en código
+# [FIX SEG-2] Los borrados masivos se detectan por (verbo de borrado + recursión +
+# objetivo amplio) en cualquier orden dentro de la misma orden simple, con comillas o sin
+# ellas, en bash, PowerShell y cmd. «Objetivo amplio» = raíz, HOME (cualquier forma de
+# escribirlo), /home/<usuario>, unidades de Windows, C:\Users\<usuario>, carpetas del
+# sistema, o esos mismos seguidos de /* o /.*. Una subcarpeta concreta (~/proyecto/build,
+# /tmp/x) NO es amplia: sigue permitida y pasa por CONFIRM_COMMANDS_REGEX. Es una defensa en
+# profundidad: la confirmación hablada cubre lo que una regex no puede ver ($(...), alias).
+_SEG = r"[^;&|\n]"  # un carácter dentro de la misma orden simple
+_ARG_END = r"""["']?(?=\s|$|[;&|)])"""  # fin del argumento (cierra comillas si las hay)
+_TAIL = r"""["']?(?:[\\/](?:\.?\*|\.\*|\.)?)?"""  # "/", "/*", "/.", "/.*", "\", "\*" opcionales
+_HOME_FORMS = (
+    r"~|\$HOME|\$\{HOME\}|\$env:USERPROFILE|\$env:HOMEPATH|\$env:HOMEDRIVE|%USERPROFILE%|%HOMEPATH%"
+)
+_POSIX_SYSTEM = r"bin|boot|dev|etc|lib|lib32|lib64|libx32|proc|root|sbin|sys|usr|var"
+_BROAD_TARGET = (
+    r"""\s["']?(?:"""
+    r"/(?:\.?\*|\.)?"                                   # /  /*  /.
+    rf"|/(?:{_POSIX_SYSTEM})(?:/{_SEG}*?)?"             # árbol del sistema entero
+    r"|/(?:home|Users|mnt|media|opt|srv|snap)(?:/[^\s/\"';&|]+)?" + _TAIL +  # /home/<usuario>
+    rf"|(?:{_HOME_FORMS})" + _TAIL +                     # ~  $HOME  "$HOME"/*  %USERPROFILE%
+    r"|[a-z]:(?:[\\/](?:\.?\*(?:\.\*)?)?)?"             # C:  C:\  C:\*  C:/*.*
+    r"|[a-z]:[\\/](?:Users|Documents and Settings)(?:[\\/][^\s\\/\"';&|]+)?" + _TAIL +
+    r"|[a-z]:[\\/](?:Windows|Program Files(?: \(x86\))?|ProgramData)(?:[\\/]" + _SEG + r"*?)?"
+    r"|(?:%SystemRoot%|%windir%|%ProgramFiles%|\$env:SystemRoot|\$env:windir|\$env:ProgramFiles)"
+    + _TAIL +
+    r")" + _ARG_END
+)
+# Verbos de borrado (bash, PowerShell y sus alias, cmd) y marcas de recursión
+# (-r, -rf, -fr, -R, --recursive, -Recurse, /s).
+_DELETE_VERB = r"(?:\brm|\brmdir|\brd|\bdel|\berase|\bRemove-Item|\bri)(?=\s|$)"
+_RECURSE_FLAG = r"\s(?:-[a-z]*r[a-z]*|--recursive|/s)(?=\s|/|$)"
+_LISTER = r"(?:\bfind|\bls|\bdir|\bgci|\bGet-ChildItem)(?=\s)"
+
 FORBIDDEN_COMMANDS_REGEX = [
     r"\bmkfs(\.\w+)?\b",
     r"\bdd\s+if=",
-    r"\brm\b.*?\s-[a-zA-Z0-9-]*[rR][a-zA-Z0-9-]*\b.*?\s+/(?:[*\s]|$)",
-    r"\brm\b.*?\s-[a-zA-Z0-9-]*[rR][a-zA-Z0-9-]*\b.*?\s+/(bin|boot|dev|etc|lib|lib64|proc|root|sbin|sys|usr|var|home)(?:/|\b)",
-    r"\bFormat-Volume\b",
+    # rm/Remove-Item/rd/del recursivo sobre un objetivo amplio (la marca, antes o después)
+    rf"{_DELETE_VERB}(?={_SEG}*{_RECURSE_FLAG}){_SEG}*?{_BROAD_TARGET}",
+    # find <amplio> ... -delete | -exec rm
+    rf"\bfind(?=\s){_SEG}*?{_BROAD_TARGET}{_SEG}*\s-(?:delete\b|exec(?:dir)?\s+\S*?\b(?:rm|shred|unlink)\b)",
+    # Get-ChildItem/ls/find <amplio> ... | Remove-Item / xargs rm
+    rf"{_LISTER}{_SEG}*?{_BROAD_TARGET}[^;&\n]*\|\s*(?:\S*xargs\b[^;&|\n]*)?{_DELETE_VERB}",
+    r"\bFormat-Volume\b|\bClear-Disk\b|\bInitialize-Disk\b",
+    r"\bformat(?:\.com)?\s+[a-z]:",
     r"\bdiskpart\b.*clean",
+    r"\bvssadmin\b.*\bdelete\s+shadows\b|\bwmic\b.*\bshadowcopy\b.*\bdelete\b",
     r":\(\)\s*\{\s*:\|:&\s*\};:",
-    r"\brm\b.*?\s-[a-zA-Z0-9-]*[rR][a-zA-Z0-9-]*\b.*?\s+(~|\$HOME|\"\$HOME\")/?(?:[*\s]|$)",
-    r"\bfind\s+/(?:\s|$).*-delete\b",
     r"\b(shutdown|reboot|poweroff|halt)\b",
     r"\bStop-Computer\b|\bRestart-Computer\b",
     r"(>|\btee\b|\bmv\b|\bcp\b).*?/etc/(fstab|passwd|shadow|sudoers)\b",
@@ -400,8 +440,12 @@ FORBIDDEN_COMMANDS_REGEX = [
 ]
 
 # Comandos que NO se bloquean pero piden confirmación hablada (si hay manejador registrado).
+# [FIX SEG-2] + rd/erase/ri (cmd y alias de PowerShell), find -delete/-exec rm, shred,
+# unlink, rsync --delete y Clear-Content/Clear-RecycleBin: borran sin decir «rm».
 CONFIRM_COMMANDS_REGEX = [
     r"\bsudo\b", r"(^|[;&|]\s*)su\b", r"\brm\b", r"\brmdir\b", r"\bRemove-Item\b", r"\bdel\s",
+    r"\b(rd|erase|ri)\s", r"\bfind\b.*\s-(delete\b|exec(dir)?\s)", r"\bshred\b", r"\bunlink\b",
+    r"\brsync\b.*--delete", r"\bClear-(Content|RecycleBin)\b",
     r"\bkill(all)?\b", r"\bpkill\b", r"\bStop-Process\b", r"\btaskkill\b",
     r"\b(pip3?|npm|apt|apt-get|dnf|yum|pacman|winget|choco)\s+(install|remove|uninstall|upgrade)\b",
     r"\bsystemctl\b", r"\bchmod\b\s+-R", r"\bchown\b", r"\bgit\s+(push|reset\s+--hard|clean)\b",

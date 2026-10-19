@@ -228,7 +228,11 @@ def _extract_embedded_tool_calls(
 
 
 # Inicio de una llamada a herramienta escrita como texto: lo que venga detrás no se lee en voz alta.
-_TOOL_MARKUP_RE = re.compile(r'\{\s*"(?:name|tool|function|herramienta|type)"\s*:|<tool_call|<function\b')
+# [FIX CER-12] Cualquier objeto JSON, no solo los que empiezan por "name"/"tool"/...: el
+# extractor también acepta {"arguments": ..., "name": ...} o {"action": "open_app", ...} (y
+# las claves aplanadas en cualquier orden). Si al final no era una llamada, rest() lo devuelve
+# y se lee igual, solo que al terminar la respuesta.
+_TOOL_MARKUP_RE = re.compile(r'\{\s*"[^"\\\n]{1,24}"\s*:|<tool_call|<function\b')
 
 
 class _ToolMarkupGate:
@@ -240,7 +244,7 @@ class _ToolMarkupGate:
     hasta el siguiente trozo.
     """
 
-    _HOLD = 24  # caracteres que se retienen tras un '{' o '<' hasta saber si es un marcador
+    _HOLD = 32  # caracteres que se retienen tras un '{' o '<' hasta saber si es un marcador
 
     def __init__(self) -> None:
         self.text = ""
@@ -318,8 +322,12 @@ def _run_cli_stream(
     timeout: float,
     label: str,
     error_hint: Optional[Callable[[str], str]] = None,
+    stdin_text: Optional[str] = None,
 ) -> Generator[Dict[str, Any], None, None]:
     """Ejecuta un CLI headless (agy, claude) y convierte su salida en eventos.
+
+    - `stdin_text`: el prompt va por la entrada estándar en vez de en la línea de comandos
+      (shims `.cmd` de Windows, que cmd.exe corta a 8191 caracteres).
 
     - Watchdog: si el CLI se cuelga (red, sesión caducada) se mata a los `timeout` segundos;
       sin él, `for line in proc.stdout` bloqueaba el turno (y el barge-in) sin límite.
@@ -340,7 +348,7 @@ def _run_cli_stream(
                 cwd=str(cwd),
                 stdout=subprocess.PIPE,
                 stderr=err,  # a fichero: un PIPE sin leer podría bloquear el proceso
-                stdin=subprocess.DEVNULL,
+                stdin=subprocess.PIPE if stdin_text is not None else subprocess.DEVNULL,
                 text=True,
                 encoding="utf-8",
                 errors="replace",
@@ -357,6 +365,17 @@ def _run_cli_stream(
         watchdog = threading.Timer(timeout, _expire)
         watchdog.daemon = True
         watchdog.start()
+        if stdin_text is not None:
+            # En un hilo: si el CLI escribe antes de leerlo todo, escribir aquí bloquearía
+            # con las dos tuberías llenas.
+            def _feed_stdin() -> None:
+                try:
+                    proc.stdin.write(stdin_text)
+                    proc.stdin.close()
+                except Exception:
+                    pass  # el CLI terminó o se mató antes de leer: lo informa su salida
+
+            threading.Thread(target=_feed_stdin, daemon=True).start()
         try:
             for line in proc.stdout:
                 full += line
@@ -477,6 +496,29 @@ def find_agy() -> Optional[str]:
     return None
 
 
+# [FIX CER-14] Un `.cmd`/`.bat` (los CLI instalados con npm en Windows) se ejecuta a través
+# de cmd.exe, que corta la línea entera a 8191 caracteres, no a los 32767 de CreateProcess.
+_CMD_EXE_LINE_LIMIT = 8191
+
+
+def _runs_through_cmd_exe(executable: str) -> bool:
+    return sys.platform == "win32" and Path(executable).suffix.lower() in (".cmd", ".bat")
+
+
+def _fit_cmd_exe_line(build: Callable[[int], List[str]], limit: int) -> List[str]:
+    """Construye la orden con `build(max_chars)` reduciendo el prompt hasta que la línea que
+    verá cmd.exe (comillas escapadas y la ruta de node que añade el shim incluidas) quepa."""
+    budget = limit
+    margin = 600  # «"C:\Program Files\nodejs\node.exe" "...\cli.js"» que añade el shim
+    for _ in range(8):
+        cmd = build(budget)
+        overflow = len(subprocess.list2cmdline(cmd)) - (limit - margin)
+        if overflow <= 0:
+            return cmd
+        budget = max(budget - overflow - 64, 500)
+    return cmd
+
+
 _FALLBACK_NEXT = {
     "gemini": "antigravity",
     "gemini_live": "antigravity",
@@ -524,7 +566,18 @@ class ZaraRouter:
 
     # Palabra de activación y muletillas al principio («Oye Zara, ...», «Hola Zara, ...») y
     # «Zara» al final («Gracias, Zara»): no dicen nada sobre si la orden necesita herramientas.
-    _WAKE_PREFIX_RE = re.compile(r"^(?:(?:hola|hey|oye|ey)\b[\W_]*)*(?:zara\b[\W_]*)?")
+    # [FIX CER-6] También los saludos de varias palabras («buenos días», «buenas tardes»,
+    # «qué tal», «cómo estás») y antes o después de «Zara»: «Buenas tardes Zara, investiga…»
+    # se juzga por «investiga…», no por el saludo.
+    _GREETING = (
+        r"(?:hola|hey|oye|ey|buen[oa]s(?:\s+(?:d[ií]as|tardes|noches))?"
+        r"|qu[ée]\s+tal|c[óo]mo\s+est[áa]s|c[óo]mo\s+te\s+va)\b[\W_]*"
+    )
+    _WAKE_PREFIX_RE = re.compile(rf"^(?:{_GREETING})*(?:zara\b[\W_]*)?(?:{_GREETING})*")
+    # Únicos patrones de cortesía que admiten continuación («qué hora es en Tokio»): el
+    # resto exige igualdad, para que «de nada, investiga…» o «cuándo es el partido» no se
+    # traten como charla y pierdan la orden.
+    _CONTINUABLE_PATTERNS = ("qué hora es", "que hora es", "qué día es", "que dia es", "qué fecha", "que fecha")
     _WAKE_SUFFIX_RE = re.compile(r"[\W_]*\bzara$")
 
     @staticmethod
@@ -547,9 +600,9 @@ class ZaraRouter:
         if any(k in low for k in ZaraRouter.GEMINI_KEYWORDS):
             return False
 
-        # Coincidencia con patrones de cortesía: los de una palabra exigen igualdad («hola»),
-        # los de varias admiten continuación («qué hora es en Tokio»).
-        if any(low == pat or (" " in pat and low.startswith(pat)) for pat in ZaraRouter.CONVERSATIONAL_PATTERNS):
+        # Coincidencia con patrones de cortesía: exigen igualdad («hola»), salvo la hora y la
+        # fecha, que admiten continuación («qué hora es en Tokio»).
+        if low in ZaraRouter.CONVERSATIONAL_PATTERNS or low.startswith(ZaraRouter._CONTINUABLE_PATTERNS):
             return True
 
         return len(words) <= 2 and not any(k in low for k in ZaraRouter.SYSTEM_COMMAND_KEYWORDS)
@@ -890,6 +943,11 @@ class GeminiProvider:
 # PROVEEDOR 3: CLAUDE (Anthropic API / Claude Code CLI)
 # =============================================================================
 
+def _short_error(text: Optional[str], limit: int = 300) -> str:
+    detail = (text or "").strip()
+    return detail[:limit].rstrip() + "..." if len(detail) > limit else detail
+
+
 def _claude_cli_hint(detail: str) -> str:
     low = detail.lower()
     if any(k in low for k in ("login", "log in", "auth", "api key", "credential")):
@@ -992,7 +1050,14 @@ class ClaudeProvider:
             # [FIX] Antes el CLI solo recibía messages[-1]: sin historial ni herramientas (nunca
             # podía actuar) y, en el paso 2, solo la observación sin la petición original.
             full_prompt = AntigravityProvider.build_prompt(messages, tools, effective_prompt)
-            cmd = [claude_bin, "-p", cli_safe_arg(claude_bin, full_prompt), "--setting-sources", "project"]
+            stdin_text: Optional[str] = None
+            if _runs_through_cmd_exe(claude_bin):
+                # [FIX CER-14] claude.cmd (npm) pasa por cmd.exe, que corta a 8191 caracteres:
+                # `claude -p` sin prompt lo lee de la entrada estándar, entero y sin aplanar.
+                cmd = [claude_bin, "-p", "--setting-sources", "project"]
+                stdin_text = full_prompt
+            else:
+                cmd = [claude_bin, "-p", cli_safe_arg(claude_bin, full_prompt), "--setting-sources", "project"]
             if self.cli_model_override:
                 cmd += ["--model", self.cli_model_override]
             yield from _run_cli_stream(
@@ -1002,6 +1067,7 @@ class ClaudeProvider:
                 timeout=AGY_TIMEOUT,
                 label="Claude CLI",
                 error_hint=_claude_cli_hint,
+                stdin_text=stdin_text,
             )
             return
 
@@ -1047,8 +1113,10 @@ class AntigravityProvider:
         messages: List[Dict[str, Any]],
         tools: Optional[List[Dict[str, Any]]],
         system_prompt: str,
+        max_chars: Optional[int] = None,
     ) -> str:
         """Un único prompt de texto: instrucciones + herramientas + historial reciente."""
+        max_chars = max_chars or cls.MAX_PROMPT_CHARS
         parts = [system_prompt.strip()]
         parts.append(
             "MODO DE TRABAJO: eres el cerebro de Zara, un asistente de voz. NO uses tus propias "
@@ -1068,11 +1136,13 @@ class AntigravityProvider:
         parts.append("CONVERSACIÓN:\n" + "\n".join(history))
         parts.append("Responde ahora como Zara al último mensaje.")
         prompt = "\n\n".join(parts)
-        if len(prompt) > cls.MAX_PROMPT_CHARS:
+        if len(prompt) > max_chars:
             # Se recorta por el principio del historial: lo último es lo que importa.
             head = "\n\n".join(parts[:3]) if tools else "\n\n".join(parts[:2])
-            tail = prompt[-(cls.MAX_PROMPT_CHARS - len(head) - 10):]
-            prompt = head + "\n\n[...]\n" + tail
+            keep = max_chars - len(head) - 10
+            if keep <= 0:  # ni las instrucciones caben: prompt[-0:] devolvería el prompt entero
+                return prompt[-max_chars:]
+            prompt = head + "\n\n[...]\n" + prompt[-keep:]
         return prompt
 
     def stream_chat(
@@ -1086,10 +1156,15 @@ class AntigravityProvider:
             yield {"type": "error", "error": "Antigravity CLI (agy) no está instalado o no está en el PATH."}
             return
 
-        prompt = self.build_prompt(messages, tools, system_prompt or SYSTEM_PROMPT)
-        cmd = [agy, "-p", cli_safe_arg(agy, prompt)]
-        if self.model:
-            cmd += ["--model", self.model]
+        def build(max_chars: Optional[int] = None) -> List[str]:
+            prompt = self.build_prompt(messages, tools, system_prompt or SYSTEM_PROMPT, max_chars)
+            cmd = [agy, "-p", cli_safe_arg(agy, prompt)]
+            if self.model:
+                cmd += ["--model", self.model]
+            return cmd
+
+        # [FIX CER-14] Un agy.cmd pasaría por cmd.exe (8191 caracteres): recortar a lo que cabe.
+        cmd = _fit_cmd_exe_line(build, _CMD_EXE_LINE_LIMIT) if _runs_through_cmd_exe(agy) else build()
         yield from _run_cli_stream(
             cmd,
             cwd=self._workdir,
@@ -1272,6 +1347,10 @@ class ZaraBrain:
             if has_error and not full_thought_text and not tool_calls_to_run:
                 # Cascada: gemini → antigravity → claude → ollama → gemini
                 failed_provider = chosen_provider
+                # [FIX CER-13] El error del cerebro PRINCIPAL lleva la pista útil («ejecute agy
+                # una vez para iniciar sesión»): el del respaldo ya no la sustituye.
+                primary_error = last_error
+                fallback_error: Optional[str] = None
                 chosen_provider = _FALLBACK_NEXT.get(chosen_provider, "gemini")
                 log.info("Activando fallback automático a: %s", chosen_provider)
                 events2 = self._execute_stream_with_fallback(
@@ -1294,13 +1373,13 @@ class ZaraBrain:
                     elif event.get("type") == "error":
                         # [FIX] Antes se ignoraba: turno mudo y se perdían pistas como
                         # «ejecute agy una vez para iniciar sesión».
-                        last_error = str(event.get("error") or "") or last_error
+                        fallback_error = str(event.get("error") or "") or fallback_error
                         log.warning("Fallo también en el respaldo %s: %s", chosen_provider, event.get("error"))
 
                 if not tool_calls_to_run and not full_thought_text:
-                    detail = (last_error or "").strip()
-                    if len(detail) > 300:
-                        detail = detail[:300].rstrip() + "..."
+                    detail = _short_error(primary_error or fallback_error)
+                    if primary_error and fallback_error:
+                        detail += f" Tampoco respondió el respaldo: {_short_error(fallback_error, 160)}"
                     msg = f"No he podido obtener respuesta, Señor VK. {detail}".strip()
                     self.history.append({"role": "assistant", "content": msg})
                     self._trim_history()
@@ -1378,7 +1457,15 @@ class ZaraBrain:
                     # (la observación es el último mensaje 'user', donde Gemini la añade).
                     result = dict(result)
                     screen_b64 = result.pop("base64_data")
-                    result["imagen"] = "captura adjunta a este mensaje como imagen (no como texto)"
+                    # [FIX CER-7] Solo GeminiProvider adjunta screen_b64: a agy, Claude u Ollama
+                    # no les llega la imagen y no deben inventarse lo que «ven».
+                    if chosen_provider in ("gemini", "gemini_live") and self.gemini.is_available():
+                        result["imagen"] = "captura adjunta a este mensaje como imagen (no como texto)"
+                    else:
+                        result["imagen"] = (
+                            "captura hecha, pero este cerebro no puede ver imágenes (solo Gemini con "
+                            "GEMINI_API_KEY): no describas la pantalla; dile al Señor VK que no puedes verla"
+                        )
 
                 if name == "run_shell" and not result.get("success"):
                     log.info("Comando falló (código %s). Enviando stderr para autocorrección.", result.get("exit_code"))
@@ -1479,6 +1566,15 @@ class ZaraBrain:
             yield from self.ollama.stream_chat(
                 self.history, tools=tools_to_pass, system_prompt=system_prompt
             )
+            return
+
+        if failed_provider:
+            # [FIX CER-13] Respaldo sin cerebro disponible: solo un error. El aviso genérico
+            # («compruebe Ollama o una clave de API») tapaba el motivo real del principal.
+            yield {
+                "type": "error",
+                "error": f"El cerebro de respaldo ({provider_name}) no está disponible.",
+            }
             return
 
         # Sin ningún cerebro disponible: NUNCA ejecutar el texto del usuario como

@@ -9,6 +9,7 @@ táctico desplegable).
 from __future__ import annotations
 import argparse
 import ctypes
+import errno
 import logging
 import logging.handlers
 import os
@@ -20,16 +21,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from PySide6 import QtCore, QtGui, QtWidgets
-
 import config
-from core.confirm import parse_confirmation
-from core.brain import ZaraBrain, list_ollama_models, _pick_default_ollama_model
-from core.ear import ContinuousEar, contains_wake_word
-from core.live import GeminiLiveSession
-from core.tools import set_confirmation_handler
-from core.voice import VoiceSynthesizer
-from ui.hud import HUDState, ZaraHUD
 
 _LOG_FORMAT = "%(asctime)s [%(levelname)s] %(name)s: %(message)s"
 logging.basicConfig(
@@ -43,6 +35,9 @@ CONFIRM_TIMEOUT_S = 25.0  # sin respuesta clara en este tiempo, la acción se ca
 NO_REPLY_MESSAGE = "Señor VK, el cerebro no devolvió respuesta. Revise el modelo seleccionado."
 LOG_MAX_BYTES = 2_000_000
 LOG_BACKUPS = 5
+# [FIX V1_-13] Tope de espera a que la voz pendiente empiece a sonar antes de devolver la bola
+# a reposo (si la síntesis falla o se cuelga, la bola no se queda en «PROCESANDO» para siempre).
+VOICE_SETTLE_TIMEOUT_S = 30.0
 
 
 # --- Registro a archivo (diagnóstico en producción) ---
@@ -96,6 +91,23 @@ def setup_logging(log_dir: Path, level_name: Optional[str] = None) -> Path:
     sys.excepthook = _log_uncaught
     threading.excepthook = _log_thread_exception
     return log_file
+
+
+# [FIX V1_-12] Lanzado como programa, el log a archivo se activa ANTES de importar Qt, torch
+# (core.ear), httpx (core.brain) o psutil (core.tools): si uno falla al importar, el traceback
+# queda en zara.log en vez de perderse con la consola. Importado desde los tests, no se toca.
+if __name__ == "__main__":
+    setup_logging(config.DATA_DIR / "logs")
+
+from PySide6 import QtCore, QtGui, QtWidgets  # noqa: E402
+
+from core.confirm import parse_confirmation  # noqa: E402
+from core.brain import ZaraBrain, list_ollama_models, _pick_default_ollama_model  # noqa: E402
+from core.ear import ContinuousEar, contains_wake_word  # noqa: E402
+from core.live import GeminiLiveSession  # noqa: E402
+from core.tools import set_confirmation_handler  # noqa: E402
+from core.voice import VoiceSynthesizer  # noqa: E402
+from ui.hud import HUDState, ZaraHUD  # noqa: E402
 
 
 # --- Instancia única ---
@@ -687,6 +699,7 @@ class ZaraController(QtCore.QObject):
         self.sig_user_speech.emit(clean_text)
         self.sig_hud_state.emit(HUDState.THINKING)
 
+        settle_hud = False
         with self._busy_lock:
             if not self._is_latest_turn(turn_id):
                 # [FIX AUD-10] Mientras esperaba el lock llegó otra orden (o se pulsó «Parar»):
@@ -726,24 +739,105 @@ class ZaraController(QtCore.QObject):
                 self.voice.say(f"Señor VK, ocurrió una anomalía: {exc}")
             finally:
                 self._is_busy = False
-                # [FIX V1_-13] Si no hay voz en curso ni otra orden detrás, la bola vuelve a
-                # reposo (si Zara habla, _on_voice_state_change la devolverá al terminar).
-                if self._is_latest_turn(turn_id) and not self.voice.is_speaking():
-                    self.sig_hud_state.emit(HUDState.IDLE)
+                settle_hud = True
+        if settle_hud:
+            # Fuera del lock: esperar a la voz no debe retrasar la orden siguiente.
+            self._return_hud_to_idle_when_silent(turn_id)
+
+    def _voice_pending(self) -> bool:
+        """True si quedan frases encoladas o sintetizándose que aún no han empezado a sonar."""
+        try:
+            return int(getattr(self.voice, "_pending_count", 0) or 0) > 0
+        except (TypeError, ValueError):
+            return False
+
+    def _return_hud_to_idle_when_silent(self, turn_id: Optional[int],
+                                        timeout: Optional[float] = None, poll: float = 0.05) -> None:
+        """[FIX V1_-13] Devuelve la bola a reposo al acabar el turno si Zara no va a hablar.
+
+        VoiceSynthesizer solo marca is_speaking() al REPRODUCIR la primera frase, no mientras
+        edge-tts la sintetiza (1-2 s): emitir IDLE en ese hueco hacía parpadear la bola
+        PROCESANDO -> REPOSO -> HABLANDO. Mientras quede voz pendiente se espera; si empieza a
+        sonar, _on_voice_state_change pondrá IDLE al terminar. Si la síntesis falla (la cola
+        se vacía sin sonar nada) o pasa el tope, se pone IDLE aquí. Otra orden posterior o
+        «Parar» cortan la espera: el estado ya no es de este turno.
+        """
+        deadline = time.monotonic() + (VOICE_SETTLE_TIMEOUT_S if timeout is None else timeout)
+        while True:
+            if not self._is_latest_turn(turn_id) or self._stop_event.is_set():
+                return
+            if self.voice.is_speaking():
+                return
+            if not self._voice_pending() or time.monotonic() >= deadline:
+                self.sig_hud_state.emit(HUDState.IDLE)
+                return
+            self._stop_event.wait(poll)
 
 
-def read_stdin_commands(controller: ZaraController, stream=None) -> None:
+def _stdin_in_background(stream) -> bool:
+    """True si `stream` es la terminal de control y este proceso está en segundo plano (POSIX)."""
+    if not hasattr(os, "tcgetpgrp"):  # Windows: no hay control de trabajos
+        return False
+    try:
+        return os.tcgetpgrp(stream.fileno()) != os.getpgrp()
+    except (OSError, ValueError, AttributeError):
+        return False
+
+
+def ignore_background_tty_reads(stream=None) -> bool:
+    """[FIX V1_-10] En POSIX, leer de la terminal estando en segundo plano («zara --cli &»,
+    Ctrl+Z y «bg») envía SIGTTIN, que DETIENE el proceso entero (micrófono y voz incluidos).
+    Ignorada la señal, esa lectura falla con EIO y read_stdin_commands espera a volver al
+    primer plano. Solo si stdin es una terminal; en Windows no existe SIGTTIN.
+    """
+    stream = sys.stdin if stream is None else stream
+    if not hasattr(signal, "SIGTTIN") or stream is None:
+        return False
+    try:
+        if not stream.isatty():
+            return False
+    except (OSError, ValueError, AttributeError):
+        return False
+    signal.signal(signal.SIGTTIN, signal.SIG_IGN)
+    return True
+
+
+def read_stdin_commands(controller: ZaraController, stream=None, retry_delay: float = 0.5) -> None:
     """[FIX V1_-10] Modo --cli: cada línea escrita es una orden (o la respuesta a una confirmación)."""
     stream = sys.stdin if stream is None else stream
     if stream is None:  # pythonw.exe en Windows no tiene consola
         return
-    try:
-        for line in stream:
-            if controller._stop_event.is_set():
-                break
-            controller._on_text_command(line)
-    except (OSError, ValueError):
-        pass  # terminal cerrada
+    while not controller._stop_event.is_set():
+        try:
+            line = stream.readline()
+        except OSError as exc:
+            # En segundo plano (SIGTTIN ignorada) la lectura da EIO: se reintenta hasta volver
+            # al primer plano. Cualquier otro error (terminal cerrada) termina la lectura.
+            if exc.errno == errno.EIO and _stdin_in_background(stream):
+                controller._stop_event.wait(retry_delay)
+                continue
+            return
+        except ValueError:
+            return  # stdin cerrado
+        if not line:
+            return  # fin de la entrada (Ctrl+D, tubería agotada)
+        if controller._stop_event.is_set():
+            return
+        controller._on_text_command(line)
+
+
+def forget_injected_qt_platform(previous: Optional[str], env=None) -> None:
+    """[FIX MUL-5] Tras crear la QApplication, deja QT_QPA_PLATFORM como lo puso el usuario.
+
+    prepare_qt_platform() lo fija («xcb;wayland») solo para esta app; Qt ya eligió el plugin
+    al crear la QApplication, y si se queda en os.environ lo heredan todos los hijos
+    (gtk-launch, xdg-open, las apps que abre Zara), forzando XWayland en apps Qt nativas.
+    """
+    env = os.environ if env is None else env
+    if previous is None:
+        env.pop("QT_QPA_PLATFORM", None)
+    else:
+        env["QT_QPA_PLATFORM"] = previous
 
 
 _INSTANCE_LOCK: Optional[QtCore.QLockFile] = None
@@ -756,7 +850,7 @@ def main() -> None:
     parser.add_argument("--cli", action="store_true", help="Ejecutar en modo terminal sin HUD gráfico.")
     args = parser.parse_args()
 
-    log_file = setup_logging(config.DATA_DIR / "logs")
+    log_file = setup_logging(config.DATA_DIR / "logs")  # idempotente: ya activo si es __main__
     log.info("Registro de %s en %s", config.APP_TITLE, log_file)
 
     # [FIX V1_-8] Una sola Zara a la vez: dos abrirían el micrófono y duplicarían cada orden.
@@ -771,11 +865,13 @@ def main() -> None:
         # así que funciona por SSH o en un TTY sin display ni plugin xcb.
         app = QtCore.QCoreApplication.instance() or QtCore.QCoreApplication(sys.argv)
     else:
+        previous_qpa = os.environ.get("QT_QPA_PLATFORM")
         platform_error = prepare_qt_platform()
         if platform_error:
             log.error(platform_error)
             sys.exit(1)
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+        forget_injected_qt_platform(previous_qpa)
     app.setApplicationName("ZARA")
     app.setApplicationVersion(config.VERSION_FULL)
     if not args.cli:
@@ -804,6 +900,7 @@ def main() -> None:
 
     if args.cli:
         print("Modo consola: escriba una orden y pulse Intro (Ctrl+C para salir).", flush=True)
+        ignore_background_tty_reads()
         threading.Thread(target=read_stdin_commands, args=(controller,), daemon=True, name="zara-stdin").start()
 
     try:

@@ -1,9 +1,11 @@
 """Pruebas del grupo app_hud: main.py (controlador y arranque), ui/hud.py y core/confirm.py."""
 
+import errno
 import io
 import logging
 import os
 import queue
+import signal
 import sys
 import threading
 import time
@@ -553,3 +555,171 @@ def test_shutdown_es_idempotente_y_quit_no_se_repite(make_controller, monkeypatc
     monkeypatch.setattr(main.QtCore.QCoreApplication, "instance", staticmethod(lambda: _App()))
     ctrl._on_quit_requested()  # ya se está cerrando: no relanza el cierre
     assert quits == []
+
+
+# =========================================================================== ronda 2
+# --------------------------------------------------------------------------- SEG-10 (ronda 2)
+@pytest.mark.parametrize("texto", [
+    "Sí, bórralo", "Sí, ciérrala", "Sí, ejecútalo", "claro que sí", "sí, adelante, hazlo",
+])
+def test_confirmacion_acepta_afirmaciones_naturales_con_verbo(texto):
+    assert parse_confirmation(texto) is True
+
+
+@pytest.mark.parametrize("texto,esperado", [
+    ("bórralo", None),             # sin «sí» explícito no basta
+    ("claro", None), ("dale", None), ("ok", None),
+    ("si lo borras", None),        # «si» condicional + verbo fuera de la lista
+    ("sí, borra", None),
+    ("sí, espera", None),
+    ("claro que no", False),
+    ("sí, no lo borres", False),
+    ("sí, ni se te ocurra", False),
+    ("sí, jamás lo cierres", False),
+])
+def test_confirmacion_sigue_rechazando_muletillas_y_negaciones(texto, esperado):
+    assert parse_confirmation(texto) is esperado
+
+
+# --------------------------------------------------------------------------- V1_-13 (ronda 2)
+def test_bola_no_pasa_a_reposo_mientras_la_voz_se_sintetiza(make_controller):
+    ctrl = make_controller()
+    states = []
+    # Directa: la señal se emite desde el hilo del turno, no desde el de la GUI.
+    ctrl.sig_hud_state.connect(states.append, QtCore.Qt.DirectConnection)
+    ctrl.voice._pending_count = 1  # frase encolada, edge-tts aún sintetizando
+    turn_id = ctrl._next_turn_id()
+    done = threading.Event()
+    t = threading.Thread(target=lambda: (ctrl._process_query("Zara, hola", turn_id), done.set()))
+    t.start()
+    assert _wait_for(lambda: HUDState.THINKING in states)
+    time.sleep(0.2)
+    assert not done.is_set() and HUDState.IDLE not in states
+    ctrl.voice.speaking = True  # empieza a sonar: _on_voice_state_change se ocupará del reposo
+    assert done.wait(2.0)
+    assert HUDState.IDLE not in states
+
+
+def test_bola_vuelve_a_reposo_si_la_sintesis_falla(make_controller):
+    ctrl = make_controller()
+    states = []
+    # Directa: la señal se emite desde el hilo del turno, no desde el de la GUI.
+    ctrl.sig_hud_state.connect(states.append, QtCore.Qt.DirectConnection)
+    ctrl.voice._pending_count = 1
+    turn_id = ctrl._next_turn_id()
+    t = threading.Thread(target=ctrl._process_query, args=("Zara, hola", turn_id))
+    t.start()
+    assert _wait_for(lambda: HUDState.THINKING in states)
+    time.sleep(0.15)
+    assert HUDState.IDLE not in states
+    ctrl.voice._pending_count = 0  # la síntesis falló: no sonará nada
+    t.join(2.0)
+    assert states[-1] == HUDState.IDLE
+
+
+def test_espera_de_reposo_tiene_tope_y_cede_ante_otra_orden(make_controller):
+    ctrl = make_controller()
+    states = []
+    ctrl.sig_hud_state.connect(states.append)
+    ctrl.voice._pending_count = 3
+    turn_id = ctrl._next_turn_id()
+    ctrl._return_hud_to_idle_when_silent(turn_id, timeout=0.1, poll=0.01)
+    assert states == [HUDState.IDLE]
+    ctrl._next_turn_id()  # llegó otra orden: el estado ya no es de ese turno
+    ctrl._return_hud_to_idle_when_silent(turn_id, timeout=0.1, poll=0.01)
+    assert states == [HUDState.IDLE]
+
+
+# --------------------------------------------------------------------------- MUL-5 (ronda 2)
+def test_qt_qpa_platform_inyectado_no_lo_heredan_los_hijos():
+    env = {"XDG_SESSION_TYPE": "wayland", "WAYLAND_DISPLAY": "wayland-0", "DISPLAY": ":0"}
+    previous = env.get("QT_QPA_PLATFORM")
+    assert main.prepare_qt_platform(env, "linux", xcb_cursor_ok=True) is None
+    assert env["QT_QPA_PLATFORM"] == "xcb;wayland"
+    main.forget_injected_qt_platform(previous, env)  # ya creada la QApplication
+    assert "QT_QPA_PLATFORM" not in env
+    # Si lo fijó el usuario, se respeta tal cual.
+    env = {"QT_QPA_PLATFORM": "wayland"}
+    main.forget_injected_qt_platform("wayland", env)
+    assert env == {"QT_QPA_PLATFORM": "wayland"}
+
+
+def test_main_retira_qt_qpa_platform_tras_crear_la_app():
+    import inspect
+    src = inspect.getsource(main.main)
+    assert src.index("QApplication(sys.argv)") < src.index("forget_injected_qt_platform(previous_qpa)")
+
+
+# --------------------------------------------------------------------------- V1_-10 (ronda 2)
+class _BackgroundTTY:
+    """stdin de una terminal: en segundo plano (SIGTTIN ignorada) readline da EIO."""
+
+    def __init__(self, lines, eio_times=2):
+        self.lines = list(lines)
+        self.eio_times = eio_times
+
+    def readline(self):
+        if self.eio_times:
+            self.eio_times -= 1
+            raise OSError(errno.EIO, "Input/output error")
+        return self.lines.pop(0) if self.lines else ""
+
+    def fileno(self):
+        return 0
+
+    def isatty(self):
+        return True
+
+
+def test_cli_en_segundo_plano_espera_al_primer_plano(make_controller, monkeypatch):
+    ctrl = make_controller(cli_mode=True)
+    answers = queue.Queue(maxsize=1)
+    ctrl._confirm_queue = answers
+    monkeypatch.setattr(main, "_stdin_in_background", lambda _s: True)
+    main.read_stdin_commands(ctrl, _BackgroundTTY(["sí\n"]), retry_delay=0.01)
+    assert answers.get_nowait() is True
+
+
+def test_cli_terminal_cerrada_termina_la_lectura(make_controller, monkeypatch):
+    ctrl = make_controller(cli_mode=True)
+    monkeypatch.setattr(main, "_stdin_in_background", lambda _s: False)
+    main.read_stdin_commands(ctrl, _BackgroundTTY(["Zara, hola\n"], eio_times=1), retry_delay=0.01)
+    assert ctrl.brain.calls == []
+
+
+def test_ignora_sigttin_solo_con_terminal_y_en_posix(monkeypatch):
+    calls = []
+    monkeypatch.setattr(main.signal, "signal", lambda sig, handler: calls.append((sig, handler)))
+    if hasattr(signal, "SIGTTIN"):
+        assert main.ignore_background_tty_reads(_BackgroundTTY([])) is True
+        assert calls == [(signal.SIGTTIN, signal.SIG_IGN)]
+    assert main.ignore_background_tty_reads(io.StringIO("")) is False  # tubería: nada que hacer
+    # Windows: no existe SIGTTIN.
+    monkeypatch.delattr(main.signal, "SIGTTIN", raising=False)
+    calls.clear()
+    assert main.ignore_background_tty_reads(_BackgroundTTY([])) is False
+    assert calls == []
+
+
+def test_stdin_en_segundo_plano_sin_tcgetpgrp_es_falso(monkeypatch):
+    monkeypatch.delattr(main.os, "tcgetpgrp", raising=False)  # Windows
+    assert main._stdin_in_background(_BackgroundTTY([])) is False
+
+
+# --------------------------------------------------------------------------- V1_-12 (ronda 2)
+def test_error_de_importacion_queda_en_el_log(tmp_path):
+    import subprocess
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    script = (
+        "import sys, runpy, pathlib\n"
+        f"sys.path.insert(0, {root!r})\n"
+        "import config\n"
+        f"config.DATA_DIR = pathlib.Path({str(tmp_path)!r})\n"
+        "sys.modules['core.ear'] = None  # simula torch roto: falla el import de core.ear\n"
+        f"runpy.run_path({os.path.join(root, 'main.py')!r}, run_name='__main__')\n"
+    )
+    proc = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True,
+                          timeout=120, env={**os.environ, "QT_QPA_PLATFORM": "offscreen"})
+    assert proc.returncode != 0
+    log_text = (tmp_path / "logs" / "zara.log").read_text(encoding="utf-8")
+    assert "Excepción no capturada" in log_text and "core.ear" in log_text

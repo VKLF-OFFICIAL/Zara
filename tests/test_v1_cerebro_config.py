@@ -1,7 +1,8 @@
 """Regresiones del grupo «cerebro_config» (core/brain.py y config.py).
 
 Cada test falla con el código anterior a la corrección: CER-6, CER-7, CER-8, CER-12,
-CER-13, CER-14, MUL-7, V1_-4 y SEG-13.
+CER-13, CER-14, MUL-7, V1_-4 y SEG-13. Segunda ronda (al final): SEG-2, O_BINARY del .env
+en Windows, CER-6, CER-14, CER-13, CER-12 y CER-7.
 """
 
 import json
@@ -478,3 +479,219 @@ def test_cli_watchdog_kills_whole_tree_on_windows(monkeypatch):
     brain_mod._kill_process_tree(_Proc())
     assert calls[0] == ["taskkill", "/F", "/T", "/PID", "4321"]
     assert calls[-1] == "kill"
+
+
+# =============================================================================
+# SEGUNDA RONDA
+# =============================================================================
+
+def _forbidden(cmd):
+    import re
+
+    return any(re.search(p, cmd, re.IGNORECASE) for p in config.FORBIDDEN_COMMANDS_REGEX)
+
+
+def _confirms(cmd):
+    import re
+
+    return any(re.search(p, cmd, re.IGNORECASE) for p in config.CONFIRM_COMMANDS_REGEX)
+
+
+# --- SEG-2: borrados masivos evadían el guardarraíl ---------------------------
+
+@pytest.mark.parametrize("cmd", [
+    # bash: HOME en todas sus formas, /home, la raíz con comodín, la marca al final
+    "rm -rf ~/*", "rm -rf ~/.*", 'rm -rf "$HOME"', 'rm -rf "$HOME"/*', "rm -rf ${HOME}",
+    "rm --recursive --force ~", "rm / -rf", "rm -rf -- /", "rm -rf '/'", "/bin/rm -rf /home",
+    "rm -rf /home/*", "rm -rf /home/vk", "cd /tmp; rm -rf ~", "rm -fr ~/ && echo ok",
+    "find ~ -type f -delete", "find $HOME -exec rm -rf {} +", "find /home -delete",
+    "find ~ -name '*.txt' | xargs rm -f",
+    # PowerShell y sus alias
+    "Remove-Item -Recurse -Force C:\\", "Remove-Item C:\\Users\\vk -Recurse -Force",
+    "Remove-Item -Recurse -Force $env:USERPROFILE", 'Remove-Item -Recurse "$env:USERPROFILE\\*"',
+    "ri -r -fo C:\\*", "rm -r -fo $HOME", "Remove-Item -Recurse -Force C:\\Windows\\System32",
+    'Remove-Item -Recurse -Force "C:\\Program Files"',
+    "Get-ChildItem C:\\ -Recurse | Remove-Item -Force", "gci ~ | ri -r -fo",
+    "Get-ChildItem -Path $env:USERPROFILE -Recurse | Remove-Item",
+    # cmd
+    "del /s /q C:\\*", "del /f /s /q %USERPROFILE%", "rd /s /q C:\\", "rmdir /s /q C:\\Users",
+    "rd /s/q %USERPROFILE%",
+    # discos y copias de seguridad
+    "format C: /q", "Clear-Disk -Number 0 -RemoveData", "vssadmin delete shadows /all /quiet",
+])
+def test_mass_deletes_are_forbidden(cmd):
+    assert _forbidden(cmd), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "ls -la", "rm -rf /tmp/x", "rm -rf ~/proyecto/build", "rm -rf ~/proyecto/build/*",
+    "rm -rf /home/vk/proyecto/build", "Remove-Item -Recurse -Force C:\\Users\\vk\\Documents\\build",
+    "rd /s /q build", "del /s *.tmp", "find . -name '*.pyc' -delete", "find ~ -name '*.txt'",
+    "ls ~ | grep x", "Get-ChildItem C:\\ | Select-Object Name", "dir /s C:\\", "ls -R ~",
+    "cp -r ~ /tmp/backup", "rm -rf node_modules",
+])
+def test_scoped_commands_are_not_forbidden(cmd):
+    assert not _forbidden(cmd), cmd
+
+
+@pytest.mark.parametrize("cmd", [
+    "rm -rf ~/proyecto/build", "find . -delete", "find . -exec rm {} +", "rd /s /q build",
+    "erase x.txt", "ri x", "shred -u a", "unlink a", "rsync -a --delete a/ b/",
+    "Clear-Content log.txt", "rm -rf $(echo /)",
+])
+def test_other_deletes_ask_for_confirmation(cmd):
+    assert _confirms(cmd), cmd
+
+
+def test_guardrail_regex_is_not_catastrophically_slow():
+    import time
+
+    t0 = time.monotonic()
+    for cmd in ("rm -r" + " /etcx/a" * 3000, "rm -rf " + "a " * 5000, "find " + "~/a " * 3000):
+        _forbidden(cmd)
+    assert time.monotonic() - t0 < 5
+
+
+# --- NUEVO: el .env se escribía en modo texto del CRT en Windows ---------------
+
+def test_write_private_opens_in_binary_mode(tmp_path, monkeypatch):
+    fake_binary = 0x40000000  # valor ficticio que no usa ningún flag de Linux
+    seen = []
+    real_open = os.open
+
+    def spy(path, flags, mode=0o777, **kw):
+        seen.append(flags)
+        return real_open(path, flags & ~fake_binary, mode, **kw)
+
+    monkeypatch.setattr(os, "O_BINARY", fake_binary, raising=False)
+    monkeypatch.setattr(os, "open", spy)
+    config._write_private(tmp_path / ".env", "A=1\n")
+    assert seen and seen[0] & fake_binary
+    assert (tmp_path / ".env").read_text(encoding="utf-8") == "A=1\n"
+
+
+# --- CER-6: saludos de varias palabras seguidos de una orden -------------------
+
+@pytest.mark.parametrize("query", [
+    "Buenas tardes Zara, investiga quién ganó el partido",
+    "buenos días, investiga quién ganó el partido",
+    "Zara, buenos días, investiga quién ganó el partido",
+    "qué tal, ¿quién ganó la liga ayer?",
+    "de nada, ahora investiga quién ganó el partido",
+    "cuándo es el próximo partido del Betis",
+])
+def test_multiword_greeting_does_not_swallow_the_order(query):
+    assert ZaraRouter.is_conversational(query) is False
+
+
+@pytest.mark.parametrize("query", [
+    "Buenos días, Zara", "buenas noches", "¿Qué tal, Zara?", "qué hora es en Tokio",
+    "Hola Zara, ¿cómo estás?", "buenas, ¿qué hora es?",
+])
+def test_plain_greetings_still_chat(query):
+    assert ZaraRouter.is_conversational(query) is True
+
+
+# --- CER-14: claude.cmd pasa por cmd.exe (8191 caracteres) ---------------------
+
+LONG_HISTORY = [{"role": "user", "content": "x" * 6000}, {"role": "assistant", "content": "y" * 6000},
+                {"role": "user", "content": "Zara, crea una carpeta web en Documentos"}]
+
+
+def test_claude_cmd_shim_gets_prompt_by_stdin(monkeypatch):
+    captured = {}
+
+    def fake_run(cmd, **kw):
+        captured["cmd"], captured["kw"] = cmd, kw
+        return iter([])
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(brain_mod.shutil, "which",
+                        lambda name: r"C:\Users\vk\AppData\Roaming\npm\claude.cmd" if name == "claude" else None)
+    monkeypatch.setattr(brain_mod, "_run_cli_stream", fake_run)
+    list(ClaudeProvider(api_key="").stream_chat(LONG_HISTORY, tools=TOOL_DEFINITIONS, system_prompt="SYS"))
+    assert len(subprocess.list2cmdline(captured["cmd"])) < 8191
+    assert "crea una carpeta web" in captured["kw"]["stdin_text"]
+    assert "\n" in captured["kw"]["stdin_text"]  # entero, sin aplanar
+
+
+def test_agy_cmd_shim_fits_cmd_exe_line(monkeypatch):
+    captured = {}
+    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(brain_mod, "find_agy", lambda: r"C:\Users\vk\AppData\Roaming\npm\agy.cmd")
+    monkeypatch.setattr(brain_mod, "_run_cli_stream", lambda cmd, **kw: captured.update(cmd=cmd) or iter([]))
+    list(AntigravityProvider().stream_chat(LONG_HISTORY, tools=TOOL_DEFINITIONS, system_prompt="SYS"))
+    line = subprocess.list2cmdline(captured["cmd"])
+    assert len(line) <= 8191 - 600
+    assert "crea una carpeta web" in line  # se recorta lo viejo, no la última petición
+
+
+def test_build_prompt_never_exceeds_tiny_limit():
+    prompt = AntigravityProvider.build_prompt(LONG_HISTORY, TOOL_DEFINITIONS, "SYS", max_chars=500)
+    assert len(prompt) <= 500
+
+
+@POSIX_ONLY
+def test_run_cli_stream_feeds_stdin(tmp_path):
+    cmd = [sys.executable, "-c", "import sys; d = sys.stdin.read(); print('recibidos', len(d), d[-5:])"]
+    events = list(brain_mod._run_cli_stream(cmd, cwd=tmp_path, tools=None, timeout=30, label="t",
+                                            stdin_text="a" * 200000 + "FINAL"))
+    text = "".join(e.get("token", "") for e in events)
+    assert "recibidos 200005 FINAL" in text
+
+
+# --- CER-13: la pista del cerebro principal no se pierde ------------------------
+
+def test_agy_login_hint_survives_when_no_backup(brain, monkeypatch):
+    hint = "Antigravity CLI falló (código 41): auth. Abra una terminal y ejecute «agy» una vez para iniciar sesión"
+    monkeypatch.setattr(brain.gemini, "is_available", lambda: False)
+    monkeypatch.setattr(brain.claude, "is_available", lambda: False)
+    monkeypatch.setattr(brain.ollama, "is_available", lambda: False)
+    monkeypatch.setattr(brain.antigravity, "is_available", lambda: True)
+    monkeypatch.setattr(brain.antigravity, "stream_chat", lambda *a, **k: iter([{"type": "error", "error": hint}]))
+    out = "".join(brain.run_react_agent("Zara, investiga quién ganó el partido", preferred_provider="antigravity"))
+    assert "iniciar sesión" in out
+    assert "Compruebe que Ollama" not in out
+
+
+# --- CER-12: JSON de llamada que no empieza por "name" ----------------------------
+
+@pytest.mark.parametrize("call", [
+    '{"action": "open_app", "target": "notepad"}',
+    '{"arguments": {"action": "open_app", "target": "notepad"}, "name": "os_control"}',
+])
+def test_gate_hides_any_json_tool_call(call):
+    gate = brain_mod._ToolMarkupGate()
+    text = "Claro, lo abro ahora mismo. " + call
+    spoken = "".join(gate.feed(text[i:i + 7]) for i in range(0, len(text), 7))
+    assert _extract_embedded_tool_calls(text, KNOWN, TOOL_DEFINITIONS)
+    assert "Claro, lo abro" in spoken and "notepad" not in spoken
+
+
+def test_gate_releases_plain_json_that_was_not_a_call():
+    gate = brain_mod._ToolMarkupGate()
+    text = 'La respuesta es {"temperatura": 20} grados.'
+    spoken = gate.feed(text)
+    events = list(brain_mod._final_text_events([], text, False, gate))
+    assert spoken + "".join(e["token"] for e in events) == text
+
+
+# --- CER-7: la nota de la captura no miente --------------------------------------
+
+@pytest.mark.parametrize("gemini_ok, expected", [(False, "no puede ver"), (True, "adjunta")])
+def test_screenshot_note_matches_provider(brain, monkeypatch, gemini_ok, expected):
+    step = {"n": 0}
+
+    def stream(provider, screen_b64=None, is_chat_only=False, system_prompt=None, failed_provider=None):
+        step["n"] += 1
+        if step["n"] == 1:
+            yield {"type": "tool_call", "name": "inspect_screen", "args": {"prompt": "qué ves"}}
+        else:
+            yield {"type": "token", "token": "Listo."}
+
+    monkeypatch.setattr(brain.gemini, "is_available", lambda: gemini_ok)
+    monkeypatch.setattr(brain, "_execute_stream_with_fallback", stream)
+    monkeypatch.setattr(brain_mod, "execute_tool", lambda n, a: {"success": True, "base64_data": "QUJD"})
+    list(brain.run_react_agent("Zara, ¿qué ves?", preferred_provider="gemini" if gemini_ok else "antigravity"))
+    obs = [m["content"] for m in brain.history if "Resultado de inspect_screen" in m["content"]]
+    assert obs and expected in obs[0]
