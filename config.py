@@ -217,8 +217,20 @@ CONFIRM_COMMANDS_REGEX = [
 # PROTECTED_EXACT: solo el directorio en sí (no se puede borrar/sobrescribir, pero sí
 # trabajar dentro: el agente debe poder escribir en el HOME del usuario).
 if sys.platform == "win32":
-    PROTECTED_TREES = [os.environ.get("SystemRoot", r"C:\Windows"), r"C:\Program Files", r"C:\Program Files (x86)"]
-    PROTECTED_EXACT = [str(Path.home()), "C:\\"]
+    PROTECTED_TREES = [
+        os.environ.get("SystemRoot", r"C:\Windows"),
+        r"C:\Program Files",
+        r"C:\Program Files (x86)",
+        "/etc",
+        "/boot",
+        "/bin",
+        "/sbin",
+        "/lib",
+        "/usr",
+        "/var",
+        "/root",
+    ]
+    PROTECTED_EXACT = [str(Path.home()), "C:\\", "/"]
 else:
     PROTECTED_TREES = ["/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/proc", "/sbin", "/sys", "/usr"]
     PROTECTED_EXACT = ["/", "/home", "/root", "/var", str(Path.home())]

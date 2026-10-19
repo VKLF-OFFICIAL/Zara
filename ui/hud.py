@@ -361,6 +361,8 @@ class ZaraPanel(QtWidgets.QWidget):
     _GEMINI_LIVE_MODEL_OPTIONS = [
         ("Auto (más reciente)", "auto"),
         ("Gemini 2.5 Flash Live", "gemini-2.5-flash-native-audio-preview-12-2025"),
+        ("Gemini 2.5 Flash Live (Preview)", "gemini-2.5-flash-preview-native-audio-dialog"),
+        ("Gemini 2.0 Flash Live", "gemini-2.0-flash-live-001"),
     ]
     _CLAUDE_MODEL_OPTIONS = [
         ("Por defecto", ""),
