@@ -25,7 +25,9 @@ import base64
 import json
 import logging
 import re
+import os
 import shutil
+from pathlib import Path
 import subprocess
 import tempfile
 import threading
@@ -258,6 +260,26 @@ def _summarize_observations_locally(observations: List[str]) -> str:
 # ENRUTADOR RÁPIDO (< 10 MS)
 # =============================================================================
 
+def find_agy() -> Optional[str]:
+    """Ruta de Antigravity CLI aunque no esté en el PATH.
+
+    El instalador de Windows deja `agy.exe` en %LOCALAPPDATA%\\agy\\bin, pero las terminales
+    (y Zara) abiertas antes de instalarlo no ven ese PATH hasta reiniciarse.
+    """
+    found = shutil.which(AGY_BIN)
+    if found:
+        return found
+    candidates = []
+    local_appdata = os.environ.get("LOCALAPPDATA")
+    if local_appdata:
+        candidates.append(Path(local_appdata) / "agy" / "bin" / "agy.exe")
+    candidates.append(Path.home() / ".local" / "bin" / "agy")
+    for candidate in candidates:
+        if candidate.is_file():
+            return str(candidate)
+    return None
+
+
 _FALLBACK_NEXT = {
     "gemini": "antigravity",
     "gemini_live": "antigravity",
@@ -327,7 +349,7 @@ class ZaraRouter:
 
         low = query.lower()
 
-        agy_available = shutil.which(AGY_BIN) is not None
+        agy_available = find_agy() is not None
 
         if any(w in low for w in ZaraRouter.GEMINI_KEYWORDS):
             if GEMINI_API_KEY:
@@ -807,7 +829,7 @@ class AntigravityProvider:
         log.info("Modelo de Antigravity cambiado a: %s", self.model or "(por defecto)")
 
     def is_available(self) -> bool:
-        return shutil.which(AGY_BIN) is not None
+        return find_agy() is not None
 
     @classmethod
     def build_prompt(
@@ -849,7 +871,7 @@ class AntigravityProvider:
         tools: Optional[List[Dict[str, Any]]] = None,
         system_prompt: Optional[str] = None,
     ) -> Generator[Dict[str, Any], None, None]:
-        agy = shutil.which(AGY_BIN)
+        agy = find_agy()
         if not agy:
             yield {"type": "error", "error": "Antigravity CLI (agy) no está instalado o no está en el PATH."}
             return

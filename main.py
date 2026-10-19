@@ -276,8 +276,8 @@ class ZaraController(QtCore.QObject):
 
         if provider == "antigravity" and not self.brain.antigravity.is_available():
             msg = (
-                "Gemini con su suscripción necesita Antigravity CLI: instálelo, ejecute «agy» una vez "
-                "para iniciar sesión con su cuenta de Google y reinicie Zara."
+                "Gemini con su suscripción necesita Antigravity CLI. Instálelo, abra una terminal NUEVA, "
+                "ejecute «agy» una vez para iniciar sesión con su cuenta de Google y reinicie Zara."
             )
             log.warning(msg)
             if self.hud:

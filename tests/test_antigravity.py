@@ -131,3 +131,18 @@ def test_cli_safe_arg_neutralises_cmd_metacharacters(monkeypatch):
     assert cli_safe_arg(r"C:\Tools\agy.exe", evil) == evil
     monkeypatch.setattr(sys, "platform", "linux")
     assert cli_safe_arg("/usr/bin/agy", evil) == evil
+
+
+def test_finds_agy_in_windows_install_dir_even_if_not_in_path(tmp_path, monkeypatch):
+    """El instalador de Windows deja agy.exe en %LOCALAPPDATA%\\agy\\bin sin refrescar el PATH."""
+    exe = tmp_path / "agy" / "bin" / "agy.exe"
+    exe.parent.mkdir(parents=True)
+    exe.write_text("", encoding="utf-8")
+    monkeypatch.setattr(brain_mod.shutil, "which", lambda name: None)
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path))
+    assert brain_mod.find_agy() == str(exe)
+    assert AntigravityProvider().is_available() is True
+    # y si no está en ninguna parte, no se inventa nada
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "vacio"))
+    monkeypatch.setattr(brain_mod.Path, "home", lambda: tmp_path / "sin-home")
+    assert brain_mod.find_agy() is None
