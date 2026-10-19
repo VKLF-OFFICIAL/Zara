@@ -71,6 +71,7 @@ class FakeEar:
 
 class FakeLive:
     def __init__(self, **_kwargs):
+        self.model = "auto"
         self.running = False
         self.available = True
         self.model_speaking = False
@@ -103,8 +104,8 @@ class FakeLive:
     def is_muted(self):
         return False
 
-    def set_model(self, _model):
-        pass
+    def set_model(self, model):
+        self.model = model
 
 
 class FakeVoice:

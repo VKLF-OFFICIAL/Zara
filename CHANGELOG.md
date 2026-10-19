@@ -17,6 +17,10 @@ Formato basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). M
 
 ### Corregido
 - El título del panel se cortaba al mostrar la versión.
+- Cambiar o añadir un modelo de IA ya no obliga a reiniciar Zara: al abrir el panel o cambiar de
+  cerebro se vuelven a consultar los modelos de Ollama (un `ollama pull` aparece al momento) y los
+  de Gemini que ofrece la API; un modelo fijado a mano que no está en la lista se muestra igual, y
+  cambiar el modelo de Gemini Live con la sesión abierta la reconecta con el modelo nuevo.
 
 ## [0.3.0-alpha]
 

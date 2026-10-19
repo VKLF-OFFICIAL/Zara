@@ -623,6 +623,9 @@ class ZaraPanel(QtWidgets.QWidget):
     interrupt_requested = QtCore.Signal()
     brain_changed = QtCore.Signal(str)
     model_changed = QtCore.Signal(str, str)  # (provider, model)
+    # Pide volver a consultar los modelos instalados/publicados (al abrir el panel o cambiar de
+    # cerebro): un modelo nuevo aparece en la lista sin reiniciar Zara.
+    models_refresh_requested = QtCore.Signal()
     quit_requested = QtCore.Signal()
     text_submitted = QtCore.Signal(str)
     close_requested = QtCore.Signal()
@@ -658,6 +661,8 @@ class ZaraPanel(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self._ollama_models: list[str] = []
+        self._gemini_models: list[str] = []
+        self._gemini_live_models: list[str] = []
         self._desired_model: dict[str, str] = {}
         self.setFixedSize(PANEL_W, PANEL_H)
         self.setWindowFlags(
@@ -827,9 +832,14 @@ class ZaraPanel(QtWidgets.QWidget):
     def _current_provider(self) -> str:
         return self.brain_combo.currentData() or "auto"
 
+    def showEvent(self, event) -> None:  # noqa: N802 (API de Qt)
+        super().showEvent(event)
+        self.models_refresh_requested.emit()
+
     def _on_provider_changed(self, _idx: int) -> None:
         provider = self._current_provider()
         self.brain_changed.emit(provider)
+        self.models_refresh_requested.emit()
         # Limpiar filtro al cambiar proveedor
         self.model_search_input.blockSignals(True)
         self.model_search_input.clear()
@@ -917,13 +927,11 @@ class ZaraPanel(QtWidgets.QWidget):
                 self.model_combo.setEnabled(True)
             elif provider == "gemini_live":
                 self.model_lbl.setText("MODELO")
-                for label, value in self._GEMINI_LIVE_MODEL_OPTIONS:
-                    self.model_combo.addItem(label, value)
+                self._add_options(self._GEMINI_LIVE_MODEL_OPTIONS, self._gemini_live_models)
                 self.model_combo.setEnabled(True)
             elif provider == "gemini":
                 self.model_lbl.setText("MODELO")
-                for label, value in self._GEMINI_MODEL_OPTIONS:
-                    self.model_combo.addItem(label, value)
+                self._add_options(self._GEMINI_MODEL_OPTIONS, self._gemini_models)
                 self.model_combo.setEnabled(True)
             else:  # auto
                 self.model_lbl.setText("MODELO")
@@ -932,12 +940,31 @@ class ZaraPanel(QtWidgets.QWidget):
 
         desired = self._desired_model.get(provider)
         if desired is not None:
-            for i in range(self.model_combo.count()):
-                if self.model_combo.itemData(i) == desired:
-                    self.model_combo.setCurrentIndex(i)
-                    break
+            self._select_model_item(provider, desired)
 
         self.model_combo.blockSignals(False)
+
+    def _add_options(self, fixed: list[tuple[str, str]], discovered: list[str]) -> None:
+        """Opciones fijas y, detrás, los modelos descubiertos en la API que no estén ya."""
+        for label, value in fixed:
+            self.model_combo.addItem(label, value)
+        known = {value for _label, value in fixed}
+        for name in discovered:
+            if name not in known:
+                known.add(name)
+                self.model_combo.addItem(name, name)
+
+    def _select_model_item(self, provider: str, model: str) -> None:
+        """Selecciona `model` en el combo; si no está en la lista (p. ej. un modelo escrito en
+        .env o publicado después), se añade para que el panel muestre el que de verdad se usa."""
+        for i in range(self.model_combo.count()):
+            if self.model_combo.itemData(i) == model:
+                self.model_combo.setCurrentIndex(i)
+                return
+        # En Ollama solo se listan los modelos instalados (o los filtrados): no se inventan.
+        if model and provider not in ("ollama", "auto") and self.model_combo.isEnabled():
+            self.model_combo.addItem(model, model)
+            self.model_combo.setCurrentIndex(self.model_combo.count() - 1)
 
     # --- API pública ---
     def set_status(self, state_text: str, muted: bool) -> None:
@@ -968,15 +995,19 @@ class ZaraPanel(QtWidgets.QWidget):
         if self._current_provider() == "ollama":
             self._refresh_model_options()
 
+    def set_gemini_models(self, chat_models: list[str], live_models: list[str]) -> None:
+        """Añade al panel los modelos Gemini que la API ofrece ahora mismo."""
+        self._gemini_models = list(chat_models)
+        self._gemini_live_models = list(live_models)
+        if self._current_provider() in ("gemini", "gemini_live"):
+            self._refresh_model_options()
+
     def set_model_selection(self, provider: str, model: str) -> None:
         """Recuerda y aplica la selección de modelo activa para un proveedor dado."""
         self._desired_model[provider] = model
         if self._current_provider() == provider:
             self.model_combo.blockSignals(True)
-            for i in range(self.model_combo.count()):
-                if self.model_combo.itemData(i) == model:
-                    self.model_combo.setCurrentIndex(i)
-                    break
+            self._select_model_item(provider, model)
             self.model_combo.blockSignals(False)
 
     def log_line(self, prefix: str, text: str) -> None:
@@ -1005,6 +1036,7 @@ class ZaraHUD(QtWidgets.QWidget):
     mic_toggle_requested = QtCore.Signal()
     brain_changed = QtCore.Signal(str)
     model_changed = QtCore.Signal(str, str)  # (provider, model)
+    models_refresh_requested = QtCore.Signal()
     quit_requested = QtCore.Signal()
     text_command_submitted = QtCore.Signal(str)
 
@@ -1070,6 +1102,7 @@ class ZaraHUD(QtWidgets.QWidget):
         self.panel.mic_toggle_requested.connect(self._on_mic_toggle_clicked)
         self.panel.brain_changed.connect(self.brain_changed.emit)
         self.panel.model_changed.connect(self.model_changed.emit)
+        self.panel.models_refresh_requested.connect(self.models_refresh_requested.emit)
         self.panel.quit_requested.connect(self.quit_requested.emit)
         self.panel.text_submitted.connect(self.text_command_submitted.emit)
 
@@ -1137,6 +1170,9 @@ class ZaraHUD(QtWidgets.QWidget):
 
     def set_ollama_models(self, models: list, current: str = "") -> None:
         self.panel.set_ollama_models(models, current)
+
+    def set_gemini_models(self, chat_models: list, live_models: list) -> None:
+        self.panel.set_gemini_models(chat_models, live_models)
 
     def set_model_selection(self, provider: str, model: str) -> None:
         self.panel.set_model_selection(provider, model)
