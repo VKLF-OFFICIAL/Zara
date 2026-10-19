@@ -14,6 +14,6 @@ jobs:
       - name: Dependencias ligeras (sin audio/GPU)
         run: pip install pytest ruff psutil requests httpx numpy pillow
       - name: Lint (errores graves)
-        run: ruff check --select E9,F63,F7,F82 .
+        run: ruff check --select E9,F63,F7,F82,F401 core ui main.py config.py
       - name: Tests
         run: pytest tests/test_tools.py tests/test_brain.py tests/test_config.py -q -k "not live"

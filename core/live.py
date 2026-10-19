@@ -23,10 +23,8 @@ import asyncio
 import json
 import logging
 import queue
-import struct
 import threading
-import time
-from typing import Any, Callable, Dict, List, Optional
+from typing import Callable, Optional
 
 import numpy as np
 import sounddevice as sd
@@ -36,8 +34,6 @@ from config import (
     GEMINI_LIVE_MODEL,
     GEMINI_LIVE_VOICE,
     GEMINI_MODEL,
-    SAMPLE_RATE,
-    FRAME_SIZE,
     get_system_prompt,
 )
 from core.tools import TOOL_DEFINITIONS, execute_tool

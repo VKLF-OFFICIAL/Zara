@@ -57,7 +57,7 @@
 ### Cerebro Híbrido y ReAct Autónomo (`core/brain.py` y `core/tools.py`)
 - **ZaraRouter (< 10 ms):** Conmutación ultrarrápida entre Claude (modelo configurable con `ANTHROPIC_MODEL`) / Claude Code, Gemini 2.5 Flash y Ollama (`qwen2.5-coder:7b`). Fallback automático ante caídas de red.
 - **Filosofía YOLO Seguro:** Cero interrupciones para comandos diagnósticos, lectura/edición de ficheros, inspección de red o gestión de procesos.
-- **Guardarraíl Estricto:** Bloqueo de operaciones catastróficas irreversibles en `run_shell` (`rm -rf /`, `rm -rf ~`, `mkfs`, `Format-Volume`, `dd if=`, `shutdown`/`reboot`, escritura en `/etc/fstab`...) y, en `file_manager`, bloqueo de `write`/`append`/`edit`/`delete` sobre rutas protegidas (`/etc`, `/boot`, `/usr`, `~/.ssh`, `~/.gnupg`, `.git`, el propio HOME...). Las listas viven en `config.py` (`FORBIDDEN_COMMANDS_REGEX`, `PROTECTED_PATHS`). No es un sandbox: es una red de seguridad contra errores del modelo.
+- **Guardarraíl Estricto:** Bloqueo de operaciones catastróficas irreversibles en `run_shell` (`rm -rf /`, `rm -rf ~`, `mkfs`, `Format-Volume`, `dd if=`, `shutdown`/`reboot`, escritura en `/etc/fstab`...) y, en `file_manager`, bloqueo de `write`/`append`/`edit`/`delete` sobre rutas protegidas (`/etc`, `/boot`, `/usr`, `~/.ssh`, `~/.gnupg`, `.git`, el propio HOME...). Las listas viven en `config.py` (`FORBIDDEN_COMMANDS_REGEX`, `PROTECTED_TREES`, `PROTECTED_EXACT`). No es un sandbox: es una red de seguridad contra errores del modelo.
 
 ### Interfaz Holográfica (`ui/hud.py`)
 - HUD transparente frameless en **PySide6** con reactividad a 60 FPS:

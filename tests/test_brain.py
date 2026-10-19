@@ -340,3 +340,39 @@ def test_react_preserves_tool_arguments_in_history(monkeypatch):
     assert len(assistant_msgs) >= 2
     assert 'run_shell({"command": "mkdir test_dir"})' in assistant_msgs[0]["content"]
 
+
+
+def test_no_provider_never_executes_user_text_as_shell(monkeypatch):
+    """Sin cerebros disponibles, el texto del usuario NUNCA debe ejecutarse como comando."""
+    import core.brain as brain_mod
+    from core.brain import ZaraBrain
+
+    brain = ZaraBrain()
+    for prov in (brain.ollama, brain.gemini, brain.claude):
+        monkeypatch.setattr(prov, "is_available", lambda: False)
+    called = []
+    monkeypatch.setattr(brain_mod, "execute_tool", lambda name, args: called.append(name) or {})
+    brain.history.append({"role": "user", "content": "touch /tmp/pwned"})
+    events = list(brain._execute_stream_with_fallback("ollama"))
+    assert not called
+    assert any(e["type"] == "error" for e in events)
+
+
+def test_trim_history_starts_with_user_message():
+    from core.brain import ZaraBrain, _MAX_HISTORY_MESSAGES
+
+    brain = ZaraBrain()
+    brain.history = [
+        {"role": "assistant" if i % 2 == 0 else "user", "content": str(i)}
+        for i in range(_MAX_HISTORY_MESSAGES + 5)
+    ]
+    brain._trim_history()
+    assert brain.history[0]["role"] == "user"
+
+
+def test_system_prompt_date_is_spanish_regardless_of_locale():
+    from config import get_system_prompt
+
+    prompt = get_system_prompt()
+    assert any(m in prompt for m in ("enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+                                     "agosto", "septiembre", "octubre", "noviembre", "diciembre"))

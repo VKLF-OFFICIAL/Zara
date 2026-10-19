@@ -20,13 +20,11 @@ BUGS CORREGIDOS:
 
 from __future__ import annotations
 import asyncio
-import io
 import logging
 import queue
 import re
 import threading
 import time
-from pathlib import Path
 from typing import AsyncGenerator, Callable, Generator, List, Optional
 import numpy as np
 import sounddevice as sd

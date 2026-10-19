@@ -307,3 +307,15 @@ def test_file_manager_protected_paths():
     res = file_manager("write", "/root/.ssh/zara_test", content="x")
     assert res.get("blocked") is True
     assert file_manager("exists", "/etc")["success"] is True
+
+
+def test_file_manager_allows_work_inside_home(tmp_path, monkeypatch):
+    """El agente debe poder escribir dentro del HOME; solo el HOME en sí está protegido."""
+    import core.tools as tools_mod
+    home = tmp_path / "home" / "vk"
+    home.mkdir(parents=True)
+    monkeypatch.setattr(tools_mod, "PROTECTED_EXACT", [str(tmp_path / "home"), str(home)])
+    monkeypatch.setattr(tools_mod, "PROTECTED_TREES", [str(home / ".ssh")])
+    assert file_manager("write", str(home / "notas.txt"), content="ok")["success"] is True
+    assert file_manager("delete", str(home))["blocked"] is True
+    assert file_manager("write", str(home / ".ssh" / "id_x"), content="x")["blocked"] is True

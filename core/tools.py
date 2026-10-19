@@ -20,8 +20,8 @@ import psutil
 
 from config import (
     FORBIDDEN_COMMANDS_REGEX,
-    MAX_REACT_STEPS,
-    PROTECTED_PATHS,
+    PROTECTED_EXACT,
+    PROTECTED_TREES,
     SHELL_TIMEOUT,
 )
 
@@ -39,13 +39,12 @@ def is_command_forbidden(cmd: str) -> Optional[str]:
 def is_path_protected(path: Path) -> Optional[str]:
     """Devuelve la ruta protegida que contiene (o es) `path`, o None si es seguro tocarla."""
     resolved = Path(os.path.realpath(path))
-    for prot in PROTECTED_PATHS:
-        prot_path = Path(os.path.realpath(prot))
-        if resolved == prot_path:
+    for prot in PROTECTED_EXACT:
+        if resolved == Path(os.path.realpath(prot)):
             return prot
-        # Dentro de un directorio de sistema o de .ssh/.gnupg/.git; el HOME completo
-        # solo se protege como objeto (no se puede borrar), no sus contenidos.
-        if prot_path != Path.home() and prot_path != Path(prot_path.anchor) and prot_path in resolved.parents:
+    for prot in PROTECTED_TREES:
+        prot_path = Path(os.path.realpath(prot))
+        if resolved == prot_path or prot_path in resolved.parents:
             return prot
     return None
 
@@ -473,7 +472,9 @@ def _os_read_clipboard(target: str, value: str) -> Dict[str, Any]:
 def _os_write_clipboard(target: str, value: str) -> Dict[str, Any]:
     text_to_copy = value or target
     if sys.platform == "win32":
-        subprocess.run(["powershell.exe", "-NoProfile", f"Set-Clipboard -Value '{text_to_copy}'"])
+        # Literal entre comillas simples de PowerShell: la comilla simple se duplica.
+        ps_text = text_to_copy.replace("'", "''")
+        subprocess.run(["powershell.exe", "-NoProfile", "-Command", f"Set-Clipboard -Value '{ps_text}'"])
         return {"success": True, "message": "Texto copiado al portapapeles."}
     elif shutil.which("xclip"):
         p = subprocess.Popen(["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE, text=True)
@@ -643,6 +644,7 @@ def _os_lock_screen(target: str, value: str) -> Dict[str, Any]:
 def _os_notify(target: str, value: str) -> Dict[str, Any]:
     msg_text = value or target or "Notificación táctica de Zara"
     if sys.platform == "win32":
+        msg_text = msg_text.replace("'", "''")  # evita inyección en el literal de PowerShell
         ps_script = (
             f"[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null;"
             f"$template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText01);"
@@ -839,6 +841,8 @@ def web_search(query: str, max_results: int = 5) -> Dict[str, Any]:
             link = ""
             if idx < len(titles):
                 link = titles[idx][0]
+                if "uddg=" in link:
+                    link = urllib.parse.unquote(urllib.parse.parse_qs(urllib.parse.urlparse(link).query).get("uddg", [link])[0])
                 title_text = clean_tag.sub("", titles[idx][1]).strip()
             results.append({
                 "title": title_text or f"Resultado {idx+1}",
