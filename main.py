@@ -187,6 +187,13 @@ class ZaraController(QtCore.QObject):
     def start(self) -> None:
         """Inicia todos los subsistemas de Zara."""
         log.info("Iniciando subsistemas de %s...", config.APP_TITLE)
+        reason = self._brain_unavailable_reason(self._preferred_provider)
+        if reason:
+            # Un cerebro guardado que ya no funciona (p. ej. Gemini Live sin clave) no debe dejar
+            # a Zara sin cerebro: se usa la suscripción si está, o el modo automático.
+            fallback = "antigravity" if self.brain.antigravity.is_available() else "auto"
+            log.warning("Cerebro guardado '%s' no disponible (%s). Usando '%s'.", self._preferred_provider, reason, fallback)
+            self._preferred_provider = fallback
         if config.ENV_MIGRATED_KEYS:
             log.info(
                 "Ajustes antiguos quitados de .env (ahora mandan los de config/ajustes.env; copia en .env.bak): %s",
@@ -274,8 +281,38 @@ class ZaraController(QtCore.QObject):
             self.hud.set_muted(muted)
             self.sig_hud_state.emit(HUDState.IDLE)
 
+    def _brain_unavailable_reason(self, provider: str) -> Optional[str]:
+        """Motivo por el que un cerebro no se puede usar ahora mismo (None si está listo)."""
+        if provider == "gemini_live" and not self.live_session.is_available():
+            return (
+                "Gemini Live necesita una clave de API (GEMINI_API_KEY en .env, gratis en aistudio.google.com). "
+                "Con su suscripción AI Pro use el cerebro «Gemini · AI Pro»."
+            )
+        if provider == "gemini" and not self.brain.gemini.is_available():
+            return (
+                "Gemini por API necesita GEMINI_API_KEY en .env. "
+                "Con su suscripción AI Pro use el cerebro «Gemini · AI Pro»."
+            )
+        if provider == "antigravity" and not self.brain.antigravity.is_available():
+            return (
+                "Gemini con su suscripción necesita Antigravity CLI. Instálelo, abra una terminal NUEVA, "
+                "ejecute «agy» una vez para iniciar sesión con su cuenta de Google y reinicie Zara."
+            )
+        if provider == "claude" and not self.brain.claude.is_available():
+            return "Claude necesita ANTHROPIC_API_KEY en .env o el CLI «claude» instalado."
+        return None
+
     def _on_brain_changed(self, provider: str) -> None:
         """Cambia en caliente el cerebro LLM preferido desde el panel táctico."""
+        reason = self._brain_unavailable_reason(provider)
+        if reason:
+            # No se activa ni se guarda: el panel vuelve al cerebro que funcionaba.
+            log.warning("Cerebro %s no disponible: %s", provider, reason)
+            if self.hud:
+                self.hud.panel.log_line("ERROR", reason)
+                self.hud.set_brain(self._preferred_provider)
+            return
+
         self._preferred_provider = provider
         log.info("Cerebro preferido cambiado a: %s", provider)
         try:
@@ -283,24 +320,7 @@ class ZaraController(QtCore.QObject):
         except Exception as exc:
             log.warning("No se pudo guardar el cerebro elegido: %s", exc)
 
-        if provider == "antigravity" and not self.brain.antigravity.is_available():
-            msg = (
-                "Gemini con su suscripción necesita Antigravity CLI. Instálelo, abra una terminal NUEVA, "
-                "ejecute «agy» una vez para iniciar sesión con su cuenta de Google y reinicie Zara."
-            )
-            log.warning(msg)
-            if self.hud:
-                self.hud.panel.log_line("ERROR", msg)
-            self.voice.say("Señor VK, para usar Gemini con su suscripción necesito Antigravity instalado.")
-
         if provider == "gemini_live":
-            if not self.live_session.is_available():
-                log.warning("Gemini Live no disponible: se requiere GEMINI_API_KEY en .env")
-                if self.hud:
-                    self.hud.panel.log_line("ERROR", "Gemini Live requiere GEMINI_API_KEY en .env")
-                self.voice.say("Señor VK, para activar Gemini Live en streaming se requiere configurar GEMINI_API_KEY.")
-                return
-
             # Pausar oído clásico para evitar conflicto de captura de micrófono
             self.ear.stop()
             self.voice.stop()
@@ -313,7 +333,7 @@ class ZaraController(QtCore.QObject):
                 self.live_session.stop()
                 self.ear.start()
             if self.hud:
-                self.hud.panel.log_line("SISTEMA", f"Cerebro cambiado a: {provider}")
+                self.hud.panel.log_line("SISTEMA", f"Cerebro cambiado a: {self.hud.panel.brain_combo.currentText()}")
 
     def _on_model_changed(self, provider: str, model: str) -> None:
         """Cambia en caliente el modelo concreto del proveedor seleccionado y lo persiste."""
