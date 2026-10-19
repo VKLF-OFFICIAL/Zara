@@ -179,7 +179,7 @@ def run_diagnostics() -> bool:
     print("=" * 60)
 
     # 1. Enrutador Cerebral
-    print("[1/5] Probando Enrutador Cerebral (ZaraRouter)... ", end="")
+    print("[1/6] Probando Enrutador Cerebral (ZaraRouter)... ", end="")
     try:
         from core.brain import ZaraRouter
         provider = ZaraRouter.classify("Revisa el código y lanza escaneo nmap")
@@ -189,7 +189,7 @@ def run_diagnostics() -> bool:
         return False
 
     # 2. Guardarraíles y Herramientas
-    print("[2/5] Probando Guardarraíles de Seguridad y Herramientas... ", end="")
+    print("[2/6] Probando Guardarraíles de Seguridad y Herramientas... ", end="")
     try:
         from core.tools import execute_tool
         block_test = execute_tool("run_shell", {"command": "rm -rf /"})
@@ -203,7 +203,7 @@ def run_diagnostics() -> bool:
         return False
 
     # 3. VAD Neuronal Silero
-    print("[3/5] Probando Carga de Silero VAD v5... ", end="")
+    print("[3/6] Probando Carga de Silero VAD v5... ", end="")
     try:
         from silero_vad import load_silero_vad
         model = load_silero_vad()
@@ -213,7 +213,7 @@ def run_diagnostics() -> bool:
         return False
 
     # 4. Motor de Audio / Miniaudio
-    print("[4/5] Probando Decodificación en Memoria (miniaudio)... ", end="")
+    print("[4/6] Probando Decodificación en Memoria (miniaudio)... ", end="")
     try:
         import miniaudio  # noqa: F401  (el import ES la prueba)
         print("OK (miniaudio listo para streaming en RAM sin disco)")
@@ -222,7 +222,7 @@ def run_diagnostics() -> bool:
         return False
 
     # 5. Interfaz HUD (PySide6)
-    print("[5/5] Probando Componentes Gráficos (PySide6)... ", end="")
+    print("[5/6] Probando Componentes Gráficos (PySide6)... ", end="")
     try:
         from PySide6 import QtWidgets
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
@@ -233,6 +233,21 @@ def run_diagnostics() -> bool:
     except Exception as exc:
         print(f"FALLO: {exc}")
         return False
+
+    # 6. Cerebro Gemini con la suscripción (Antigravity CLI). No es obligatorio: solo informa.
+    print("[6/6] Buscando Antigravity CLI (Gemini con suscripción AI Pro)... ", end="")
+    try:
+        from config import DEFAULT_BRAIN
+        from core.brain import find_agy
+        agy = find_agy()
+        if agy:
+            print(f"OK -> {agy}")
+        elif DEFAULT_BRAIN == "antigravity":
+            print("NO ENCONTRADO: es el cerebro por defecto; instale Antigravity CLI y ejecute 'agy' para iniciar sesión.")
+        else:
+            print("no instalado (opcional)")
+    except Exception as exc:
+        print(f"FALLO: {exc}")
 
     print("=" * 60)
     print("TODOS LOS SUBSISTEMAS ESTÁN OPERATIVOS Y CALIBRADOS")

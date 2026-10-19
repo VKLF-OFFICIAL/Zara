@@ -96,7 +96,7 @@ cd Zara
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
+cp .env.example .env   # opcional: solo hace falta para claves de API
 ```
 O deja que el propio script lo haga por ti, incluyendo la copia de `.env`:
 ```powershell
@@ -117,6 +117,14 @@ Edita `.env`:
 - `ANTHROPIC_API_KEY`: para tareas de código/seguridad con Claude. Sin esta clave, si tienes el CLI `claude` instalado y en el `PATH`, Zara lo usa automáticamente como alternativa.
 
 Sin ninguna de las dos, Zara funciona igual de bien **100% offline** con `ZARA_DEFAULT_BRAIN="ollama"`.
+
+### Paso 3b — Gemini con tu suscripción Google AI Pro (sin API key)
+La suscripción Google AI Pro/Ultra **no** incluye una clave de API, pero sí da acceso a Gemini a través de **Antigravity CLI** (`agy`), el sustituto oficial de Gemini CLI desde el 18 de junio de 2026. Zara puede usarlo como cerebro:
+1. Instala Antigravity CLI siguiendo las instrucciones oficiales de Google y comprueba que `agy` funciona en una terminal.
+2. Ejecuta `agy` una vez e inicia sesión con la misma cuenta de Google que tiene la suscripción.
+3. En el panel de Zara elige el cerebro **«Gemini · AI Pro»** (o pon `ZARA_DEFAULT_BRAIN="antigravity"` en `.env`). Con `ZARA_AGY_MODEL` puedes fijar un modelo de los que lista `agy models`.
+
+Limitaciones: cada respuesta arranca un proceso de `agy`, así que es más lento que la API (varios segundos); y hay usuarios de AI Pro a los que Antigravity les asigna solo la cuota básica ("Starter Quota") o les rechaza la cuenta (`FREE_TIER_USER_NOT_ELIGIBLE`). Si eso pasa, Zara lo indicará en el panel. Alternativas: la clave gratuita de [Google AI Studio](https://aistudio.google.com/apikey) (solo modelos Flash, con límites) o los 10 $/mes de créditos de Google Cloud que incluye AI Pro a través del Google Developer Program, que desde octubre de 2026 solo se aplican a la API tras haber recargado saldo de prepago.
 
 ### Paso 4 — Verificar antes de arrancar
 ```powershell
@@ -159,31 +167,22 @@ chmod +x setup_and_run.sh
 
 ---
 
-## 5. Configuración (`.env`)
-Edite el archivo `.env` para personalizar API Keys o motores:
-```env
-# Claves de IA (Opcionales, fallback automático a Ollama local)
-GEMINI_API_KEY=""
-ANTHROPIC_API_KEY=""
+## 5. Configuración
 
-# Configuración de Ollama Local
-OLLAMA_HOST="http://localhost:11434"
-OLLAMA_MODEL="qwen2.5-coder:7b"
+Zara lee sus ajustes de dos archivos (y de las variables de entorno del sistema, que mandan sobre ambos):
 
-# Voz y Síntesis
-ZARA_TTS_ENGINE="edge"
-ZARA_EDGE_VOICE="es-ES-XimenaNeural"
-ZARA_EDGE_RATE="+6%"
-ZARA_EDGE_PITCH="+2Hz"
+| Archivo | ¿Se sube a GitHub? | Para qué |
+|---|---|---|
+| `config/ajustes.env` | **Sí** (repositorio público) | Preferencias: cerebro por defecto, voz, transcripción... Es la configuración con la que arranca Zara. |
+| `.env` | **No** (`.gitignore`) | Lo privado de este equipo: claves de API y cualquier ajuste que quieras cambiar solo aquí. Gana sobre `config/ajustes.env`. |
 
-# Barge-in anti-eco (ver sección 6 si Zara se corta sola al hablar)
-ZARA_VAD_BARGE_IN_MIN_RMS=0.02
-ZARA_VAD_BARGE_IN_GRACE_MS=300
-```
+Por defecto Zara usa **Gemini con la suscripción Google AI Pro** (`ZARA_DEFAULT_BRAIN="antigravity"`, ver Paso 3b). Lo que elijas en el panel (cerebro, modelo) se guarda en `.env`.
+
+> **Nunca** pongas claves, contraseñas ni datos personales en `config/ajustes.env`: cualquiera puede leer el repositorio.
+
+Si tu `.env` viene de una versión anterior, Zara quita automáticamente (una sola vez, con copia en `.env.bak`) las líneas copiadas de la plantilla antigua que tapaban los ajustes nuevos; tus claves y tus elecciones no se tocan.
 
 ---
-
-> Documentación de la v1 (obsoleta) en `docs/legacy/`.
 
 ## 6. Cómo dejarlo funcionando a la perfección
 
@@ -197,7 +196,8 @@ No todos los modelos locales manejan igual el "function calling". Zara es robust
 Para abrir aplicaciones ("abre el bloc de notas", "abre la calculadora", "abre el navegador"), Zara ya traduce los nombres comunes en español al ejecutable real de Windows. Si una app no abre, prueba a decir su nombre tal cual aparece en el menú Inicio, o el nombre técnico del ejecutable.
 
 ### Si Zara tarda en responder
-Mira el log: cada orden imprime líneas `[LATENCIA]` con el tiempo de transcripción (`x1.00` = tiempo real), el del primer token del cerebro y el total.
+Mira el log: cada orden imprime líneas `[LATENCIA]` con el tiempo de cada fase:
+`STT` (transcripción; `x1.00` = tiempo real), `<cerebro> respondió en` (qué cerebro y cuánto tardó en empezar), `primer token`, `TTS` (síntesis de cada frase) y `turno completo`. La fase con el número más alto es el cuello de botella.
 - **STT lento (`x` > 1):** estás en CPU con un modelo demasiado grande. Usa `ZARA_WHISPER_MODEL="base"` (o `tiny`) y borra de tu `.env` las líneas antiguas `ZARA_WHISPER_MODEL=...large-v3-turbo...` y `ZARA_WHISPER_BEAM_SIZE=5` (Zara ya las ignora en CPU salvo `ZARA_WHISPER_FORCE=1`).
 - **Primer token lento:** un modelo local grande sin GPU es lo más lento de la cadena; prueba con Gemini (`GEMINI_API_KEY`) o un modelo Ollama más pequeño.
 

@@ -16,4 +16,4 @@ jobs:
       - name: Lint (errores graves)
         run: ruff check --select E9,F63,F7,F82,F401 core ui main.py config.py
       - name: Tests
-        run: python -m pytest tests/test_tools.py tests/test_brain.py tests/test_config.py tests/test_gemini_models.py tests/test_geometry.py -q -k "not live"
+        run: python -m pytest tests/test_tools.py tests/test_brain.py tests/test_config.py tests/test_gemini_models.py tests/test_geometry.py tests/test_antigravity.py -q -k "not live"

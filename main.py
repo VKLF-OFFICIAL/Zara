@@ -187,6 +187,11 @@ class ZaraController(QtCore.QObject):
     def start(self) -> None:
         """Inicia todos los subsistemas de Zara."""
         log.info("Iniciando subsistemas de %s...", config.APP_TITLE)
+        if config.ENV_MIGRATED_KEYS:
+            log.info(
+                "Ajustes antiguos quitados de .env (ahora mandan los de config/ajustes.env; copia en .env.bak): %s",
+                ", ".join(config.ENV_MIGRATED_KEYS),
+            )
         if self._preferred_provider == "gemini_live" and self.live_session.is_available():
             log.info("Iniciando directamente en modo Gemini Live...")
             self.live_session.start()
@@ -200,6 +205,7 @@ class ZaraController(QtCore.QObject):
             self.hud.set_brain(self._preferred_provider)
             self.hud.set_model_selection("ollama", self.brain.ollama.model)
             self.hud.set_model_selection("claude", self.brain.claude.cli_model_override)
+            self.hud.set_model_selection("antigravity", self.brain.antigravity.model)
             self.hud.set_model_selection("gemini", self.brain.gemini.model)
             self.hud.set_model_selection("gemini_live", config.GEMINI_LIVE_MODEL)
             threading.Thread(target=self._load_ollama_models, daemon=True).start()
@@ -272,6 +278,20 @@ class ZaraController(QtCore.QObject):
         """Cambia en caliente el cerebro LLM preferido desde el panel táctico."""
         self._preferred_provider = provider
         log.info("Cerebro preferido cambiado a: %s", provider)
+        try:
+            config.persist_env_var("ZARA_DEFAULT_BRAIN", provider)  # se recuerda al reiniciar
+        except Exception as exc:
+            log.warning("No se pudo guardar el cerebro elegido: %s", exc)
+
+        if provider == "antigravity" and not self.brain.antigravity.is_available():
+            msg = (
+                "Gemini con su suscripción necesita Antigravity CLI. Instálelo, abra una terminal NUEVA, "
+                "ejecute «agy» una vez para iniciar sesión con su cuenta de Google y reinicie Zara."
+            )
+            log.warning(msg)
+            if self.hud:
+                self.hud.panel.log_line("ERROR", msg)
+            self.voice.say("Señor VK, para usar Gemini con su suscripción necesito Antigravity instalado.")
 
         if provider == "gemini_live":
             if not self.live_session.is_available():
@@ -309,6 +329,10 @@ class ZaraController(QtCore.QObject):
             self.brain.gemini.model = model
             config.persist_env_var("GEMINI_MODEL", model)
             label = model
+        elif provider == "antigravity":
+            self.brain.antigravity.set_model(model)
+            config.persist_env_var("ZARA_AGY_MODEL", model)
+            label = model or "por defecto"
         elif provider == "gemini_live":
             self.live_session.set_model(model)
             config.persist_env_var("ZARA_GEMINI_LIVE_MODEL", model)

@@ -3,6 +3,21 @@
 Formato basado en [Keep a Changelog](https://keepachangelog.com/es-ES/1.1.0/). Mientras la versión sea
 `0.y.z` no hay API estable: cualquier versión puede romper cosas.
 
+## [Sin publicar]
+
+### Añadido
+- Cerebro **«Gemini · AI Pro»** vía Antigravity CLI (`agy -p`), sin API key.
+- Panel rediseñado como chat: burbujas, cabecera con avatar y estado, chips de herramientas que pasan
+  de «⋯» a «✓», tarjeta de confirmación, caja de escritura con botón de enviar y tecla Esc.
+- Registros `[LATENCIA]` por fase: cerebro usado y su tiempo de respuesta, y síntesis de voz.
+
+### Seguridad
+- Los argumentos que se pasan a CLIs `.cmd` en Windows (claude, agy) se neutralizan: un `&` o `|`
+  en el texto ya no puede ejecutar comandos a través de cmd.exe.
+
+### Corregido
+- El título del panel se cortaba al mostrar la versión.
+
 ## [0.3.0-alpha]
 
 Primera versión con número propio. Antes se anunciaba como "v2.0", pero no hay ni una 1.0 estable.
