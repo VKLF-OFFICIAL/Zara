@@ -6,6 +6,7 @@ para Windows (10/11) y Linux (Kali/Fedora).
 
 from __future__ import annotations
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -39,7 +40,71 @@ def _load_env_file(path: Path) -> None:
     except Exception:
         pass
 
+# Marca que indica que el .env ya está en el formato actual (ver _migrate_legacy_env).
+ENV_SCHEMA_MARKER = "# zara-env-schema: 2"
+
+# Valores que solo pudieron llegar a un .env copiando las plantillas .env.example antiguas
+# (antes todos los ajustes vivían ahí). Al estar en .env tapaban config/ajustes.env.
+_LEGACY_TEMPLATE_VALUES = {
+    "ZARA_DEFAULT_BRAIN": {"auto"},
+    "ZARA_GEMINI_LIVE_MODEL": {"gemini-2.5-flash-preview-native-audio-dialog"},
+    "ZARA_WHISPER_MODEL": {"deepdml/faster-whisper-large-v3-turbo-ct2"},
+    "ZARA_WHISPER_BEAM_SIZE": {"5"},
+    "ZARA_VAD_MIN_SILENCE_MS": {"700"},
+    "ZARA_WS_PORT": {"8765"},
+}
+
+# Claves quitadas del .env en esta ejecución (main.py lo registra en el log).
+ENV_MIGRATED_KEYS: list[str] = []
+
+
+def _migrate_legacy_env(path: Path) -> list[str]:
+    """Una sola vez por .env: quita las líneas heredadas de plantillas antiguas.
+
+    Solo elimina pares clave=valor idénticos a los de esas plantillas (nunca claves de
+    API ni valores elegidos por el usuario), guarda una copia en .env.bak y añade
+    ENV_SCHEMA_MARKER para no volver a tocar el archivo.
+    """
+    if not path.is_file():
+        return []
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines(keepends=True)
+    except Exception:
+        return []
+    if any(line.strip() == ENV_SCHEMA_MARKER for line in lines):
+        return []
+
+    kept: list[str] = []
+    removed: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("#") and "=" in stripped:
+            key, value = stripped.split("=", 1)
+            key, value = key.strip(), value.strip().strip("'\"")
+            if value in _LEGACY_TEMPLATE_VALUES.get(key, ()):
+                removed.append(key)
+                continue
+        kept.append(line)
+
+    try:
+        if removed:
+            shutil.copy2(path, path.with_name(path.name + ".bak"))
+        if kept and not kept[-1].endswith("\n"):
+            kept[-1] += "\n"
+        kept.append(ENV_SCHEMA_MARKER + "\n")
+        tmp_path = path.with_name(path.name + ".tmp")
+        tmp_path.write_text("".join(kept), encoding="utf-8")
+        os.replace(tmp_path, path)
+    except Exception:
+        return []
+    return removed
+
+
+# Orden de prioridad: entorno del sistema > .env (local, privado) > config/ajustes.env
+# (preferencias del repositorio). _load_env_file nunca sobrescribe lo ya definido.
+ENV_MIGRATED_KEYS.extend(_migrate_legacy_env(BASE_DIR / ".env"))
 _load_env_file(BASE_DIR / ".env")
+_load_env_file(BASE_DIR / "config" / "ajustes.env")
 
 def get_system_prompt() -> str:
     """Construye el prompt base inyectando la fecha y hora actuales reales."""
@@ -159,7 +224,7 @@ EDGE_RATE = os.environ.get("ZARA_EDGE_RATE", "+6%")
 EDGE_PITCH = os.environ.get("ZARA_EDGE_PITCH", "+2Hz")
 
 # --- CONFIGURACIÓN DEL CEREBRO (LLM) ---
-DEFAULT_BRAIN = os.environ.get("ZARA_DEFAULT_BRAIN", "auto")  # "auto", "ollama", "gemini", "claude"
+DEFAULT_BRAIN = os.environ.get("ZARA_DEFAULT_BRAIN", "auto")  # "auto", "antigravity", "ollama", "gemini", "claude"
 
 # Ollama
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://localhost:11434")
@@ -204,6 +269,11 @@ def persist_env_var(key: str, value: str) -> None:
     if env_path.is_file():
         with open(env_path, "r", encoding="utf-8") as f:
             lines = f.readlines()
+
+    if not any(line.strip() == ENV_SCHEMA_MARKER for line in lines):
+        if lines and not lines[-1].endswith("\n"):
+            lines[-1] += "\n"
+        lines.append(ENV_SCHEMA_MARKER + "\n")
 
     found = False
     for i, line in enumerate(lines):

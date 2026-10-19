@@ -187,6 +187,11 @@ class ZaraController(QtCore.QObject):
     def start(self) -> None:
         """Inicia todos los subsistemas de Zara."""
         log.info("Iniciando subsistemas de %s...", config.APP_TITLE)
+        if config.ENV_MIGRATED_KEYS:
+            log.info(
+                "Ajustes antiguos quitados de .env (ahora mandan los de config/ajustes.env; copia en .env.bak): %s",
+                ", ".join(config.ENV_MIGRATED_KEYS),
+            )
         if self._preferred_provider == "gemini_live" and self.live_session.is_available():
             log.info("Iniciando directamente en modo Gemini Live...")
             self.live_session.start()
@@ -273,6 +278,10 @@ class ZaraController(QtCore.QObject):
         """Cambia en caliente el cerebro LLM preferido desde el panel táctico."""
         self._preferred_provider = provider
         log.info("Cerebro preferido cambiado a: %s", provider)
+        try:
+            config.persist_env_var("ZARA_DEFAULT_BRAIN", provider)  # se recuerda al reiniciar
+        except Exception as exc:
+            log.warning("No se pudo guardar el cerebro elegido: %s", exc)
 
         if provider == "antigravity" and not self.brain.antigravity.is_available():
             msg = (

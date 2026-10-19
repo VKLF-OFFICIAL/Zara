@@ -102,3 +102,77 @@ def test_beam_is_capped_on_cpu(monkeypatch):
     assert config.resolve_beam_size(5, "cuda") == 5
     monkeypatch.setattr(config, "WHISPER_FORCE", True)
     assert config.resolve_beam_size(5, "cpu") == 5
+
+
+LEGACY_ENV = """# plantilla antigua
+GEMINI_API_KEY="mi-clave-secreta"
+ZARA_DEFAULT_BRAIN="auto"
+ZARA_WHISPER_MODEL="deepdml/faster-whisper-large-v3-turbo-ct2"
+ZARA_WHISPER_BEAM_SIZE=5
+ZARA_VAD_MIN_SILENCE_MS=700
+OLLAMA_MODEL="qwen2.5-coder:7b"
+ZARA_EDGE_VOICE="es-ES-ElviraNeural"
+ZARA_WS_PORT=8765"""
+
+
+def test_legacy_env_is_migrated_once_keeping_secrets_and_choices(tmp_path):
+    env = tmp_path / ".env"
+    env.write_text(LEGACY_ENV, encoding="utf-8")  # sin salto final, como deja el Bloc de notas
+    removed = config._migrate_legacy_env(env)
+    assert set(removed) == {
+        "ZARA_DEFAULT_BRAIN", "ZARA_WHISPER_MODEL", "ZARA_WHISPER_BEAM_SIZE",
+        "ZARA_VAD_MIN_SILENCE_MS", "ZARA_WS_PORT",
+    }
+    text = env.read_text(encoding="utf-8")
+    assert 'GEMINI_API_KEY="mi-clave-secreta"' in text          # las claves nunca se tocan
+    assert 'OLLAMA_MODEL="qwen2.5-coder:7b"' in text            # ni lo que eligió el usuario
+    assert 'ZARA_EDGE_VOICE="es-ES-ElviraNeural"' in text
+    assert config.ENV_SCHEMA_MARKER in text
+    assert (tmp_path / ".env.bak").read_text(encoding="utf-8") == LEGACY_ENV  # copia de seguridad
+
+    # Segunda ejecución: no cambia nada, aunque ahora el usuario elija "auto" a propósito
+    env.write_text(text + 'ZARA_DEFAULT_BRAIN="auto"\n', encoding="utf-8")
+    assert config._migrate_legacy_env(env) == []
+    assert 'ZARA_DEFAULT_BRAIN="auto"' in env.read_text(encoding="utf-8")
+
+
+def test_settings_priority_env_over_dotenv_over_repo(tmp_path, monkeypatch):
+    dotenv = tmp_path / ".env"
+    ajustes = tmp_path / "ajustes.env"
+    dotenv.write_text('ZARA_T_A="dotenv"\nZARA_T_B="dotenv"\n', encoding="utf-8")
+    ajustes.write_text('ZARA_T_A="repo"\nZARA_T_B="repo"\nZARA_T_C="repo"\n', encoding="utf-8")
+    for k in ("ZARA_T_A", "ZARA_T_B", "ZARA_T_C"):
+        monkeypatch.delenv(k, raising=False)
+    monkeypatch.setenv("ZARA_T_A", "sistema")
+    config._load_env_file(dotenv)
+    config._load_env_file(ajustes)
+    import os
+    assert os.environ["ZARA_T_A"] == "sistema"  # 1. entorno del sistema
+    assert os.environ["ZARA_T_B"] == "dotenv"   # 2. .env local
+    assert os.environ["ZARA_T_C"] == "repo"     # 3. config/ajustes.env
+
+
+def test_repo_settings_file_has_no_secrets():
+    """config/ajustes.env es público: no puede contener claves con valor."""
+    from pathlib import Path
+
+    text = (Path(config.BASE_DIR) / "config" / "ajustes.env").read_text(encoding="utf-8")
+    for line in text.splitlines():
+        if "=" in line and not line.lstrip().startswith("#"):
+            key, value = line.split("=", 1)
+            if any(s in key.upper() for s in ("KEY", "TOKEN", "SECRET", "PASSWORD")):
+                assert value.strip().strip('"') == "", f"{key} no debe tener valor en el repo"
+    assert 'ZARA_DEFAULT_BRAIN="antigravity"' in text
+
+
+def test_persist_env_var_marks_file_as_current(tmp_path, monkeypatch):
+    monkeypatch.setattr(config, "BASE_DIR", tmp_path)
+    monkeypatch.setenv("ZARA_DEFAULT_BRAIN", "")  # persist_env_var escribe en os.environ: restaurarlo
+    (tmp_path / ".env").write_text('GEMINI_API_KEY="x"', encoding="utf-8")  # sin salto final
+    config.persist_env_var("ZARA_DEFAULT_BRAIN", "auto")
+    text = (tmp_path / ".env").read_text(encoding="utf-8")
+    assert 'GEMINI_API_KEY="x"\n' in text
+    assert config.ENV_SCHEMA_MARKER in text
+    assert 'ZARA_DEFAULT_BRAIN="auto"' in text
+    # una elección hecha desde el panel no la borra la migración
+    assert config._migrate_legacy_env(tmp_path / ".env") == []

@@ -96,7 +96,7 @@ cd Zara
 python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env
+cp .env.example .env   # opcional: solo hace falta para claves de API
 ```
 O deja que el propio script lo haga por ti, incluyendo la copia de `.env`:
 ```powershell
@@ -167,31 +167,22 @@ chmod +x setup_and_run.sh
 
 ---
 
-## 5. Configuración (`.env`)
-Edite el archivo `.env` para personalizar API Keys o motores:
-```env
-# Claves de IA (Opcionales, fallback automático a Ollama local)
-GEMINI_API_KEY=""
-ANTHROPIC_API_KEY=""
+## 5. Configuración
 
-# Configuración de Ollama Local
-OLLAMA_HOST="http://localhost:11434"
-OLLAMA_MODEL="qwen2.5-coder:7b"
+Zara lee sus ajustes de dos archivos (y de las variables de entorno del sistema, que mandan sobre ambos):
 
-# Voz y Síntesis
-ZARA_TTS_ENGINE="edge"
-ZARA_EDGE_VOICE="es-ES-XimenaNeural"
-ZARA_EDGE_RATE="+6%"
-ZARA_EDGE_PITCH="+2Hz"
+| Archivo | ¿Se sube a GitHub? | Para qué |
+|---|---|---|
+| `config/ajustes.env` | **Sí** (repositorio público) | Preferencias: cerebro por defecto, voz, transcripción... Es la configuración con la que arranca Zara. |
+| `.env` | **No** (`.gitignore`) | Lo privado de este equipo: claves de API y cualquier ajuste que quieras cambiar solo aquí. Gana sobre `config/ajustes.env`. |
 
-# Barge-in anti-eco (ver sección 6 si Zara se corta sola al hablar)
-ZARA_VAD_BARGE_IN_MIN_RMS=0.02
-ZARA_VAD_BARGE_IN_GRACE_MS=300
-```
+Por defecto Zara usa **Gemini con la suscripción Google AI Pro** (`ZARA_DEFAULT_BRAIN="antigravity"`, ver Paso 3b). Lo que elijas en el panel (cerebro, modelo) se guarda en `.env`.
+
+> **Nunca** pongas claves, contraseñas ni datos personales en `config/ajustes.env`: cualquiera puede leer el repositorio.
+
+Si tu `.env` viene de una versión anterior, Zara quita automáticamente (una sola vez, con copia en `.env.bak`) las líneas copiadas de la plantilla antigua que tapaban los ajustes nuevos; tus claves y tus elecciones no se tocan.
 
 ---
-
-> Documentación de la v1 (obsoleta) en `docs/legacy/`.
 
 ## 6. Cómo dejarlo funcionando a la perfección
 
