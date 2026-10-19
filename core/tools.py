@@ -35,6 +35,25 @@ def is_command_forbidden(cmd: str) -> Optional[str]:
     return None
 
 
+def _normalize_windows_command(cmd: str) -> str:
+    """Traduce comandos Unix habituales emitidos por modelos locales a sintaxis PowerShell."""
+    c = cmd.strip()
+    if re.match(r"^ls\s+-[a-zA-Z]+(\s+.*)?$", c):
+        c = re.sub(r"^ls\s+-[a-zA-Z]+", "Get-ChildItem -Force", c)
+    elif c.startswith("which "):
+        target = c[6:].strip()
+        c = f"where.exe {target}"
+    elif c == "ifconfig" or c.startswith("ifconfig "):
+        c = "ipconfig"
+    elif "grep " in c and not shutil.which("grep"):
+        c = re.sub(r"\|\s*grep\s+(-[a-zA-Z]+\s+)?", "| Select-String ", c)
+    elif c == "clear":
+        c = "Clear-Host"
+    elif c.startswith("uname"):
+        c = "(Get-CimInstance Win32_OperatingSystem).Caption"
+    return c
+
+
 # =============================================================================
 # 1. HERRAMIENTA: EJECUCIÓN EN SHELL (run_shell)
 # =============================================================================
@@ -51,6 +70,9 @@ def run_shell(command: str, timeout: int = SHELL_TIMEOUT, background: bool = Fal
             "stderr": f"ACCESO DENEGADO POR GUARDARRAÍL: El comando coincide con el patrón destructivo '{blocked_pattern}'.",
             "exit_code": 126,
         }
+
+    if sys.platform == "win32":
+        command = _normalize_windows_command(command)
 
     log.info("Ejecutando shell [%s]: %s", "Windows/PowerShell" if sys.platform == "win32" else "Linux/Bash", command)
 
@@ -870,6 +892,27 @@ TOOL_DEFINITIONS = [
         },
     },
 ]
+
+
+def format_tools_for_local_prompt(tools: Optional[List[Dict[str, Any]]] = None) -> str:
+    """Genera una especificación compacta y rigurosa de las herramientas para modelos locales."""
+    t_list = tools or TOOL_DEFINITIONS
+    lines = ["HERRAMIENTAS DEL SISTEMA DISPONIBLES:"]
+    for t in t_list:
+        name = t.get("name", "")
+        desc = t.get("description", "")
+        props = (t.get("parameters", {}) or {}).get("properties", {}) or {}
+        param_list = []
+        for p_name, p_info in props.items():
+            enum_vals = p_info.get("enum")
+            p_type = p_info.get("type", "str")
+            if enum_vals:
+                param_list.append(f"{p_name} [{'|'.join(enum_vals[:12])}]")
+            else:
+                param_list.append(f"{p_name}: {p_type}")
+        params_str = ", ".join(param_list)
+        lines.append(f"* {name}({params_str}): {desc}")
+    return "\n".join(lines)
 
 
 _ACTION_ALIAS_CACHE: Optional[Dict[str, Tuple[str, str]]] = None

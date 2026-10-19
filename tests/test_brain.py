@@ -7,6 +7,7 @@ from core.brain import (
     ZaraBrain,
     ZaraRouter,
     _extract_embedded_tool_call,
+    _extract_embedded_tool_calls,
     _pick_default_ollama_model,
     _summarize_observations_locally,
 )
@@ -222,3 +223,120 @@ def test_history_trimming():
     brain._trim_history()
     assert len(brain.history) <= 40
     assert brain.history[-1]["content"] == "msg 49"
+
+
+def test_extract_embedded_tool_calls_resilience():
+    from core.tools import TOOL_DEFINITIONS
+    known_tools = {"run_shell", "file_manager", "os_control", "web_search"}
+
+    # 1. Alias de clave "tool" y "parameters"
+    text1 = '{"tool": "run_shell", "parameters": {"command": "dir"}}'
+    calls1 = _extract_embedded_tool_calls(text1, known_tools, TOOL_DEFINITIONS)
+    assert len(calls1) == 1
+    assert calls1[0]["name"] == "run_shell"
+    assert calls1[0]["arguments"]["command"] == "dir"
+
+    # 2. Argumentos aplanados en la raíz
+    text2 = '{"name": "file_manager", "action": "read", "path": "test.txt"}'
+    calls2 = _extract_embedded_tool_calls(text2, known_tools, TOOL_DEFINITIONS)
+    assert len(calls2) == 1
+    assert calls2[0]["name"] == "file_manager"
+    assert calls2[0]["arguments"]["action"] == "read"
+    assert calls2[0]["arguments"]["path"] == "test.txt"
+
+    # 3. Tag XML <tool_call>
+    text3 = '<tool_call>{"name": "run_shell", "arguments": {"command": "ipconfig"}}</tool_call>'
+    calls3 = _extract_embedded_tool_calls(text3, known_tools, TOOL_DEFINITIONS)
+    assert len(calls3) == 1
+    assert calls3[0]["name"] == "run_shell"
+    assert calls3[0]["arguments"]["command"] == "ipconfig"
+
+
+def test_ollama_provider_caching_and_tool_injection(monkeypatch):
+    from core.tools import TOOL_DEFINITIONS
+
+    provider = OllamaProvider(model="test-gguf:latest")
+    assert provider._native_tools_supported.get("test-gguf:latest") is None
+
+    recorded_payloads = []
+
+    class FakeResponse:
+        def __init__(self, status_code, data_lines):
+            self.status_code = status_code
+            self._data_lines = data_lines
+            self.text = ""
+
+        def iter_lines(self, decode_unicode=False):
+            for l in self._data_lines:
+                if decode_unicode and isinstance(l, bytes):
+                    yield l.decode("utf-8")
+                else:
+                    yield l
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args):
+            pass
+
+        def close(self):
+            pass
+
+    def fake_post(url, json=None, **kwargs):
+        recorded_payloads.append(json)
+        # Si incluye "tools", falla con 400 como hacen los modelos locales sin template
+        if "tools" in json:
+            return FakeResponse(400, [])
+        return FakeResponse(200, [b'{"message": {"role": "assistant", "content": "{\\"tool\\": \\"run_shell\\", \\"command\\": \\"dir\\"}"}}'])
+
+    import requests
+    monkeypatch.setattr(requests, "post", fake_post)
+
+    messages = [{"role": "user", "content": "lista archivos"}]
+    events = list(provider.stream_chat(messages, tools=TOOL_DEFINITIONS))
+
+    # Comprobar que tras el 400 se cacheó que este modelo no soporta native tools
+    assert provider._native_tools_supported["test-gguf:latest"] is False
+    # Se debe haber extraído la tool call embebida con los argumentos aplanados
+    assert len(events) == 1
+    assert events[0]["type"] == "tool_call"
+    assert events[0]["name"] == "run_shell"
+    assert events[0]["args"]["command"] == "dir"
+
+    # Comprobar que en la segunda petición (reintento sin native tools), se inyectó la especificación de herramientas
+    assert len(recorded_payloads) == 2
+    retry_payload = recorded_payloads[1]
+    system_msg = next((m for m in retry_payload["messages"] if m["role"] == "system"), None)
+    assert system_msg is not None
+    assert "HERRAMIENTAS DEL SISTEMA DISPONIBLES:" in system_msg["content"]
+    assert "run_shell" in system_msg["content"]
+
+
+def test_react_preserves_tool_arguments_in_history(monkeypatch):
+    """Verifica que el bucle ReAct almacena el nombre y argumentos de la herramienta
+    en el turno del asistente, evitando amnesia en turnos subsecuentes."""
+    brain = ZaraBrain()
+
+    turn = {"n": 0}
+
+    def fake_execute_stream(*args, **kwargs):
+        turn["n"] += 1
+        if turn["n"] == 1:
+            yield {"type": "tool_call", "name": "run_shell", "args": {"command": "mkdir test_dir"}}
+        else:
+            yield {"type": "token", "token": "Carpeta creada con éxito, Señor VK."}
+
+    monkeypatch.setattr(brain, "_execute_stream_with_fallback", fake_execute_stream)
+    monkeypatch.setattr(
+        "core.brain.execute_tool",
+        lambda name, args: {"success": True, "stdout": "", "stderr": "", "exit_code": 0},
+    )
+
+    outputs = list(brain.run_react_agent("crea la carpeta test_dir", preferred_provider="ollama"))
+    assert "Carpeta creada con éxito, Señor VK." in "".join(outputs)
+
+    # Verificar que en el historial el turno del asistente contiene la acción explícita con argumentos
+    assistant_msgs = [m for m in brain.history if m["role"] == "assistant"]
+    assert len(assistant_msgs) >= 2
+    assert 'run_shell({"command": "mkdir test_dir"})' in assistant_msgs[0]["content"]
+

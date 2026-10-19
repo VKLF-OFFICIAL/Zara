@@ -9,10 +9,12 @@ import pytest
 from core.tools import (
     execute_tool,
     file_manager,
+    format_tools_for_local_prompt,
     is_command_forbidden,
     os_control,
     run_shell,
     web_search,
+    _normalize_windows_command,
 )
 
 
@@ -257,4 +259,27 @@ def test_execute_tool_dispatch():
     res_unknown = execute_tool("non_existent_tool", {})
     assert res_unknown["success"] is False
     assert "desconocida" in res_unknown["error"]
+
+
+def test_normalize_windows_command():
+    assert _normalize_windows_command("ls -la") == "Get-ChildItem -Force"
+    assert _normalize_windows_command("ls -lh /path") == "Get-ChildItem -Force /path"
+    assert _normalize_windows_command("which python") == "where.exe python"
+    assert _normalize_windows_command("ifconfig") == "ipconfig"
+    assert _normalize_windows_command("clear") == "Clear-Host"
+    assert "Win32_OperatingSystem" in _normalize_windows_command("uname -a")
+    # Unix grep to PowerShell Select-String
+    converted_grep = _normalize_windows_command("Get-Content log.txt | grep error")
+    assert "Select-String error" in converted_grep
+
+
+def test_format_tools_for_local_prompt():
+    formatted = format_tools_for_local_prompt()
+    assert "HERRAMIENTAS DEL SISTEMA DISPONIBLES:" in formatted
+    assert "run_shell" in formatted
+    assert "file_manager" in formatted
+    assert "os_control" in formatted
+    assert "web_search" in formatted
+    assert "open_app" in formatted  # Enum values represented
+
 

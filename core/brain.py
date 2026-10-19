@@ -47,7 +47,7 @@ from config import (
     SYSTEM_PROMPT,
     get_system_prompt,
 )
-from core.tools import TOOL_DEFINITIONS, execute_tool
+from core.tools import TOOL_DEFINITIONS, execute_tool, format_tools_for_local_prompt
 
 log = logging.getLogger("zara.brain")
 
@@ -148,6 +148,24 @@ def _extract_embedded_tool_calls(
         seen.add(key)
         calls.append({"name": name, "arguments": arguments})
 
+    def _parse_and_add_obj(obj: Any) -> None:
+        if not isinstance(obj, dict):
+            return
+        name = obj.get("name") or obj.get("tool") or obj.get("function") or obj.get("herramienta")
+        args = obj.get("arguments") or obj.get("args") or obj.get("parameters") or obj.get("argumentos")
+
+        # Si el modelo no especificó 'name', pero puso 'action' que coincide con un enum reconocido:
+        if not name and "action" in obj and obj["action"] in recognized:
+            name = obj["action"]
+            args = {k: v for k, v in obj.items() if k != "action"}
+
+        # Si los parámetros vinieron aplanados en la raíz del objeto JSON:
+        if name and not isinstance(args, dict):
+            excluded = {"name", "tool", "function", "herramienta", "arguments", "args", "parameters", "argumentos", "type"}
+            args = {k: v for k, v in obj.items() if k not in excluded}
+
+        _maybe_add(name, args)
+
     for m in _FUNCTION_TAG_RE.finditer(text):
         try:
             args = json.loads(m.group(2))
@@ -160,12 +178,10 @@ def _extract_embedded_tool_calls(
             obj = json.loads(m.group(1))
         except Exception:
             continue
-        if isinstance(obj, dict):
-            _maybe_add(obj.get("name"), obj.get("arguments") or obj.get("args"))
+        _parse_and_add_obj(obj)
 
     for obj in _iter_json_objects(text):
-        if isinstance(obj, dict):
-            _maybe_add(obj.get("name"), obj.get("arguments") or obj.get("args"))
+        _parse_and_add_obj(obj)
 
     return calls
 
@@ -322,6 +338,7 @@ class OllamaProvider:
     def __init__(self, host: str = OLLAMA_HOST, model: str = OLLAMA_MODEL):
         self.host = host.rstrip("/")
         self.model = model
+        self._native_tools_supported: Dict[str, bool] = {}
         if not self.model:
             # [FIX] Sin OLLAMA_MODEL en .env, autodetectar en vez de fallar
             # contra un nombre fijo que puede no existir en esta máquina
@@ -364,61 +381,72 @@ class OllamaProvider:
 
         known_tool_names = {t.get("name") for t in (tools or [])}
 
+        # Comprobar caché de soporte de tools nativos en Ollama para este modelo
+        use_native_tools = bool(tools) and self._native_tools_supported.get(self.model, True)
+
         # [FIX] Construir lista de mensajes: system primero (con fecha actual),
         # luego historial, y por último el recordatorio táctico de herramientas
         # AÑADIDO (no sustituido) para no perder la personalidad/reglas de Zara.
+        # En modo JSON embebido (cuando el modelo no soporta tools nativos),
+        # SE INYECTA LA ESPECIFICACIÓN COMPLETA DE HERRAMIENTAS Y PARÁMETROS.
         def _build_messages() -> List[Dict[str, Any]]:
             sent: List[Dict[str, Any]] = []
             if system_prompt:
                 sent.append({"role": "system", "content": system_prompt})
             sent.extend(messages)
             if tools:
+                tools_spec = format_tools_for_local_prompt(tools) if not use_native_tools else ""
+                tactical_instruction = (
+                    "INSTRUCCIÓN TÁCTICA SOBRE HERRAMIENTAS:\n"
+                    "- Si la petición del Señor VK es una pregunta general, saludo, conversación, explicación o no requiere interactuar con el sistema, responde DIRECTAMENTE en lenguaje natural español, NUNCA uses JSON ni llames a herramientas.\n"
+                    "- ÚNICAMENTE cuando sea estrictamente necesario ejecutar una acción (comandos del sistema, archivos, apps, pantalla, web), responde con un objeto JSON de una sola línea: {\"name\": \"<herramienta>\", \"arguments\": {...}}. Sin bloques de código markdown.\n"
+                    "- Si ya recibiste una [OBSERVACIÓN DEL SISTEMA], NO vuelvas a llamar a la misma herramienta: resume el resultado directamente para el Señor VK."
+                )
+                if tools_spec:
+                    tactical_instruction += f"\n\n{tools_spec}"
                 sent.append({
                     "role": "system",
-                    "content": (
-                        "INSTRUCCIÓN TÁCTICA SOBRE HERRAMIENTAS:\n"
-                        "- Si la petición del Señor VK es una pregunta general, saludo, conversación, explicación o no requiere interactuar con el sistema, responde DIRECTAMENTE en lenguaje natural español, NUNCA uses JSON ni llames a herramientas.\n"
-                        "- ÚNICAMENTE cuando sea estrictamente necesario ejecutar una acción (comandos, web, archivos, apps, pantalla), responde con un objeto JSON de una sola línea: {\"name\": \"<herramienta>\", \"arguments\": {...}}. Sin bloques de código markdown.\n"
-                        "- Si ya recibiste una [OBSERVACIÓN DEL SISTEMA], NO vuelvas a llamar a la misma herramienta: resume el resultado directamente para el Señor VK."
-                    ),
+                    "content": tactical_instruction,
                 })
             return sent
 
-        def _post(use_native_tools: bool):
+        def _post(native_tools_flag: bool):
             payload: Dict[str, Any] = {
                 "model": self.model,
                 "messages": _build_messages(),
                 "stream": True,
                 "options": {"temperature": 0.15},
             }
-            if tools and use_native_tools:
+            if tools and native_tools_flag:
                 payload["tools"] = [{"type": "function", "function": t} for t in tools]
             return requests.post(url, json=payload, stream=True, timeout=60)
 
         full_content = ""
         native_tool_call_found = False
-        use_native_tools = bool(tools)
+        is_tool_call_stream = None
+        tokens_yielded = False
 
         try:
             resp = _post(use_native_tools)
 
-            # [FIX] Muchos modelos locales (p. ej. qwen2.5-coder) NO soportan
-            # tool-calling nativo en Ollama y responden HTTP 400 ("does not
-            # support tools"), lo que antes abortaba toda la interacción con
-            # el sistema. Reintentamos sin el campo nativo "tools" y confiamos
-            # en el recordatorio táctico + extracción de JSON embebido, que
-            # funciona con cualquier modelo instruction-following.
+            # [FIX] Muchos modelos locales (p. ej. qwen2.5-coder o modelos GGUF custom)
+            # NO soportan tool-calling nativo en Ollama y responden HTTP 400 ("does not
+            # support tools"). Cacheamos el soporte para no volver a pagar el coste de red,
+            # e inyectamos la especificación de herramientas directamente en el prompt.
             if use_native_tools and resp.status_code == 400:
+                self._native_tools_supported[self.model] = False
                 try:
                     resp.close()
                 except Exception:
                     pass
                 log.info(
                     "El modelo Ollama '%s' no soporta tool-calling nativo (HTTP 400). "
-                    "Reintentando en modo JSON embebido.", self.model,
+                    "Reintentando en modo JSON embebido con especificación de herramientas.", self.model,
                 )
                 use_native_tools = False
                 resp = _post(use_native_tools)
+            elif use_native_tools and resp.status_code == 200:
+                self._native_tools_supported[self.model] = True
 
             with resp:
                 if resp.status_code != 200:
@@ -441,7 +469,22 @@ class OllamaProvider:
                                     "args": fn.get("arguments", {}),
                                 }
                         elif "content" in msg and msg["content"]:
-                            full_content += msg["content"]
+                            chunk = msg["content"]
+                            full_content += chunk
+
+                            # Si no se detectó tool-call nativo, comprobar si es conversación normal para streaming de voz
+                            if not native_tool_call_found:
+                                stripped = full_content.strip()
+                                if is_tool_call_stream is None:
+                                    if stripped.startswith(("{", "```", "<")):
+                                        is_tool_call_stream = True
+                                    elif len(stripped) >= 15:
+                                        is_tool_call_stream = False
+                                        tokens_yielded = True
+                                        yield {"type": "token", "token": full_content}
+                                elif not is_tool_call_stream:
+                                    tokens_yielded = True
+                                    yield {"type": "token", "token": chunk}
                     except Exception:
                         pass
         except Exception as exc:
@@ -451,9 +494,7 @@ class OllamaProvider:
         if native_tool_call_found:
             return
 
-        # [FIX] Extraer TODAS las llamadas embebidas (antes solo se tomaba la
-        # primera y, con regex ingenuas, ni siquiera esa si había JSON anidado
-        # o varias llamadas seguidas en la misma respuesta).
+        # [FIX] Extraer llamadas embebidas soportando aliases, sintaxis aplanada y tags
         parsed_calls = _extract_embedded_tool_calls(full_content, known_tool_names, tools)
         if parsed_calls:
             for pc in parsed_calls:
@@ -462,7 +503,7 @@ class OllamaProvider:
                     "name": pc.get("name", ""),
                     "args": pc.get("arguments") or pc.get("args") or {},
                 }
-        elif full_content:
+        elif full_content and not tokens_yielded:
             yield {"type": "token", "token": full_content}
 
 
@@ -852,11 +893,22 @@ class ZaraBrain:
             # "user" consecutivos. Claude/Gemini rechazan o se comportan mal
             # ante eso. Un placeholder breve del lado "assistant" restaura la
             # alternancia incluso cuando el modelo no dijo nada antes de actuar.
+            # [FIX] Mantener alternancia y registrar explícitamente las llamadas
+            # a herramientas con sus argumentos para que el modelo (especialmente
+            # modelos locales con poca memoria de contexto) no sufra amnesia
+            # contextual en la siguiente iteración ReAct tras recibir la observación.
+            call_repr = ", ".join(
+                f"{tc.get('name', '?')}({json.dumps(tc.get('args', {}), ensure_ascii=False)})"
+                for tc in tool_calls_to_run
+            )
+            if full_thought_text:
+                assistant_record = f"{full_thought_text}\n[Acción: {call_repr}]"
+            else:
+                assistant_record = f"Ejecutando acción: {call_repr}"
+
             self.history.append({
                 "role": "assistant",
-                "content": full_thought_text or (
-                    "Ejecutando " + ", ".join(tc.get("name", "?") for tc in tool_calls_to_run) + "..."
-                ),
+                "content": assistant_record,
             })
             self._trim_history()
 
