@@ -98,3 +98,27 @@ def resolve_gemini_model(api_key: str, preferred: str, live: bool, fallback: str
         return preferred  # el usuario fijó un modelo concreto: no tocar ni gastar red
     available = list_gemini_models(api_key) if api_key else {}
     return choose_gemini_model(available, preferred, live=live, fallback=fallback)
+
+
+# Variantes que no se pueden elegir como cerebro en el panel (ni de chat ni de voz).
+_EXCLUDE_SELECTABLE = ("image", "tts", "embedding", "robotics", "computer-use", "translate", "aqa")
+
+
+def selectable_gemini_models(available: Dict[str, List[str]], live: bool = False) -> List[str]:
+    """Modelos que el panel puede ofrecer, del más reciente al más antiguo.
+
+    Así un modelo que Google publique después de instalar Zara aparece en el panel sin
+    tocar el código ni reiniciar. Para chat se descartan los de solo audio (Live).
+    """
+    action = "bidiGenerateContent" if live else "generateContent"
+    names = []
+    for raw, acts in available.items():
+        name = raw.removeprefix("models/")
+        if action not in (acts or []) or not name.startswith("gemini-") or name in RETIRED_MODELS:
+            continue
+        if any(x in name for x in _EXCLUDE_SELECTABLE):
+            continue
+        if not live and ("live" in name or "native-audio" in name):
+            continue
+        names.append(name)
+    return sorted(set(names), key=lambda n: (_version_key(n), n), reverse=True)

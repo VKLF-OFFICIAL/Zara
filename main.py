@@ -104,6 +104,7 @@ from PySide6 import QtCore, QtGui, QtWidgets  # noqa: E402
 from core.confirm import parse_confirmation  # noqa: E402
 from core.brain import ZaraBrain, list_ollama_models, _pick_default_ollama_model  # noqa: E402
 from core.ear import ContinuousEar, contains_wake_word  # noqa: E402
+from core.gemini_models import list_gemini_models, selectable_gemini_models  # noqa: E402
 from core.live import GeminiLiveSession  # noqa: E402
 from core.tools import set_confirmation_handler  # noqa: E402
 from core.voice import VoiceSynthesizer  # noqa: E402
@@ -208,6 +209,9 @@ class ZaraController(QtCore.QObject):
     sig_user_speech = QtCore.Signal(str)
     sig_assistant_reply = QtCore.Signal(str)
     sig_ollama_models = QtCore.Signal(list, str)
+    sig_gemini_models = QtCore.Signal(list, list)  # (modelos de chat, modelos Live)
+    # La lista de Gemini sale de la red y cambia poco: no se pide más de una vez por intervalo.
+    GEMINI_MODELS_REFRESH_SECONDS = 60.0
     # [FIX AUD-4] Línea del panel (prefijo, texto): los widgets Qt solo se tocan en el hilo
     # de la GUI, así que los hilos del agente y de Live escriben en el panel con esta señal
     # (conexión en cola automática entre hilos).
@@ -231,6 +235,9 @@ class ZaraController(QtCore.QObject):
         self._worker_lock = threading.Lock()
         self._worker_running = False
         self._classic_active = False
+        # Recarga en caliente de las listas de modelos (una consulta a la vez).
+        self._models_refresh_lock = threading.Lock()
+        self._gemini_models_checked_at: Optional[float] = None
 
         # 1. Motor de Voz (TTS) con Sentence Chunking y Barge-in
         self.voice = VoiceSynthesizer(on_state_change=self._on_voice_state_change)
@@ -289,6 +296,8 @@ class ZaraController(QtCore.QObject):
         self.sig_user_speech.connect(self.hud.update_user_speech)
         self.sig_assistant_reply.connect(self.hud.update_assistant_reply)
         self.sig_ollama_models.connect(self.hud.set_ollama_models)
+        self.sig_gemini_models.connect(self.hud.set_gemini_models)
+        self.hud.models_refresh_requested.connect(self.request_models_refresh)
         self.hud.barge_in_requested.connect(self._on_barge_in)
         self.hud.mic_toggle_requested.connect(self._on_mic_toggle)
         self.hud.brain_changed.connect(self._on_brain_changed)
@@ -406,13 +415,50 @@ class ZaraController(QtCore.QObject):
             self.hud.set_model_selection("claude", self.brain.claude.cli_model_override)
             self.hud.set_model_selection("antigravity", self.brain.antigravity.model)
             self.hud.set_model_selection("gemini", self.brain.gemini.model)
-            self.hud.set_model_selection("gemini_live", config.GEMINI_LIVE_MODEL)
-            threading.Thread(target=self._load_ollama_models, daemon=True).start()
+            self.hud.set_model_selection("gemini_live", self.live_session.model)
+            self.request_models_refresh()
 
         # Saludo inicial táctico
         saludo = "Sistemas tácticos operativos, Señor VK. A su servicio."
         log.info("ZARA: %s", saludo)
         self.voice.say(saludo)
+
+    def request_models_refresh(self) -> None:
+        """Vuelve a consultar los modelos disponibles en un hilo aparte (red).
+
+        Se llama al arrancar, al abrir el panel y al cambiar de cerebro: un modelo instalado
+        con `ollama pull` o publicado por Google con Zara abierta aparece sin reiniciarla.
+        """
+        if not self._models_refresh_lock.acquire(blocking=False):
+            return  # ya hay una consulta en marcha
+        threading.Thread(target=self._refresh_models_worker, daemon=True, name="zara-models").start()
+
+    def _refresh_models_worker(self) -> None:
+        try:
+            for load in (self._load_ollama_models, self._load_gemini_models):
+                try:  # un proveedor caído no impide refrescar el otro
+                    load()
+                except Exception as exc:
+                    log.warning("No se pudo actualizar la lista de modelos: %s", exc)
+        finally:
+            self._models_refresh_lock.release()
+
+    def _load_gemini_models(self) -> None:
+        """Consulta los modelos Gemini que la API ofrece ahora (como mucho una vez por minuto)."""
+        api_key = config.GEMINI_API_KEY
+        if not api_key:
+            return
+        now = time.monotonic()
+        last = self._gemini_models_checked_at
+        if last is not None and now - last < self.GEMINI_MODELS_REFRESH_SECONDS:
+            return
+        self._gemini_models_checked_at = now
+        available = list_gemini_models(api_key)
+        if available:
+            self.sig_gemini_models.emit(
+                selectable_gemini_models(available, live=False),
+                selectable_gemini_models(available, live=True),
+            )
 
     def _load_ollama_models(self) -> None:
         """Consulta los modelos realmente instalados en Ollama (hilo aparte, red)."""
@@ -586,9 +632,16 @@ class ZaraController(QtCore.QObject):
             config.persist_env_var("ZARA_AGY_MODEL", model)
             label = model or "por defecto"
         elif provider == "gemini_live":
+            changed = model != self.live_session.model
             self.live_session.set_model(model)
             config.persist_env_var("ZARA_GEMINI_LIVE_MODEL", model)
             label = model
+            if changed and self.live_session.is_running():
+                # El modelo Live se fija al conectar: se reconecta ya en vez de esperar a
+                # que se reinicie Zara.
+                self.live_session.stop()
+                self.live_session.start()
+                label += " (sesión Live reconectada)"
         else:
             return
 

@@ -40,3 +40,21 @@ def test_retired_model_is_treated_as_auto(monkeypatch):
     # un ID vigente fijado a mano no se toca ni consulta la red
     monkeypatch.setattr(gm, "list_gemini_models", lambda key: (_ for _ in ()).throw(AssertionError("sin red")))
     assert gm.resolve_gemini_model("k", "gemini-2.5-flash", live=False, fallback="x") == "gemini-2.5-flash"
+
+
+def test_selectable_lists_new_models_newest_first():
+    from core.gemini_models import selectable_gemini_models
+
+    listing = dict(AVAILABLE)
+    listing["models/gemini-2.5-flash-preview-tts"] = ["generateContent"]
+    listing["models/gemini-embedding-001"] = ["embedContent"]
+    listing["models/gemini-2.0-flash"] = ["generateContent"]  # retirado
+
+    chat = selectable_gemini_models(listing)
+    assert chat[0] == "gemini-3.5-flash"
+    assert "gemini-3.6-flash-preview-09-2026" in chat and "gemini-2.5-pro" in chat
+    assert not any("tts" in m or "embedding" in m or "audio" in m or "live" in m for m in chat)
+    assert "gemini-2.0-flash" not in chat
+
+    live = selectable_gemini_models(listing, live=True)
+    assert set(live) == {"gemini-2.5-flash-native-audio-preview-12-2025", "gemini-3.1-flash-live-preview"}
