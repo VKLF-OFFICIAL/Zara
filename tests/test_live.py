@@ -43,12 +43,26 @@ def test_gemini_live_availability():
     assert valid_session.is_available() is True
 
 
-def test_gemini_live_model_resolution():
-    session = GeminiLiveSession(api_key="key", model="gemini-2.0-flash-live-001")
-    assert session._resolve_live_model() == "gemini-2.0-flash-live-001"
+def test_gemini_live_model_resolution(monkeypatch):
+    import core.gemini_models as gm
 
-    session.set_model("gemini-2.5-flash-preview-native-audio-dialog")
-    assert session._resolve_live_model() == "gemini-2.5-flash-preview-native-audio-dialog"
+    available = {
+        "models/gemini-2.5-flash-native-audio-preview-12-2025": ["bidiGenerateContent"],
+        "models/gemini-2.5-flash": ["generateContent"],
+    }
+    monkeypatch.setattr(gm, "list_gemini_models", lambda key: available)
+
+    # Un modelo vigente fijado a mano se respeta tal cual
+    session = GeminiLiveSession(api_key="key", model="gemini-2.5-flash-native-audio-preview-12-2025")
+    assert session._resolve_live_model() == "gemini-2.5-flash-native-audio-preview-12-2025"
+
+    # Un modelo retirado (p. ej. heredado de un .env antiguo) se sustituye por uno vigente
+    session.set_model("gemini-2.0-flash-live-001")
+    assert session._resolve_live_model() == "gemini-2.5-flash-native-audio-preview-12-2025"
+
+    # "auto" elige un modelo con soporte Live
+    session.set_model("auto")
+    assert session._resolve_live_model() == "gemini-2.5-flash-native-audio-preview-12-2025"
 
 
 def test_gemini_live_audio_parameters():
@@ -101,6 +115,9 @@ def test_hud_tactical_panel_has_gemini_live():
 
     # Verificar que el combo de modelos contiene los modelos Live
     model_values = [panel.model_combo.itemData(i) for i in range(panel.model_combo.count())]
-    assert "gemini-2.5-flash-preview-native-audio-dialog" in model_values
-    assert "gemini-2.0-flash-live-001" in model_values
+    assert "gemini-2.5-flash-native-audio-preview-12-2025" in model_values
+    assert "auto" in model_values
+    # no se ofrecen modelos que Google ya retiró
+    from core.gemini_models import RETIRED_MODELS
+    assert not RETIRED_MODELS.intersection(model_values)
 

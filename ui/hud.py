@@ -55,6 +55,7 @@ _STATE_TEXT = {
     HUDState.THINKING: "PROCESANDO",
     HUDState.SPEAKING: "RESPONDIENDO",
 }
+_STATE_BY_TEXT = {text: state for state, text in _STATE_TEXT.items()}
 
 # Rutas candidatas para el retrato de Zara (relativas a la raíz del proyecto).
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -67,137 +68,144 @@ APP_ICON_CANDIDATES = [
     str(_PROJECT_ROOT / "config" / "zara-icon.png"),
 ]
 
-# [DISEÑO] Pilas de fuentes con fallback seguro: la fuente preferida va
-# primero (Orbitron para títulos "HUD", JetBrains Mono para la consola/datos
-# técnicos, Inter para el resto de la interfaz), pero como no se garantiza
-# que estén instaladas en el Windows del Señor VK, Qt recorre la lista y usa
-# la primera disponible — nunca se queda sin fuente legible.
-_FONT_TITLE = "'Orbitron', 'Segoe UI Semibold', 'Segoe UI', sans-serif"
-_FONT_MONO = "'JetBrains Mono', 'Cascadia Code', 'Consolas', monospace"
-_FONT_UI = "'Inter', 'Segoe UI', sans-serif"
+# [DISEÑO] Pilas de fuentes con fallback seguro: Qt recorre la lista y usa la primera
+# instalada. Segoe UI Variable es la fuente nativa de Windows 11 (aspecto profesional);
+# Inter/Segoe UI cubren Windows 10 y Linux. La monoespaciada solo se usa en chips técnicos.
+_FONT_UI = "'Segoe UI Variable Text', 'Segoe UI', 'Inter', 'Noto Sans', sans-serif"
+_FONT_MONO = "'Cascadia Code', 'JetBrains Mono', 'Consolas', monospace"
+
+PANEL_W, PANEL_H = 400, 620
 
 _PANEL_STYLE = f"""
+* {{ font-family: {_FONT_UI}; }}
 QFrame#bg {{
-    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 rgba(8, 11, 18, 245), stop:1 rgba(16, 23, 37, 250));
-    border: 1px solid rgba(46, 242, 230, 60);
-    border-radius: 14px;
+    background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 #0E1422, stop:1 #0A0F1A);
+    border: 1px solid rgba(148, 163, 184, 38);
+    border-radius: 18px;
 }}
-QLabel {{ color: #94A3B8; font-family: {_FONT_UI}; font-size: 12px; border: none; }}
-QLabel#title {{ color: #E5EDF7; font-family: {_FONT_TITLE}; font-size: 20px; font-weight: 600; }}
-QLabel#status {{ color: #E5EDF7; font-family: {_FONT_UI}; font-size: 12px; }}
-QPushButton {{
-    background-color: #131D2C;
-    color: #DCE8F6;
-    border: 1px solid #30445F;
-    border-radius: 8px;
-    padding: 9px 12px;
-    font-family: {_FONT_UI};
-    font-size: 12px;
+QLabel {{ color: #94A3B8; font-size: 12px; border: none; background: transparent; }}
+QLabel#title {{ color: #F1F5F9; font-size: 15px; font-weight: 600; }}
+QLabel#status {{ color: #94A3B8; font-size: 11px; }}
+QLabel#caption {{ color: #64748B; font-size: 10px; font-weight: 600; letter-spacing: 0.8px; }}
+QLabel#version {{ color: #475569; font-size: 10px; }}
+QFrame#divider {{ background: rgba(148, 163, 184, 26); border: none; max-height: 1px; min-height: 1px; }}
+QFrame#card {{
+    background: rgba(23, 34, 52, 150);
+    border: 1px solid rgba(148, 163, 184, 26);
+    border-radius: 12px;
 }}
-QPushButton:hover {{ background-color: #192A3D; border: 1px solid #2EF2E6; }}
-QPushButton:pressed {{ background-color: #102B3A; padding-top: 10px; padding-bottom: 8px; }}
 QPushButton#iconBtn {{
-    background-color: #131D2C;
-    border: 1px solid #30445F;
-    border-radius: 20px;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 15px;
     padding: 0px;
 }}
-QPushButton#iconBtn:hover {{ background-color: #192A3D; border: 1px solid #2EF2E6; }}
-QPushButton#iconBtn:pressed {{ background-color: #102B3A; }}
-QPushButton#closeBtn {{
-    color: #F87171;
+QPushButton#iconBtn:hover {{ background: rgba(148, 163, 184, 30); border: 1px solid rgba(148, 163, 184, 45); }}
+QPushButton#iconBtn:pressed {{ background: rgba(46, 242, 230, 40); }}
+QPushButton#sendBtn {{
     border: none;
-    background: transparent;
-    font-size: 15px;
-    font-weight: bold;
-    padding: 0px 4px;
+    border-radius: 17px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #22D3EE, stop:1 #8878FF);
 }}
-QPushButton#closeBtn:hover {{ color: #FCA5A5; }}
-QPlainTextEdit#console {{
-    background-color: #0B111C;
-    color: #C3D2E5;
-    border: 1px solid #1E3045;
-    border-radius: 10px;
-    padding: 10px;
-    font-family: {_FONT_MONO};
-    font-size: 11px;
-    selection-background-color: #17465A;
+QPushButton#sendBtn:hover {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #67E8F9, stop:1 #A397FF); }}
+QPushButton#sendBtn:disabled {{ background: #1E293B; }}
+QFrame#composer {{
+    background: #121A2A;
+    border: 1px solid rgba(148, 163, 184, 45);
+    border-radius: 19px;
 }}
 QLineEdit {{
-    background-color: #101725;
-    color: #E5EDF7;
-    border: 1px solid #30445F;
-    border-radius: 8px;
-    padding: 9px 10px;
-    font-family: {_FONT_UI};
+    background: #121A2A;
+    color: #E2E8F0;
+    border: 1px solid rgba(148, 163, 184, 45);
+    border-radius: 10px;
+    padding: 7px 10px;
     font-size: 12px;
+    selection-background-color: rgba(46, 242, 230, 70);
 }}
-QLineEdit:focus {{ border: 1px solid #2EF2E6; }}
+QLineEdit:focus {{ border: 1px solid rgba(46, 242, 230, 150); }}
+QLineEdit#composerInput {{ background: transparent; border: none; padding: 8px 4px 8px 14px; font-size: 13px; }}
 QComboBox {{
-    background-color: #101725;
-    color: #E5EDF7;
-    border: 1px solid #30445F;
-    border-radius: 8px;
-    padding: 7px 28px 7px 10px;
-    font-family: {_FONT_UI};
+    background: #121A2A;
+    color: #E2E8F0;
+    border: 1px solid rgba(148, 163, 184, 45);
+    border-radius: 10px;
+    padding: 6px 26px 6px 10px;
     font-size: 12px;
 }}
-QComboBox:hover {{
-    border: 1px solid #4B6382;
-}}
-QComboBox:focus {{ border: 1px solid #2EF2E6; }}
-QComboBox:disabled {{
-    background-color: #0B111C;
-    color: #556B88;
-    border: 1px solid #1E293B;
-}}
-QComboBox::drop-down {{
-    subcontrol-origin: padding;
-    subcontrol-position: top right;
-    width: 24px;
-    border-left: none;
-}}
-QComboBox::down-arrow {{
-    image: none;
-    border-left: 4px solid transparent;
-    border-right: 4px solid transparent;
-    border-top: 5px solid #2EF2E6;
-    margin-right: 8px;
-}}
+QComboBox:hover {{ border: 1px solid rgba(148, 163, 184, 90); }}
+QComboBox:focus {{ border: 1px solid rgba(46, 242, 230, 150); }}
+QComboBox:disabled {{ color: #64748B; background: #0F1624; border: 1px solid rgba(148, 163, 184, 25); }}
+QComboBox::drop-down {{ subcontrol-origin: padding; subcontrol-position: center right; width: 22px; border: none; }}
+QComboBox::down-arrow {{ image: none; width: 0px; height: 0px; border: none; }}
 QComboBox QAbstractItemView {{
-    background-color: #0E1624;
-    color: #E5EDF7;
-    border: 1px solid #30445F;
+    background: #121A2A;
+    color: #E2E8F0;
+    border: 1px solid rgba(148, 163, 184, 60);
+    border-radius: 8px;
     selection-background-color: rgba(46, 242, 230, 45);
     selection-color: #FFFFFF;
-    font-family: {_FONT_UI};
     font-size: 12px;
     outline: none;
-    padding: 2px 0px;
+    padding: 4px;
 }}
-QComboBox QAbstractItemView::item {{
-    min-height: 26px;
-    padding: 4px 8px;
+QComboBox QAbstractItemView::item {{ min-height: 26px; padding: 4px 8px; border-radius: 6px; }}
+QComboBox QAbstractItemView::item:selected {{ background: rgba(46, 242, 230, 45); color: #FFFFFF; }}
+QScrollArea#chat, QWidget#chatInner {{ background: transparent; border: none; }}
+QFrame#bubbleUser {{
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 #0E7490, stop:1 #4C3FA8);
+    border-radius: 14px;
+    border-bottom-right-radius: 4px;
 }}
-QComboBox QAbstractItemView::item:selected {{
-    background-color: rgba(46, 242, 230, 50);
-    color: #2EF2E6;
+QFrame#bubbleZara {{
+    background: #172234;
+    border: 1px solid rgba(148, 163, 184, 30);
+    border-radius: 14px;
+    border-bottom-left-radius: 4px;
 }}
-QScrollBar:vertical {{
-    background: #0B111C;
-    width: 8px;
-    border-radius: 4px;
-    margin: 2px;
+QFrame#bubbleConfirm {{
+    background: rgba(245, 158, 11, 28);
+    border: 1px solid rgba(245, 158, 11, 120);
+    border-radius: 12px;
 }}
-QScrollBar::handle:vertical {{
-    background: rgba(46, 242, 230, 110);
-    border-radius: 4px;
-    min-height: 24px;
+QLabel#bubbleText {{ color: #E8EEF6; font-size: 13px; }}
+QLabel#bubbleTextUser {{ color: #FFFFFF; font-size: 13px; }}
+QLabel#bubbleTime {{ color: rgba(226, 232, 240, 120); font-size: 10px; }}
+QLabel#confirmTitle {{ color: #FBBF24; font-size: 11px; font-weight: 600; letter-spacing: 0.5px; }}
+QLabel#chipTool {{
+    color: #A5B4FC;
+    background: rgba(136, 120, 255, 26);
+    border: 1px solid rgba(136, 120, 255, 70);
+    border-radius: 10px;
+    padding: 3px 10px;
+    font-family: {_FONT_MONO};
+    font-size: 10px;
 }}
-QScrollBar::handle:vertical:hover {{
-    background: rgba(46, 242, 230, 180);
+QLabel#chipToolDone {{
+    color: #6EE7B7;
+    background: rgba(52, 211, 153, 20);
+    border: 1px solid rgba(52, 211, 153, 60);
+    border-radius: 10px;
+    padding: 3px 10px;
+    font-family: {_FONT_MONO};
+    font-size: 10px;
 }}
+QLabel#chipError {{
+    color: #FCA5A5;
+    background: rgba(248, 113, 113, 24);
+    border: 1px solid rgba(248, 113, 113, 80);
+    border-radius: 10px;
+    padding: 4px 10px;
+    font-size: 11px;
+}}
+QLabel#systemNote {{ color: #64748B; font-size: 10.5px; }}
+QLabel#emptyState {{ color: #475569; font-size: 12px; }}
+QScrollBar:vertical {{ background: transparent; width: 6px; margin: 2px; }}
+QScrollBar::handle:vertical {{ background: rgba(148, 163, 184, 70); border-radius: 3px; min-height: 24px; }}
+QScrollBar::handle:vertical:hover {{ background: rgba(148, 163, 184, 130); }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0px; }}
+QScrollBar::add-page:vertical, QScrollBar::sub-page:vertical {{ background: transparent; }}
+QToolTip {{ color: #E2E8F0; background: #121A2A; border: 1px solid rgba(148, 163, 184, 60); padding: 4px 6px; }}
 """
 
 
@@ -309,6 +317,44 @@ def _draw_power_icon(p: QtGui.QPainter, rect: QtCore.QRectF, color: QtGui.QColor
     p.drawLine(QtCore.QPointF(cx, cy - h * 0.34), QtCore.QPointF(cx, cy))
 
 
+def _draw_close_icon(p: QtGui.QPainter, rect: QtCore.QRectF, color: QtGui.QColor) -> None:
+    w = rect.width()
+    cx, cy = rect.center().x(), rect.center().y()
+    p.setPen(QtGui.QPen(color, w * 0.08, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap))
+    d = w * 0.2
+    p.drawLine(QtCore.QPointF(cx - d, cy - d), QtCore.QPointF(cx + d, cy + d))
+    p.drawLine(QtCore.QPointF(cx - d, cy + d), QtCore.QPointF(cx + d, cy - d))
+
+
+def _draw_send_icon(p: QtGui.QPainter, rect: QtCore.QRectF, color: QtGui.QColor) -> None:
+    """Flecha hacia arriba (enviar), estilo de los chats modernos."""
+    w = rect.width()
+    cx, cy = rect.center().x(), rect.center().y()
+    p.setPen(QtGui.QPen(color, w * 0.1, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
+    p.drawLine(QtCore.QPointF(cx, cy + w * 0.24), QtCore.QPointF(cx, cy - w * 0.22))
+    p.drawLine(QtCore.QPointF(cx - w * 0.18, cy - w * 0.04), QtCore.QPointF(cx, cy - w * 0.22))
+    p.drawLine(QtCore.QPointF(cx + w * 0.18, cy - w * 0.04), QtCore.QPointF(cx, cy - w * 0.22))
+
+
+def circular_pixmap(path: str, size: int) -> Optional[QtGui.QPixmap]:
+    """Carga una imagen y la devuelve recortada en círculo (para el avatar de la cabecera)."""
+    src = QtGui.QPixmap(path)
+    if src.isNull():
+        return None
+    scaled = src.scaled(size * 2, size * 2, QtCore.Qt.KeepAspectRatioByExpanding, QtCore.Qt.SmoothTransformation)
+    out = QtGui.QPixmap(size * 2, size * 2)
+    out.fill(QtCore.Qt.transparent)
+    p = QtGui.QPainter(out)
+    p.setRenderHint(QtGui.QPainter.Antialiasing)
+    path_c = QtGui.QPainterPath()
+    path_c.addEllipse(0, 0, size * 2, size * 2)
+    p.setClipPath(path_c)
+    p.drawPixmap(0, 0, scaled)
+    p.end()
+    out.setDevicePixelRatio(2.0)  # nítido en pantallas HiDPI
+    return out
+
+
 def build_icon(draw_fn, color: QtGui.QColor, px: int = 40) -> QtGui.QIcon:
     """Renderiza un glifo vectorial en un QPixmap transparente de `px`x`px`."""
     pm = QtGui.QPixmap(px, px)
@@ -338,11 +384,227 @@ class TacticalComboBox(QtWidgets.QComboBox):
         view.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarAsNeeded)
         view.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
 
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:  # noqa: N802
+        # Texto abreviado POR EL MEDIO: así un modelo largo conserva su etiqueta final
+        # (p. ej. "qwen2.5-co…der:7b") en vez de cortarse justo donde están las diferencias.
+        painter = QtWidgets.QStylePainter(self)
+        opt = QtWidgets.QStyleOptionComboBox()
+        self.initStyleOption(opt)
+        painter.drawComplexControl(QtWidgets.QStyle.CC_ComboBox, opt)
+        field = self.style().subControlRect(
+            QtWidgets.QStyle.CC_ComboBox, opt, QtWidgets.QStyle.SC_ComboBoxEditField, self
+        )
+        opt.currentText = self.fontMetrics().elidedText(opt.currentText, QtCore.Qt.ElideMiddle, max(10, field.width() - 4))
+        painter.drawControl(QtWidgets.QStyle.CE_ComboBoxLabel, opt)
+        painter.end()
+        # Chevron vectorial: la flecha por CSS se ve como un cuadrado en varios estilos de Qt.
+        p = QtGui.QPainter(self)
+        p.setRenderHint(QtGui.QPainter.Antialiasing)
+        color = QtGui.QColor("#94A3B8" if self.isEnabled() else "#475569")
+        p.setPen(QtGui.QPen(color, 1.6, QtCore.Qt.SolidLine, QtCore.Qt.RoundCap, QtCore.Qt.RoundJoin))
+        cx, cy = self.width() - 14, self.height() / 2 + 1
+        p.drawPolyline(QtGui.QPolygonF([
+            QtCore.QPointF(cx - 4, cy - 2), QtCore.QPointF(cx, cy + 2), QtCore.QPointF(cx + 4, cy - 2),
+        ]))
+        p.end()
+
     def wheelEvent(self, event: QtGui.QWheelEvent) -> None:  # noqa: N802
         if not self.view().isVisible():
             event.ignore()
         else:
             super().wheelEvent(event)
+
+
+class ChatView(QtWidgets.QScrollArea):
+    """Conversación en burbujas: Señor VK a la derecha, Zara a la izquierda, y los eventos
+    del sistema (herramientas, avisos, errores) como chips discretos centrados.
+
+    Todo el texto se pinta como TEXTO PLANO: la salida de un modelo nunca se interpreta
+    como HTML (evita etiquetas inyectadas y textos que "desaparecen").
+    """
+
+    MAX_ITEMS = 200
+    BUBBLE_MAX_W = 268
+
+    def __init__(self, parent: Optional[QtWidgets.QWidget] = None):
+        super().__init__(parent)
+        self.setObjectName("chat")
+        self.setWidgetResizable(True)
+        self.setFrameShape(QtWidgets.QFrame.NoFrame)
+        self.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarAlwaysOff)
+
+        self._inner = QtWidgets.QWidget()
+        self._inner.setObjectName("chatInner")
+        self._layout = QtWidgets.QVBoxLayout(self._inner)
+        self._layout.setContentsMargins(2, 6, 6, 6)
+        self._layout.setSpacing(8)
+        # Sin esto, el QScrollArea encogía el contenido al alto visible (Qt solo impone el
+        # mínimo del layout en ventanas) y aplastaba las burbujas en vez de hacer scroll.
+        self._layout.setSizeConstraint(QtWidgets.QLayout.SetMinimumSize)
+        self._layout.addStretch(1)  # empuja los mensajes hacia abajo, como un chat real
+        self.setWidget(self._inner)
+
+        self._empty = QtWidgets.QLabel("Di «Zara» o escribe abajo para empezar.")
+        self._empty.setObjectName("emptyState")
+        self._empty.setAlignment(QtCore.Qt.AlignCenter)
+        self._layout.addWidget(self._empty)
+
+        self._rows: list[QtWidgets.QWidget] = []
+        self._to_fit: list[QtWidgets.QLabel] = []
+        self._pending_tools: dict[str, QtWidgets.QLabel] = {}
+        self._avatar_small: Optional[QtGui.QPixmap] = None
+        for candidate in AVATAR_CANDIDATES:
+            if Path(candidate).is_file():
+                self._avatar_small = circular_pixmap(candidate, 22)
+                if self._avatar_small is not None:
+                    break
+
+        # Al crecer el contenido, bajar al último mensaje.
+        self.verticalScrollBar().rangeChanged.connect(
+            lambda _min, _max: self.verticalScrollBar().setValue(_max)
+        )
+
+    # --- construcción de filas ---
+    def _text_label(self, text: str, object_name: str) -> QtWidgets.QLabel:
+        lbl = QtWidgets.QLabel(text)
+        lbl.setObjectName(object_name)
+        lbl.setTextFormat(QtCore.Qt.PlainText)
+        lbl.setWordWrap(True)
+        lbl.setTextInteractionFlags(QtCore.Qt.TextSelectableByMouse)
+        lbl.setMaximumWidth(self.BUBBLE_MAX_W - 24)
+        self._to_fit.append(lbl)  # se dimensiona al insertarlo (ver _fit_label)
+        return lbl
+
+    def _fit_label(self, lbl: QtWidgets.QLabel, max_w: int) -> None:
+        """Ancho natural del texto (hasta `max_w`) y altura exacta para ese ancho.
+
+        Debe llamarse con la etiqueta ya dentro del panel, para medir con la fuente real de
+        la hoja de estilos. Sin esto, Qt partía las líneas demasiado pronto y, dentro de un
+        QScrollArea, aplastaba las burbujas (texto cortado) en vez de mostrar el scroll.
+        """
+        lbl.ensurePolished()
+        fm = lbl.fontMetrics()
+        natural = max((fm.horizontalAdvance(line) for line in lbl.text().splitlines() or [""]), default=0)
+        width = max(1, min(max_w, natural + 2))
+        lbl.setFixedWidth(width)
+        lbl.setMinimumHeight(lbl.heightForWidth(width))
+
+    def _bubble(self, text: str, user: bool) -> QtWidgets.QFrame:
+        bubble = QtWidgets.QFrame()
+        bubble.setObjectName("bubbleUser" if user else "bubbleZara")
+        bubble.setMaximumWidth(self.BUBBLE_MAX_W)
+        lay = QtWidgets.QVBoxLayout(bubble)
+        lay.setContentsMargins(12, 8, 12, 6)
+        lay.setSpacing(2)
+        lay.addWidget(self._text_label(text, "bubbleTextUser" if user else "bubbleText"))
+        stamp = QtWidgets.QLabel(QtCore.QTime.currentTime().toString("HH:mm"))
+        stamp.setObjectName("bubbleTime")
+        stamp.setAlignment(QtCore.Qt.AlignRight)
+        lay.addWidget(stamp)
+        return bubble
+
+    def _append_row(self, row: QtWidgets.QWidget) -> None:
+        if self._empty is not None:
+            self._empty.hide()
+            self._layout.removeWidget(self._empty)
+            self._empty.deleteLater()
+            self._empty = None
+        self._layout.addWidget(row)
+        self._rows.append(row)
+        for lbl in self._to_fit:
+            self._fit_label(lbl, lbl.maximumWidth())
+        self._to_fit.clear()
+        while len(self._rows) > self.MAX_ITEMS:
+            old = self._rows.pop(0)
+            self._layout.removeWidget(old)
+            old.deleteLater()
+
+    def _centered(self, widget: QtWidgets.QWidget) -> QtWidgets.QWidget:
+        row = QtWidgets.QWidget()
+        lay = QtWidgets.QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addStretch(1)
+        lay.addWidget(widget)
+        lay.addStretch(1)
+        return row
+
+    # --- API ---
+    def add_user(self, text: str) -> None:
+        row = QtWidgets.QWidget()
+        lay = QtWidgets.QHBoxLayout(row)
+        lay.setContentsMargins(40, 0, 0, 0)
+        lay.addStretch(1)
+        lay.addWidget(self._bubble(text, user=True))
+        self._append_row(row)
+
+    def add_assistant(self, text: str) -> None:
+        row = QtWidgets.QWidget()
+        lay = QtWidgets.QHBoxLayout(row)
+        lay.setContentsMargins(0, 0, 40, 0)
+        lay.setSpacing(6)
+        if self._avatar_small is not None:
+            av = QtWidgets.QLabel()
+            av.setPixmap(self._avatar_small)
+            av.setFixedSize(22, 22)
+            lay.addWidget(av, 0, QtCore.Qt.AlignBottom)
+        lay.addWidget(self._bubble(text, user=False))
+        lay.addStretch(1)
+        self._append_row(row)
+
+    def add_tool(self, tool_name: str, desc: str) -> None:
+        """Un chip por herramienta: «ejecutando…» se transforma en «✓» al completarse."""
+        done = desc.strip().lower().startswith("completad")
+        pending = self._pending_tools.pop(tool_name, None)
+        if done and pending is not None:
+            pending.setText(f"✓  {tool_name}")
+            pending.setObjectName("chipToolDone")
+            pending.style().unpolish(pending)
+            pending.style().polish(pending)
+            return
+        chip = QtWidgets.QLabel(f"✓  {tool_name}" if done else f"⋯  {tool_name}")
+        chip.setObjectName("chipToolDone" if done else "chipTool")
+        chip.setTextFormat(QtCore.Qt.PlainText)
+        chip.setToolTip(desc)
+        if not done:
+            self._pending_tools[tool_name] = chip
+        self._append_row(self._centered(chip))
+
+    def add_confirm(self, text: str) -> None:
+        card = QtWidgets.QFrame()
+        card.setObjectName("bubbleConfirm")
+        lay = QtWidgets.QVBoxLayout(card)
+        lay.setContentsMargins(12, 8, 12, 8)
+        lay.setSpacing(3)
+        title = QtWidgets.QLabel("CONFIRMACIÓN NECESARIA")
+        title.setObjectName("confirmTitle")
+        lay.addWidget(title)
+        lay.addWidget(self._text_label(text, "bubbleText"))
+        hint = QtWidgets.QLabel("Responda «sí» o «no» por voz, o escríbalo abajo.")
+        hint.setObjectName("bubbleTime")
+        lay.addWidget(hint)
+        self._append_row(card)
+
+    def add_error(self, text: str) -> None:
+        chip = QtWidgets.QLabel(text)
+        chip.setObjectName("chipError")
+        chip.setTextFormat(QtCore.Qt.PlainText)
+        chip.setWordWrap(True)
+        chip.setMaximumWidth(self.BUBBLE_MAX_W + 40)
+        self._to_fit.append(chip)
+        self._append_row(self._centered(chip))
+
+    def add_system(self, text: str) -> None:
+        note = QtWidgets.QLabel(text)
+        note.setObjectName("systemNote")
+        note.setTextFormat(QtCore.Qt.PlainText)
+        note.setWordWrap(True)
+        note.setAlignment(QtCore.Qt.AlignCenter)
+        note.setMaximumWidth(self.BUBBLE_MAX_W + 40)
+        self._to_fit.append(note)
+        self._append_row(self._centered(note))
+
+    def count(self) -> int:
+        return len(self._rows)
 
 
 class ZaraPanel(QtWidgets.QWidget):
@@ -358,10 +620,14 @@ class ZaraPanel(QtWidgets.QWidget):
 
     _BRAIN_OPTIONS = [
         ("Auto", "auto"),
-        ("Gemini Live (Streaming)", "gemini_live"),
+        ("Gemini Live", "gemini_live"),
         ("Ollama (local)", "ollama"),
         ("Claude", "claude"),
         ("Gemini", "gemini"),
+        ("Gemini · AI Pro", "antigravity"),
+    ]
+    _ANTIGRAVITY_MODEL_OPTIONS = [
+        ("Por defecto", ""),
     ]
     _GEMINI_LIVE_MODEL_OPTIONS = [
         ("Auto (más reciente)", "auto"),
@@ -384,7 +650,7 @@ class ZaraPanel(QtWidgets.QWidget):
         super().__init__()
         self._ollama_models: list[str] = []
         self._desired_model: dict[str, str] = {}
-        self.setFixedSize(380, 520)
+        self.setFixedSize(PANEL_W, PANEL_H)
         self.setWindowFlags(
             QtCore.Qt.FramelessWindowHint
             | QtCore.Qt.WindowStaysOnTopHint
@@ -395,137 +661,153 @@ class ZaraPanel(QtWidgets.QWidget):
 
     def _build_ui(self) -> None:
         outer = QtWidgets.QVBoxLayout(self)
-        outer.setContentsMargins(8, 8, 8, 8)
+        outer.setContentsMargins(10, 10, 10, 10)
 
         bg = QtWidgets.QFrame(self)
         bg.setObjectName("bg")
-        bg.setStyleSheet(_PANEL_STYLE)
         self.setStyleSheet(_PANEL_STYLE)
 
-        # [DISEÑO] Sombra suave para dar profundidad ("glassmorphism" ligero)
-        # sin abusar de efectos: un único halo moderado, no uno por widget.
+        # Sombra suave para dar profundidad, un único efecto para todo el panel.
         shadow = QtWidgets.QGraphicsDropShadowEffect(bg)
-        shadow.setBlurRadius(36)
-        shadow.setOffset(0, 6)
-        shadow.setColor(QtGui.QColor(0, 0, 0, 160))
+        shadow.setBlurRadius(40)
+        shadow.setOffset(0, 8)
+        shadow.setColor(QtGui.QColor(0, 0, 0, 170))
         bg.setGraphicsEffect(shadow)
         outer.addWidget(bg)
 
         layout = QtWidgets.QVBoxLayout(bg)
-        layout.setContentsMargins(12, 10, 12, 10)
-        layout.setSpacing(8)
+        layout.setContentsMargins(16, 14, 16, 12)
+        layout.setSpacing(10)
 
-        # 1. Cabecera (Título y botón cerrar)
+        # 1. Cabecera: avatar + nombre + estado | acciones rápidas
         header = QtWidgets.QHBoxLayout()
-        title = QtWidgets.QLabel(f"ZARA // PANEL TÁCTICO  ·  v{VERSION_FULL}")
+        header.setSpacing(10)
+        self.avatar_lbl = QtWidgets.QLabel()
+        self.avatar_lbl.setFixedSize(36, 36)
+        for candidate in AVATAR_CANDIDATES:
+            if Path(candidate).is_file():
+                pm = circular_pixmap(candidate, 36)
+                if pm is not None:
+                    self.avatar_lbl.setPixmap(pm)
+                    break
+        header.addWidget(self.avatar_lbl)
+
+        name_box = QtWidgets.QVBoxLayout()
+        name_box.setSpacing(1)
+        title = QtWidgets.QLabel("Zara")
         title.setObjectName("title")
-        header.addWidget(title)
-        header.addStretch()
-        close_btn = QtWidgets.QPushButton("×")
-        close_btn.setObjectName("closeBtn")
-        close_btn.setFixedSize(20, 20)
-        close_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        name_box.addWidget(title)
+        status_row = QtWidgets.QHBoxLayout()
+        status_row.setSpacing(6)
+        self.status_dot = QtWidgets.QLabel()
+        self.status_dot.setFixedSize(8, 8)
+        status_row.addWidget(self.status_dot, 0, QtCore.Qt.AlignVCenter)
+        self.status_lbl = QtWidgets.QLabel()
+        self.status_lbl.setObjectName("status")
+        status_row.addWidget(self.status_lbl)
+        status_row.addStretch(1)
+        name_box.addLayout(status_row)
+        header.addLayout(name_box, stretch=1)
+
+        def _icon_button(draw_fn, color, tooltip) -> QtWidgets.QPushButton:
+            btn = QtWidgets.QPushButton()
+            btn.setObjectName("iconBtn")
+            btn.setFixedSize(30, 30)
+            btn.setIcon(build_icon(draw_fn, color, px=36))
+            btn.setIconSize(QtCore.QSize(20, 20))
+            btn.setToolTip(tooltip)
+            btn.setCursor(QtCore.Qt.PointingHandCursor)
+            return btn
+
+        self.mic_btn = _icon_button(_draw_mic_icon, CYAN, "Micrófono: activar / silenciar")
+        self.mic_btn.clicked.connect(self.mic_toggle_requested.emit)
+        interrupt_btn = _icon_button(_draw_stop_icon, QtGui.QColor("#F87171"), "Parar la respuesta de Zara")
+        interrupt_btn.clicked.connect(self.interrupt_requested.emit)
+        quit_btn = _icon_button(_draw_power_icon, QtGui.QColor("#A5B4FC"), "Cerrar Zara por completo")
+        quit_btn.clicked.connect(self.quit_requested.emit)
+        close_btn = _icon_button(_draw_close_icon, QtGui.QColor("#94A3B8"), "Ocultar panel (Zara sigue activa)")
         close_btn.clicked.connect(self.close_requested.emit)
-        header.addWidget(close_btn)
+        actions = QtWidgets.QHBoxLayout()
+        actions.setSpacing(2)
+        for btn in (self.mic_btn, interrupt_btn, quit_btn, close_btn):
+            actions.addWidget(btn)
+        header.addLayout(actions)
         layout.addLayout(header)
 
-        # 2. Estado
-        self.status_lbl = QtWidgets.QLabel("ESTADO: EN ESPERA // MIC ACTIVO")
-        self.status_lbl.setObjectName("status")
-        layout.addWidget(self.status_lbl)
+        # 2. Selectores de IA dentro de una tarjeta compacta
+        card = QtWidgets.QFrame()
+        card.setObjectName("card")
+        card_lay = QtWidgets.QGridLayout(card)
+        card_lay.setContentsMargins(12, 10, 12, 10)
+        card_lay.setHorizontalSpacing(10)
+        card_lay.setVerticalSpacing(4)
+        brain_lbl = QtWidgets.QLabel("CEREBRO")
+        brain_lbl.setObjectName("caption")
+        self.model_lbl = QtWidgets.QLabel("MODELO")
+        self.model_lbl.setObjectName("caption")
+        card_lay.addWidget(brain_lbl, 0, 0)
+        card_lay.addWidget(self.model_lbl, 0, 1)
 
-        # 3. Selectores de IA en la parte superior (alineados en cuadrícula para
-        # que ambos desplegables tengan idéntico ancho y se abran hacia abajo
-        # sobre el área amplia de la consola, sin desbordar la pantalla).
-        selectors_grid = QtWidgets.QGridLayout()
-        selectors_grid.setContentsMargins(0, 0, 0, 0)
-        selectors_grid.setHorizontalSpacing(8)
-        selectors_grid.setVerticalSpacing(6)
-
-        brain_lbl = QtWidgets.QLabel("Cerebro:")
         self.brain_combo = TacticalComboBox()
         for label, value in self._BRAIN_OPTIONS:
             self.brain_combo.addItem(label, value)
         self.brain_combo.currentIndexChanged.connect(self._on_provider_changed)
         self.brain_combo.activated.connect(self._on_provider_changed)
-        selectors_grid.addWidget(brain_lbl, 0, 0)
-        selectors_grid.addWidget(self.brain_combo, 0, 1)
-
-        self.model_lbl = QtWidgets.QLabel("Modelo:")
         self.model_combo = TacticalComboBox()
         self.model_combo.currentIndexChanged.connect(self._on_model_changed)
         self.model_combo.activated.connect(self._on_model_changed)
-        selectors_grid.addWidget(self.model_lbl, 1, 0)
-        selectors_grid.addWidget(self.model_combo, 1, 1)
+        card_lay.addWidget(self.brain_combo, 1, 0)
+        card_lay.addWidget(self.model_combo, 1, 1)
+        card_lay.setColumnStretch(0, 1)
+        card_lay.setColumnStretch(1, 1)
 
-        layout.addLayout(selectors_grid)
-
-        # 4. Buscador / filtro rápido de modelos locales (aparece para Ollama)
+        # Buscador de modelos locales (solo con Ollama)
         self.model_search_input = QtWidgets.QLineEdit()
-        self.model_search_input.setPlaceholderText("🔍 Filtrar modelos locales (ej: qwen, deepseek)...")
+        self.model_search_input.setPlaceholderText("Filtrar modelos locales (qwen, llama…)")
+        self.model_search_input.setClearButtonEnabled(True)
         self.model_search_input.textChanged.connect(self._on_model_filter_changed)
         self.model_search_input.returnPressed.connect(self._on_model_filter_return_pressed)
         self.model_search_input.hide()
-        layout.addWidget(self.model_search_input)
+        card_lay.addWidget(self.model_search_input, 2, 0, 1, 2)
+        layout.addWidget(card)
 
         self._refresh_model_options()
 
-        # 5. Consola de eventos y chat (área principal en el centro)
-        self.console = QtWidgets.QPlainTextEdit()
-        self.console.setObjectName("console")
-        self.console.setReadOnly(True)
-        self.console.setMaximumBlockCount(300)
-        layout.addWidget(self.console, stretch=1)
+        # 3. Conversación
+        self.chat = ChatView()
+        layout.addWidget(self.chat, stretch=1)
 
-        # 6. Entrada de texto manual (justo debajo del chat)
-        input_row = QtWidgets.QHBoxLayout()
+        # 4. Caja de escritura con botón de enviar integrado
+        composer = QtWidgets.QFrame()
+        composer.setObjectName("composer")
+        comp_lay = QtWidgets.QHBoxLayout(composer)
+        comp_lay.setContentsMargins(0, 3, 4, 3)
+        comp_lay.setSpacing(4)
         self.input_box = QtWidgets.QLineEdit()
-        self.input_box.setPlaceholderText("Escribe una orden para Zara...")
+        self.input_box.setObjectName("composerInput")
+        self.input_box.setPlaceholderText("Escribe a Zara…")
         self.input_box.returnPressed.connect(self._submit_text)
-        input_row.addWidget(self.input_box, stretch=1)
-        send_btn = QtWidgets.QPushButton("Enviar")
-        send_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        send_btn.clicked.connect(self._submit_text)
-        input_row.addWidget(send_btn)
-        layout.addLayout(input_row)
+        comp_lay.addWidget(self.input_box, stretch=1)
+        self.send_btn = QtWidgets.QPushButton()
+        self.send_btn.setObjectName("sendBtn")
+        self.send_btn.setFixedSize(34, 34)
+        self.send_btn.setIcon(build_icon(_draw_send_icon, QtGui.QColor("#FFFFFF"), px=36))
+        self.send_btn.setIconSize(QtCore.QSize(20, 20))
+        self.send_btn.setToolTip("Enviar (Intro)")
+        self.send_btn.setCursor(QtCore.Qt.PointingHandCursor)
+        self.send_btn.clicked.connect(self._submit_text)
+        self.send_btn.setEnabled(False)
+        self.input_box.textChanged.connect(lambda t: self.send_btn.setEnabled(bool(t.strip())))
+        comp_lay.addWidget(self.send_btn)
+        layout.addWidget(composer)
 
-        # 7. Botones rápidos como iconos circulares vectoriales (tooltip descriptivo)
-        btn_row = QtWidgets.QHBoxLayout()
-        btn_row.setSpacing(10)
-        btn_row.addStretch()
+        version = QtWidgets.QLabel(f"Zara v{VERSION_FULL} · Esc para ocultar")
+        version.setObjectName("version")
+        version.setAlignment(QtCore.Qt.AlignCenter)
+        layout.addWidget(version)
 
-        self.mic_btn = QtWidgets.QPushButton()
-        self.mic_btn.setObjectName("iconBtn")
-        self.mic_btn.setFixedSize(40, 40)
-        self.mic_btn.setIcon(build_icon(_draw_mic_icon, CYAN))
-        self.mic_btn.setIconSize(QtCore.QSize(22, 22))
-        self.mic_btn.setToolTip("Micrófono: activar / silenciar")
-        self.mic_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        self.mic_btn.clicked.connect(self.mic_toggle_requested.emit)
-        btn_row.addWidget(self.mic_btn)
-
-        interrupt_btn = QtWidgets.QPushButton()
-        interrupt_btn.setObjectName("iconBtn")
-        interrupt_btn.setFixedSize(40, 40)
-        interrupt_btn.setIcon(build_icon(_draw_stop_icon, QtGui.QColor("#F87171")))
-        interrupt_btn.setIconSize(QtCore.QSize(22, 22))
-        interrupt_btn.setToolTip("Parar: interrumpir la respuesta de Zara")
-        interrupt_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        interrupt_btn.clicked.connect(self.interrupt_requested.emit)
-        btn_row.addWidget(interrupt_btn)
-
-        quit_btn = QtWidgets.QPushButton()
-        quit_btn.setObjectName("iconBtn")
-        quit_btn.setFixedSize(40, 40)
-        quit_btn.setIcon(build_icon(_draw_power_icon, VIOLET))
-        quit_btn.setIconSize(QtCore.QSize(22, 22))
-        quit_btn.setToolTip("Salir: cerrar ZARA")
-        quit_btn.setCursor(QtCore.Qt.PointingHandCursor)
-        quit_btn.clicked.connect(self.quit_requested.emit)
-        btn_row.addWidget(quit_btn)
-
-        btn_row.addStretch()
-        layout.addLayout(btn_row)
+        QtGui.QShortcut(QtGui.QKeySequence(QtCore.Qt.Key_Escape), self, activated=self.close_requested.emit)
+        self.set_status(_STATE_TEXT[HUDState.IDLE], False)
 
     def _submit_text(self) -> None:
         text = self.input_box.text().strip()
@@ -599,7 +881,7 @@ class ZaraPanel(QtWidgets.QWidget):
                 candidates = [m for m in candidates if filter_text in m.lower()]
 
             if candidates:
-                count_str = f"Modelo ({len(candidates)}/{len(self._ollama_models)}):" if filter_text else f"Modelo ({len(candidates)}):"
+                count_str = f"MODELO ({len(candidates)}/{len(self._ollama_models)})" if filter_text else f"MODELO ({len(candidates)})"
                 self.model_lbl.setText(count_str)
                 for name in candidates:
                     display = format_ollama_model_display(name, max_len=36)
@@ -608,29 +890,34 @@ class ZaraPanel(QtWidgets.QWidget):
                     self.model_combo.setItemData(idx, f"Modelo completo: {name}", QtCore.Qt.ToolTipRole)
                 self.model_combo.setEnabled(True)
             else:
-                self.model_lbl.setText("Modelo (0):")
+                self.model_lbl.setText("MODELO (0)")
                 msg = "(sin coincidencias)" if filter_text else "(sin modelos detectados)"
                 self.model_combo.addItem(msg, "")
                 self.model_combo.setEnabled(False)
         else:
             self.model_search_input.hide()
-            if provider == "claude":
-                self.model_lbl.setText("Modelo:")
+            if provider == "antigravity":
+                self.model_lbl.setText("MODELO")
+                for label, value in self._ANTIGRAVITY_MODEL_OPTIONS:
+                    self.model_combo.addItem(label, value)
+                self.model_combo.setEnabled(True)
+            elif provider == "claude":
+                self.model_lbl.setText("MODELO")
                 for label, value in self._CLAUDE_MODEL_OPTIONS:
                     self.model_combo.addItem(label, value)
                 self.model_combo.setEnabled(True)
             elif provider == "gemini_live":
-                self.model_lbl.setText("Modelo:")
+                self.model_lbl.setText("MODELO")
                 for label, value in self._GEMINI_LIVE_MODEL_OPTIONS:
                     self.model_combo.addItem(label, value)
                 self.model_combo.setEnabled(True)
             elif provider == "gemini":
-                self.model_lbl.setText("Modelo:")
+                self.model_lbl.setText("MODELO")
                 for label, value in self._GEMINI_MODEL_OPTIONS:
                     self.model_combo.addItem(label, value)
                 self.model_combo.setEnabled(True)
             else:  # auto
-                self.model_lbl.setText("Modelo: (auto)")
+                self.model_lbl.setText("MODELO")
                 self.model_combo.addItem("El sistema elige", "")
                 self.model_combo.setEnabled(False)
 
@@ -645,13 +932,15 @@ class ZaraPanel(QtWidgets.QWidget):
 
     # --- API pública ---
     def set_status(self, state_text: str, muted: bool) -> None:
-        mic_text = "MIC PAUSADO" if muted else "MIC ACTIVO"
-        self.status_lbl.setText(f"ESTADO: {state_text} // {mic_text}")
+        mic_text = "Mic pausado" if muted else "Mic activo"
+        self.status_lbl.setText(f"{state_text.capitalize()} · {mic_text}")
+        color = MUTED_GRAY if muted else _STATE_COLOR.get(_STATE_BY_TEXT.get(state_text, HUDState.IDLE), CYAN)
+        self.status_dot.setStyleSheet(f"background: {color.name()}; border-radius: 4px;")
 
     def set_muted_visual(self, muted: bool) -> None:
         icon_fn = _draw_mic_off_icon if muted else _draw_mic_icon
-        self.mic_btn.setIcon(build_icon(icon_fn, MUTED_GRAY if muted else CYAN))
-        self.mic_btn.setToolTip("Micrófono silenciado" if muted else "Micrófono: activar / silenciar")
+        self.mic_btn.setIcon(build_icon(icon_fn, MUTED_GRAY if muted else CYAN, px=36))
+        self.mic_btn.setToolTip("Micrófono silenciado: pulse para reactivar" if muted else "Micrófono: activar / silenciar")
 
     def set_brain(self, value: str) -> None:
         for i in range(self.brain_combo.count()):
@@ -682,9 +971,21 @@ class ZaraPanel(QtWidgets.QWidget):
             self.model_combo.blockSignals(False)
 
     def log_line(self, prefix: str, text: str) -> None:
-        self.console.appendPlainText(f"[{prefix}] {text}")
-        bar = self.console.verticalScrollBar()
-        bar.setValue(bar.maximum())
+        """Añade un mensaje a la conversación según su origen (API usada por main.py)."""
+        kind = prefix.upper()
+        if kind == "VK":
+            self.chat.add_user(text)
+        elif kind == "ZARA":
+            self.chat.add_assistant(text)
+        elif kind == "TOOL":
+            name, _, desc = text.partition(":")
+            self.chat.add_tool(name.strip(), desc.strip())
+        elif kind == "CONFIRMAR":
+            self.chat.add_confirm(text)
+        elif kind == "ERROR":
+            self.chat.add_error(text)
+        else:
+            self.chat.add_system(text)
 
 
 class ZaraHUD(QtWidgets.QWidget):

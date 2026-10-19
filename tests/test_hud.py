@@ -1,4 +1,4 @@
-"""Pruebas unitarias para ui/hud.py (ZARA v2.0)."""
+"""Pruebas unitarias para ui/hud.py."""
 
 import os
 import sys
@@ -35,19 +35,19 @@ def test_panel_creation_and_model_filtering(qapp):
 
     # 1. Comprobar que todos los modelos están presentes en el combo
     assert panel.model_combo.count() == len(models)
-    assert "Modelo (6):" in panel.model_lbl.text()
+    assert "MODELO (6)" in panel.model_lbl.text()
     assert not panel.model_search_input.isHidden()
 
     # 2. Filtrar por "deepseek"
     panel.model_search_input.setText("deepseek")
     assert panel.model_combo.count() == 1
     assert "deepseek-coder-v2:16b" in panel.model_combo.itemData(0)
-    assert "Modelo (1/6):" in panel.model_lbl.text()
+    assert "MODELO (1/6)" in panel.model_lbl.text()
 
     # 3. Filtrar por "qwen"
     panel.model_search_input.setText("qwen")
     assert panel.model_combo.count() == 3  # qwen2.5-coder, qwen2.5, huihui_ai/qwen2.5-coder
-    assert "Modelo (3/6):" in panel.model_lbl.text()
+    assert "MODELO (3/6)" in panel.model_lbl.text()
 
     # 4. Filtro sin coincidencias
     panel.model_search_input.setText("modelo_inexistente_xyz")
@@ -78,11 +78,11 @@ def test_hud_state_and_colors(qapp):
 
     hud.set_muted(True)
     assert hud._muted is True
-    assert "MIC PAUSADO" in hud.panel.status_lbl.text()
+    assert "mic pausado" in hud.panel.status_lbl.text().lower()
 
     hud.set_muted(False)
     assert hud._muted is False
-    assert "MIC ACTIVO" in hud.panel.status_lbl.text()
+    assert "mic activo" in hud.panel.status_lbl.text().lower()
 
 
 def test_format_ollama_model_display():
@@ -201,3 +201,67 @@ def test_dropdown_sync_and_duplicate_suppression(qapp):
     assert len(model_emitted) == 0
 
 
+
+
+def test_chat_routes_messages_and_renders_plain_text(qapp):
+    from ui.hud import ZaraPanel
+    from PySide6 import QtWidgets
+
+    panel = ZaraPanel()
+    chat = panel.chat
+    panel.log_line("VK", "<b>hola</b>")
+    panel.log_line("ZARA", "Respuesta")
+    panel.log_line("SISTEMA", "Cerebro cambiado")
+    panel.log_line("ERROR", "Algo falló")
+    panel.log_line("CONFIRMAR", "¿borrar x?")
+    assert chat.count() == 5
+    # La salida del modelo nunca se interpreta como HTML
+    texts = [l for l in chat.findChildren(QtWidgets.QLabel) if l.text() == "<b>hola</b>"]
+    assert texts and texts[0].textFormat() == QtCore.Qt.PlainText
+
+
+def test_tool_chip_collapses_when_completed(qapp):
+    from ui.hud import ZaraPanel
+
+    panel = ZaraPanel()
+    panel.log_line("TOOL", "web_search: Ejecutando web_search...")
+    panel.log_line("TOOL", "web_search: Completado.")
+    # «ejecutando» y «completado» comparten un único chip
+    assert panel.chat.count() == 1
+
+
+def test_chat_keeps_a_bounded_history(qapp):
+    from ui.hud import ChatView, ZaraPanel
+
+    panel = ZaraPanel()
+    for i in range(ChatView.MAX_ITEMS + 15):
+        panel.log_line("SISTEMA", f"evento {i}")
+    assert panel.chat.count() == ChatView.MAX_ITEMS
+
+
+def test_long_messages_scroll_instead_of_being_squashed(qapp):
+    from ui.hud import ZaraPanel
+
+    panel = ZaraPanel()
+    panel.show()
+    for _ in range(6):
+        panel.log_line("ZARA", "Una respuesta larga de varias líneas para forzar el scroll del chat. " * 3)
+    qapp.processEvents()
+    chat = panel.chat
+    # el contenido nunca es más bajo que su mínimo: si no cabe, aparece el scroll
+    assert chat._inner.height() >= chat._inner.minimumSizeHint().height()
+    assert chat.verticalScrollBar().maximum() > 0
+
+
+def test_send_button_only_enabled_with_text(qapp):
+    from ui.hud import ZaraPanel
+
+    panel = ZaraPanel()
+    sent = []
+    panel.text_submitted.connect(sent.append)
+    assert not panel.send_btn.isEnabled()
+    panel.input_box.setText("  hola zara ")
+    assert panel.send_btn.isEnabled()
+    panel.send_btn.click()
+    assert sent == ["hola zara"]
+    assert panel.input_box.text() == ""

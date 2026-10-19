@@ -67,6 +67,24 @@ def needs_confirmation(name: str, args: Dict[str, Any]) -> Optional[str]:
     return None
 
 
+# Metacaracteres que cmd.exe interpreta aunque vayan entre comillas ("BatBadBut").
+_CMD_METACHARS = re.compile(r'[&|<>^%!"]')
+
+
+def cli_safe_arg(executable: str, text: str) -> str:
+    """Prepara texto libre (del usuario o de un modelo) para pasarlo como argumento a un CLI.
+
+    En Windows, los CLI instalados con npm (claude, agy...) son shims `.cmd`/`.bat` que se
+    ejecutan a través de cmd.exe: un `&`, `|` o `>` dentro del argumento rompería las comillas
+    y ejecutaría lo que viniera detrás. Para esos ejecutables se neutralizan los
+    metacaracteres y los saltos de línea (cmd.exe corta el argumento en el primer salto).
+    """
+    if sys.platform == "win32" and Path(executable).suffix.lower() in (".cmd", ".bat"):
+        flat = " / ".join(line.strip() for line in text.splitlines() if line.strip())
+        return _CMD_METACHARS.sub(" ", flat)
+    return text
+
+
 def is_path_protected(path: Path) -> Optional[str]:
     """Devuelve la ruta protegida que contiene (o es) `path`, o None si es seguro tocarla."""
     resolved = Path(os.path.realpath(path))
@@ -810,7 +828,7 @@ def invoke_claude_code(project_path: str, instruction: str) -> Dict[str, Any]:
     try:
         cmd = [
             claude_bin,
-            "-p", instruction,
+            "-p", cli_safe_arg(claude_bin, instruction),
             "--dangerously-skip-permissions",
             "--setting-sources", "project",
         ]

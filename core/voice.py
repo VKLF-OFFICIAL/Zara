@@ -377,7 +377,9 @@ class VoiceSynthesizer:
             with self._lock:
                 gen = self._generation
 
+            t0 = time.monotonic()
             audio_data = self._synthesize_audio(text)
+            log.info("[LATENCIA] TTS %.2f s para %d caracteres", time.monotonic() - t0, len(text))
 
             with self._lock:
                 # Tanda abortada por barge-in mientras sintetizábamos: esta

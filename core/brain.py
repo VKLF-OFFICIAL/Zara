@@ -27,12 +27,18 @@ import logging
 import re
 import shutil
 import subprocess
+import tempfile
 import threading
+import time
 import httpx
 from typing import Any, Callable, Dict, Generator, List, Optional, Tuple
 
 from core.gemini_models import AUTO as AUTO_MODEL, resolve_gemini_model
 from config import (
+    AGY_BIN,
+    AGY_MODEL,
+    AGY_TIMEOUT,
+    DATA_DIR,
     GEMINI_MODEL_FALLBACK,
     ANTHROPIC_API_KEY,
     ANTHROPIC_MODEL,
@@ -46,7 +52,7 @@ from config import (
     SYSTEM_PROMPT,
     get_system_prompt,
 )
-from core.tools import TOOL_DEFINITIONS, execute_tool, format_tools_for_local_prompt
+from core.tools import TOOL_DEFINITIONS, cli_safe_arg, execute_tool, format_tools_for_local_prompt
 
 log = logging.getLogger("zara.brain")
 
@@ -252,6 +258,15 @@ def _summarize_observations_locally(observations: List[str]) -> str:
 # ENRUTADOR RÁPIDO (< 10 MS)
 # =============================================================================
 
+_FALLBACK_NEXT = {
+    "gemini": "antigravity",
+    "gemini_live": "antigravity",
+    "antigravity": "claude",
+    "claude": "ollama",
+    "ollama": "gemini",
+}
+
+
 class ZaraRouter:
     """Clasifica intenciones del Señor VK en < 10 ms y enruta al mejor proveedor."""
 
@@ -312,17 +327,26 @@ class ZaraRouter:
 
         low = query.lower()
 
+        agy_available = shutil.which(AGY_BIN) is not None
+
         if any(w in low for w in ZaraRouter.GEMINI_KEYWORDS):
             if GEMINI_API_KEY:
                 return "gemini"
+            if agy_available:
+                return "antigravity"
 
         if any(w in low for w in ZaraRouter.CLAUDE_KEYWORDS):
             if ANTHROPIC_API_KEY or shutil.which("claude"):
                 return "claude"
 
+        # Orden por defecto: APIs (más rápidas) → suscripción Gemini vía agy → Claude CLI → local.
         if GEMINI_API_KEY:
             return "gemini"
-        if ANTHROPIC_API_KEY or shutil.which("claude"):
+        if ANTHROPIC_API_KEY:
+            return "claude"
+        if agy_available:
+            return "antigravity"
+        if shutil.which("claude"):
             return "claude"
         return "ollama"
 
@@ -724,7 +748,7 @@ class ClaudeProvider:
             try:
                 user_msg = messages[-1]["content"] if messages else ""
                 full_prompt = f"{effective_prompt}\n\nPetición del Señor VK:\n{user_msg}"
-                cmd = [claude_bin, "-p", full_prompt, "--setting-sources", "project"]
+                cmd = [claude_bin, "-p", cli_safe_arg(claude_bin, full_prompt), "--setting-sources", "project"]
                 if self.cli_model_override:
                     cmd += ["--model", self.cli_model_override]
                 proc = subprocess.Popen(
@@ -753,6 +777,152 @@ class ClaudeProvider:
 
 
 # =============================================================================
+# PROVEEDOR 4: GEMINI CON LA SUSCRIPCIÓN GOOGLE AI PRO (Antigravity CLI)
+# =============================================================================
+
+class AntigravityProvider:
+    """Gemini a través de Antigravity CLI (`agy`), con la cuota de la suscripción AI Pro/Ultra.
+
+    Es la vía soportada por Google para usar la suscripción fuera de la app de Gemini: no
+    necesita API key, solo haber iniciado sesión una vez con `agy`. `agy -p` responde en
+    modo headless y termina.
+
+    `agy` es un agente de programación con herramientas propias. Se ejecuta en una carpeta
+    vacía y, en modo headless, las herramientas que requieren aprobación (shell, escritura)
+    se deniegan solas. Las acciones sobre el sistema las sigue haciendo Zara, con su
+    guardarraíl y su confirmación, mediante el protocolo JSON de herramientas.
+
+    Arranca un proceso por petición: es más lento que la API (varios segundos por respuesta).
+    """
+
+    MAX_PROMPT_CHARS = 24000  # Windows limita la línea de comandos a ~32 000 caracteres
+    HISTORY_MESSAGES = 8
+
+    def __init__(self, model: str = AGY_MODEL):
+        self.model = model or ""
+        self._workdir = DATA_DIR / "agy-workspace"
+
+    def set_model(self, model: str) -> None:
+        self.model = model or ""
+        log.info("Modelo de Antigravity cambiado a: %s", self.model or "(por defecto)")
+
+    def is_available(self) -> bool:
+        return shutil.which(AGY_BIN) is not None
+
+    @classmethod
+    def build_prompt(
+        cls,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]],
+        system_prompt: str,
+    ) -> str:
+        """Un único prompt de texto: instrucciones + herramientas + historial reciente."""
+        parts = [system_prompt.strip()]
+        parts.append(
+            "MODO DE TRABAJO: eres el cerebro de Zara, un asistente de voz. NO uses tus propias "
+            "herramientas (terminal, archivos, navegador): no tienes permiso. Responde en español, "
+            "breve y sin markdown."
+        )
+        if tools:
+            parts.append(
+                "Si para responder hace falta actuar sobre el equipo, responde ÚNICAMENTE con un JSON "
+                'de una línea: {"name": "<herramienta>", "arguments": {...}}. Zara lo ejecutará y te '
+                "devolverá el resultado.\n" + format_tools_for_local_prompt(tools)
+            )
+        history = []
+        for m in messages[-cls.HISTORY_MESSAGES:]:
+            who = "Señor VK" if m.get("role") == "user" else "Zara"
+            history.append(f"{who}: {m.get('content', '')}")
+        parts.append("CONVERSACIÓN:\n" + "\n".join(history))
+        parts.append("Responde ahora como Zara al último mensaje.")
+        prompt = "\n\n".join(parts)
+        if len(prompt) > cls.MAX_PROMPT_CHARS:
+            # Se recorta por el principio del historial: lo último es lo que importa.
+            head = "\n\n".join(parts[:3]) if tools else "\n\n".join(parts[:2])
+            tail = prompt[-(cls.MAX_PROMPT_CHARS - len(head) - 10):]
+            prompt = head + "\n\n[...]\n" + tail
+        return prompt
+
+    def stream_chat(
+        self,
+        messages: List[Dict[str, Any]],
+        tools: Optional[List[Dict[str, Any]]] = None,
+        system_prompt: Optional[str] = None,
+    ) -> Generator[Dict[str, Any], None, None]:
+        agy = shutil.which(AGY_BIN)
+        if not agy:
+            yield {"type": "error", "error": "Antigravity CLI (agy) no está instalado o no está en el PATH."}
+            return
+
+        prompt = self.build_prompt(messages, tools, system_prompt or SYSTEM_PROMPT)
+        cmd = [agy, "-p", cli_safe_arg(agy, prompt)]
+        if self.model:
+            cmd += ["--model", self.model]
+        self._workdir.mkdir(parents=True, exist_ok=True)
+        known_tool_names = {t.get("name") for t in (tools or [])}
+
+        full = ""
+        is_tool_stream: Optional[bool] = None
+        tokens_yielded = False
+        with tempfile.TemporaryFile() as err:
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    cwd=str(self._workdir),
+                    stdout=subprocess.PIPE,
+                    stderr=err,  # a fichero: un PIPE sin leer podría bloquear el proceso
+                    stdin=subprocess.DEVNULL,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+            except Exception as exc:
+                yield {"type": "error", "error": f"No se pudo lanzar Antigravity CLI: {exc}"}
+                return
+            watchdog = threading.Timer(AGY_TIMEOUT, proc.kill)
+            watchdog.start()
+            try:
+                for line in proc.stdout:
+                    full += line
+                    stripped = full.strip()
+                    if is_tool_stream is None:
+                        if stripped.startswith(("{", "```", "<")):
+                            is_tool_stream = True
+                        elif len(stripped) >= 15:
+                            is_tool_stream = False
+                            tokens_yielded = True
+                            yield {"type": "token", "token": full}
+                    elif not is_tool_stream:
+                        tokens_yielded = True
+                        yield {"type": "token", "token": line}
+                proc.wait(timeout=10)
+            finally:
+                watchdog.cancel()
+                # También si el generador se cierra por barge-in: no dejar procesos huérfanos.
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait()
+
+            if proc.returncode != 0 and not full.strip():
+                err.seek(0)
+                detail = err.read().decode("utf-8", errors="replace").strip()[-400:]
+                hint = ""
+                if any(k in detail.lower() for k in ("auth", "login", "sign in", "credential")):
+                    hint = " Abra una terminal y ejecute «agy» una vez para iniciar sesión con su cuenta de Google."
+                elif any(k in detail.lower() for k in ("quota", "eligible", "rate limit", "1002")):
+                    hint = " Su cuenta no tiene cuota de Antigravity ahora mismo (límite o cuenta no elegible)."
+                yield {"type": "error", "error": f"Antigravity CLI falló (código {proc.returncode}): {detail}{hint}"}
+                return
+
+        parsed = _extract_embedded_tool_calls(full, known_tool_names, tools) if tools else []
+        if parsed:
+            for pc in parsed:
+                yield {"type": "tool_call", "name": pc.get("name", ""), "args": pc.get("arguments") or pc.get("args") or {}}
+        elif full.strip() and not tokens_yielded:
+            yield {"type": "token", "token": full}
+
+
+# =============================================================================
 # CEREBRO CENTRAL ZARA
 # =============================================================================
 
@@ -766,6 +936,7 @@ class ZaraBrain:
         self.ollama = OllamaProvider()
         self.gemini = GeminiProvider()
         self.claude = ClaudeProvider()
+        self.antigravity = AntigravityProvider()
 
         # [FIX] AUDITORÍA: un barge-in detenía el AUDIO (VoiceSynthesizer.stop())
         # pero nunca cancelaba la generación del LLM ni el bucle ReAct en curso.
@@ -846,6 +1017,8 @@ class ZaraBrain:
                 return
 
             log.info("Bucle ReAct - Paso %d/%d", step, max_steps)
+            t_step = time.monotonic()
+            first_event_logged = False
 
             events = self._execute_stream_with_fallback(
                 chosen_provider, screen_b64,
@@ -861,6 +1034,9 @@ class ZaraBrain:
                 if self._cancel_event.is_set():
                     log.info("Turno cancelado por barge-in a mitad de la respuesta. Descartando el resto.")
                     return
+                if not first_event_logged:
+                    first_event_logged = True
+                    log.info("[LATENCIA] %s respondió en %.2f s (paso %d)", chosen_provider, time.monotonic() - t_step, step)
                 etype = event.get("type")
                 if etype == "token":
                     tok = event.get("token", "")
@@ -873,13 +1049,8 @@ class ZaraBrain:
                     log.warning("Fallo en proveedor %s: %s", chosen_provider, event.get("error"))
 
             if has_error and not full_thought_text and not tool_calls_to_run:
-                # [BUG-11 FIX] Cascada correcta: gemini → claude → ollama
-                if chosen_provider == "gemini":
-                    chosen_provider = "claude"
-                elif chosen_provider == "claude":
-                    chosen_provider = "ollama"
-                else:
-                    chosen_provider = "gemini"
+                # Cascada: gemini → antigravity → claude → ollama → gemini
+                chosen_provider = _FALLBACK_NEXT.get(chosen_provider, "gemini")
                 log.info("Activando fallback automático a: %s", chosen_provider)
                 events2 = self._execute_stream_with_fallback(
                     chosen_provider, screen_b64,
@@ -1025,6 +1196,12 @@ class ZaraBrain:
             # ejecutar acciones reales sobre el sistema, solo responder en texto.
             yield from self.gemini.stream_chat(
                 self.history, tools=tools_to_pass, screen_b64=screen_b64, system_prompt=system_prompt
+            )
+            return
+
+        if provider_name == "antigravity" and self.antigravity.is_available():
+            yield from self.antigravity.stream_chat(
+                self.history, tools=tools_to_pass, system_prompt=system_prompt
             )
             return
 

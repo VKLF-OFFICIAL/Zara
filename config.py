@@ -181,6 +181,12 @@ GEMINI_LIVE_VOICE = os.environ.get("ZARA_GEMINI_LIVE_VOICE", "Aoede")
 # Anthropic API
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
 ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5")
+# Antigravity CLI (agy): Gemini con la cuota de la suscripción Google AI Pro/Ultra, sin API key.
+# Google retiró Gemini CLI para cuentas personales el 18-jun-2026 y lo sustituyó por agy.
+AGY_BIN = os.environ.get("ZARA_AGY_BIN", "agy")
+AGY_MODEL = os.environ.get("ZARA_AGY_MODEL", "")  # "" = el modelo por defecto de agy (ver `agy models`)
+AGY_TIMEOUT = int(os.environ.get("ZARA_AGY_TIMEOUT", "120"))
+
 # Alias de modelo para el CLI 'claude' (ej. "sonnet", "opus", "haiku", "fable"); vacío = por defecto.
 CLAUDE_MODEL_OVERRIDE = os.environ.get("ZARA_CLAUDE_MODEL", "")
 
