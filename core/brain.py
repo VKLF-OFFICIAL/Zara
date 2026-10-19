@@ -269,14 +269,15 @@ def find_agy() -> Optional[str]:
     found = shutil.which(AGY_BIN)
     if found:
         return found
-    candidates = []
-    local_appdata = os.environ.get("LOCALAPPDATA")
-    if local_appdata:
-        candidates.append(Path(local_appdata) / "agy" / "bin" / "agy.exe")
-    candidates.append(Path.home() / ".local" / "bin" / "agy")
-    for candidate in candidates:
-        if candidate.is_file():
-            return str(candidate)
+    if AGY_BIN == "agy":
+        candidates = []
+        local_appdata = os.environ.get("LOCALAPPDATA")
+        if local_appdata:
+            candidates.append(Path(local_appdata) / "agy" / "bin" / "agy.exe")
+        candidates.append(Path.home() / ".local" / "bin" / "agy")
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
     return None
 
 

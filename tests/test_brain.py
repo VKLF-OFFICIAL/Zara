@@ -79,7 +79,7 @@ def test_router_classify_keywords(monkeypatch):
     monkeypatch.setattr(brain_mod, "ANTHROPIC_API_KEY", "clave-de-prueba")
     monkeypatch.setattr(brain_mod, "GEMINI_API_KEY", "")
     assert ZaraRouter.classify("analiza este código para encontrar un bug", preferred="auto") == "claude"
-    assert ZaraRouter.classify("mira la pantalla y dime qué error hay", preferred="auto") in ("gemini", "claude", "ollama")
+    assert ZaraRouter.classify("mira la pantalla y dime qué error hay", preferred="auto") in ("gemini", "antigravity", "claude", "ollama")
 
 
 def test_router_falls_back_to_ollama_without_cloud_brains(monkeypatch):
@@ -87,6 +87,7 @@ def test_router_falls_back_to_ollama_without_cloud_brains(monkeypatch):
 
     monkeypatch.setattr(brain_mod, "ANTHROPIC_API_KEY", "")
     monkeypatch.setattr(brain_mod, "GEMINI_API_KEY", "")
+    monkeypatch.setattr(brain_mod, "find_agy", lambda: None)
     monkeypatch.setattr(brain_mod.shutil, "which", lambda name: None)
     assert ZaraRouter.classify("analiza este código para encontrar un bug", preferred="auto") == "ollama"
 
