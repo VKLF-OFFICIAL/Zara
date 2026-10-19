@@ -78,6 +78,10 @@ def needs_confirmation(name: str, args: Dict[str, Any]) -> Optional[str]:
     """
     name, args = _normalize_call(name, args)
     action = str(args.get("action") or "").strip().lower()
+    if name == "file_manager" and args.get("action") is None:
+        # [FIX SEG-7] Sin 'action', _dispatch lee el archivo (acción por defecto «read»):
+        # preguntar igual que si la trajera, o leer ~/.ssh/id_rsa no pedía confirmación.
+        action = "read"
     if name == "run_shell":
         cmd = str(args.get("command") or "")
         for pattern in CONFIRM_COMMANDS_REGEX:
@@ -114,7 +118,7 @@ def _describe_delete(raw_path: str) -> Optional[str]:
     """Qué se va a borrar de verdad: el enlace (no su destino) o la ruta real resuelta."""
     link = _link_path(raw_path)
     if link is not None:
-        if _protected_match(_lexical(link), ancestors=True):
+        if _link_protected(link):
             return None  # el guardarraíl lo bloquea sin preguntar
         return f"eliminar el enlace {link} (su destino no se toca)"
     target = resolve_user_path(raw_path)
@@ -226,6 +230,48 @@ def _lexical(link: Path) -> Path:
     return Path(os.path.realpath(link.parent)) / link.name
 
 
+def _link_protected(link: Path) -> Optional[str]:
+    """¿Borrar el enlace `link` toca una ruta protegida?
+
+    [FIX NUEVO] _protected_match compara con las rutas protegidas YA resueltas
+    (/bin -> /usr/bin), pero de un enlace se compara su ruta léxica (/bin): borrar
+    /bin, que en las distros con /usr fusionado es un enlace a usr/bin, no se
+    bloqueaba. Se compara además con cada ruta protegida resuelta solo hasta su
+    carpeta padre, igual que el enlace (sin seguir el propio enlace).
+    """
+    lexical = _lexical(link)
+    hit = _protected_match(lexical, ancestors=True)
+    if hit:
+        return hit
+    for prot in list(PROTECTED_EXACT) + _extra_protected_exact() + list(PROTECTED_TREES) + _extra_protected_trees():
+        prot_path = Path(os.path.abspath(os.path.expanduser(prot)))
+        if prot_path.name and _lexical(prot_path) == lexical:
+            return prot
+    return None
+
+
+def _is_junction(path: Path) -> bool:
+    """¿Es `path` una junction de Windows?
+
+    [FIX CER-3] os.path.isjunction solo existe desde Python 3.12 y en 3.10/3.11
+    is_symlink() devuelve False para una junction: sin esto, «borra el enlace» hacía
+    rmtree del destino. En esas versiones se mira la etiqueta de reparse del lstat.
+    """
+    is_junction = getattr(os.path, "isjunction", None)
+    if is_junction is not None:
+        return bool(is_junction(path))
+    if sys.platform != "win32":
+        return False
+    try:
+        tag = getattr(os.lstat(path), "st_reparse_tag", 0)
+    except (OSError, ValueError):
+        return False
+    return tag == _IO_REPARSE_TAG_MOUNT_POINT
+
+
+_IO_REPARSE_TAG_MOUNT_POINT = 0xA0000003  # stat.IO_REPARSE_TAG_MOUNT_POINT (solo en Windows)
+
+
 def _link_path(path: str) -> Optional[Path]:
     """Si `path` (tal como lo dio el modelo) es un enlace simbólico o una junction de
     Windows, devuelve la ruta del PROPIO enlace sin seguirlo; si no, None.
@@ -240,9 +286,8 @@ def _link_path(path: str) -> Optional[Path]:
     if not p.name:
         return None  # raíz de unidad
     link = resolve_user_path(str(p.parent)) / p.name
-    is_junction = getattr(os.path, "isjunction", None)
     try:
-        if link.is_symlink() or (is_junction is not None and is_junction(link)):
+        if link.is_symlink() or _is_junction(link):
             return link
     except OSError:
         return None
@@ -452,6 +497,12 @@ def _run_capture(cmd: List[str], timeout: float, cwd: Optional[str] = None) -> T
             out, err = proc.communicate(timeout=5)
         except (subprocess.TimeoutExpired, ValueError, OSError):
             out, err = "", ""
+            if sys.platform == "win32":
+                # [FIX MUL-3] En Windows communicate() lee con hilos (daemon) bloqueados
+                # en read() con el lock del búfer tomado: close() esperaría ese lock y
+                # colgaría el turno. Se abandonan los pipes; los hilos acaban solos
+                # cuando muera el último nieto que los tiene abiertos.
+                return 124, out, err, True
             for pipe in (proc.stdout, proc.stderr):
                 try:
                     if pipe:
@@ -798,7 +849,7 @@ def file_manager(
 
 def _delete_link(link: Path) -> Dict[str, Any]:
     """Borra un enlace simbólico o una junction SIN tocar el contenido al que apunta."""
-    protected = _protected_match(_lexical(link), ancestors=True)
+    protected = _link_protected(link)
     if protected:
         log.warning("file_manager 'delete' bloqueado sobre enlace protegido: %s", link)
         return {
@@ -955,6 +1006,66 @@ _BLOCKED_OPEN_SUFFIXES = {
     ".pif", ".com", ".reg", ".msi", ".desktop", ".sh", ".run", ".appimage", ".py", ".pyw", ".jar",
 }
 _APP_ID_RE = re.compile(r"[\w.+-]+")
+_OPEN_SCRIPT_BLOCKED: Dict[str, Any] = {
+    "success": False,
+    "blocked": True,
+    "error": "Por seguridad, open_app no ejecuta scripts ni instaladores; usa run_shell, que pide confirmación cuando hace falta.",
+}
+
+
+def _is_blocked_script(target: str) -> bool:
+    """¿Es `target` (o el archivo al que apunta, si es un enlace) un script o instalador?"""
+    # Windows ignora los puntos y espacios finales («a.bat.» es a.bat)
+    names = [target]
+    try:
+        names.append(os.path.realpath(target))
+    except (OSError, ValueError):
+        pass
+    for name in names:
+        if Path(name.rstrip(". ")).suffix.lower() in _BLOCKED_OPEN_SUFFIXES:
+            return True
+    return False
+
+
+def _startfile_runs_script(candidate: str) -> bool:
+    """[FIX SEG-6] ¿Acabaría os.startfile(candidate) ejecutando un script?
+
+    El bloqueo por extensión solo miraba el texto recibido: «script» sin extensión lo
+    completa Windows con PATHEXT (script.bat) en la carpeta actual o en el PATH, y así
+    un .bat escrito con file_manager se ejecutaba sin pasar por run_shell.
+    """
+    if Path(candidate).suffix or candidate.endswith(":"):
+        return _is_blocked_script(candidate)  # con extensión, o un protocolo (ms-settings:)
+    dirs = [""] + os.environ.get("PATH", "").split(os.pathsep)
+    exts = os.environ.get("PATHEXT", "").split(os.pathsep) + sorted(_BLOCKED_OPEN_SUFFIXES)
+    for folder in dirs:
+        base = os.path.join(folder, candidate) if folder else candidate
+        for ext in exts:
+            if ext and ext.lower() in _BLOCKED_OPEN_SUFFIXES and os.path.isfile(base + ext):
+                return True
+    return False
+
+
+_SBIN_DIRS = ("/sbin", "/usr/sbin", "/usr/local/sbin")
+_BIN_DIRS = ("/bin", "/usr/bin", "/usr/local/bin")
+
+
+def _is_admin_tool(app_id: str, exe: str) -> bool:
+    """¿Es `exe` una herramienta de administración (está en un sbin)?
+
+    Con /usr/sbin fusionado en /usr/bin (Arch, Fedora 42+) no se puede distinguir por
+    carpeta: ahí solo se descartan las rutas cuyo nombre de carpeta es «sbin».
+    """
+    if any(Path(p).parent.name == "sbin" for p in (exe, os.path.realpath(exe))):
+        return True
+    bins = {os.path.realpath(d) for d in _BIN_DIRS}
+    for folder in _SBIN_DIRS:
+        if os.path.realpath(folder) in bins:
+            continue
+        candidate = os.path.join(folder, app_id)
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+            return True
+    return False
 
 
 def _open_linux_app(tgt: str) -> Dict[str, Any]:
@@ -977,10 +1088,12 @@ def _open_linux_app(tgt: str) -> Dict[str, Any]:
             if res.returncode == 0:
                 return {"success": True, "message": f"Lanzado '{app_id}' vía gtk-launch."}
 
-    # 2) Ejecutable del PATH (sin argumentos; nunca rutas ni apagados)
+    # 2) Ejecutable del PATH (sin argumentos; nunca rutas ni apagados ni herramientas
+    #    de administración: [FIX NUEVO] antes se lanzaba también lo de /usr/sbin,
+    #    p. ej. update-grub, sin confirmación, cuando gtk-launch fallaba)
     for app_id in app_ids:
         exe = shutil.which(app_id)
-        if not exe:
+        if not exe or _is_admin_tool(app_id, exe):
             continue
         proc = subprocess.Popen(
             [exe], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
@@ -1021,13 +1134,8 @@ def _os_open_app(target: str, value: str) -> Dict[str, Any]:
             subprocess.Popen(["xdg-open", tgt], stdin=subprocess.DEVNULL, start_new_session=True)
         return {"success": True, "message": f"URL '{tgt}' abierta en el navegador."}
 
-    # Windows ignora los puntos y espacios finales («a.bat.» es a.bat)
-    if Path(tgt.rstrip(". ")).suffix.lower() in _BLOCKED_OPEN_SUFFIXES:
-        return {
-            "success": False,
-            "blocked": True,
-            "error": "Por seguridad, open_app no ejecuta scripts ni instaladores; usa run_shell, que pide confirmación cuando hace falta.",
-        }
+    if _is_blocked_script(tgt):
+        return _OPEN_SCRIPT_BLOCKED
 
     if sys.platform == "win32":
         # [FIX] Resolver alias en español ANTES de shutil.which, que
@@ -1036,6 +1144,8 @@ def _os_open_app(target: str, value: str) -> Dict[str, Any]:
 
         # Intentos de ejecución en Windows
         resolved = shutil.which(candidate) or shutil.which(f"{candidate}.exe")
+        if resolved and _is_blocked_script(resolved):
+            return _OPEN_SCRIPT_BLOCKED
         if resolved:
             subprocess.Popen([resolved])
             return {"success": True, "message": f"Aplicación '{tgt}' iniciada."}
@@ -1059,6 +1169,8 @@ def _os_open_app(target: str, value: str) -> Dict[str, Any]:
         # (Start-Process de PowerShell en un subprocess.Popen separado)
         # reportaba éxito SIEMPRE sin comprobar si el proceso hijo
         # realmente consiguió arrancar algo.
+        if _startfile_runs_script(candidate):
+            return _OPEN_SCRIPT_BLOCKED
         try:
             os.startfile(candidate)
             return {"success": True, "message": f"Aplicación '{tgt}' iniciada."}
@@ -1932,7 +2044,14 @@ def execute_tool(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
         log.info("Herramienta '%s' normalizada/remapeada a %s(%s).", original, name, args.get("action", ""))
 
     if _confirm_handler is not None:
-        description = needs_confirmation(name, args)
+        try:
+            description = needs_confirmation(name, args)
+        except Exception as exc:
+            # [FIX CER-11] needs_confirmation resuelve rutas y consulta el disco (una ruta
+            # con un byte nulo lanza ValueError): no tumbar el turno, y ante la duda
+            # no ejecutar lo que no se ha podido comprobar.
+            log.warning("No se pudo comprobar si %s necesita confirmación: %s", name, exc)
+            return {"success": False, "error": f"Argumentos inválidos para {name}: {exc}"}
         if description:
             try:
                 confirmed = bool(_confirm_handler(description))

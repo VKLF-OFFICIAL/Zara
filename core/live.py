@@ -477,6 +477,14 @@ class GeminiLiveSession:
                 t.cancel()
             await asyncio.gather(*pending, return_exceptions=True)
             self._tool_tasks.clear()
+            # [FIX AUD-12] Si el WebSocket cae mientras Zara habla (p. ej. GoAway al límite
+            # de la sesión) nunca llegará el turn_complete de ese turno: sin esto
+            # _is_model_speaking se quedaba en True y el filtro de eco silenciaba el
+            # micrófono en la sesión reconectada. El turno se perdió con la conexión, así
+            # que se corta su audio pendiente. Con stop() en curso no se toca la cola (ya
+            # se vació y lleva la señal de fin del hilo de reproducción).
+            if self._running:
+                self._flush_playback(emit=False)
 
         for t in done:
             if not t.cancelled() and t.exception() is not None:
@@ -809,9 +817,14 @@ class GeminiLiveSession:
                     break
 
                 if chunk == _TURN_END:
-                    # Fin de turno: el eco de lo que queda en el búfer aún dura un poco
-                    latency = float(getattr(out, "latency", 0.0) or 0.0) if out is not None else 0.0
-                    self._echo_guard_until = time.monotonic() + LIVE_ECHO_TAIL_S + min(latency, 0.5)
+                    # Fin de turno: el eco de lo que queda en el búfer aún dura un poco.
+                    # [FIX AUD-12] Solo si el turno llegó a sonar: tras un barge-in el servidor
+                    # envía igualmente turn_complete, y _flush_playback ya dejó
+                    # _is_model_speaking=False; armar aquí la ventana de eco taparía con
+                    # silencio la voz del Señor VK justo mientras habla.
+                    if self._is_model_speaking:
+                        latency = float(getattr(out, "latency", 0.0) or 0.0) if out is not None else 0.0
+                        self._echo_guard_until = time.monotonic() + LIVE_ECHO_TAIL_S + min(latency, 0.5)
                     self._is_model_speaking = False
                     self._emit_state("listening")
                     continue

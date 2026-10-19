@@ -360,6 +360,50 @@ def test_gate_de_eco_respeta_configuracion_y_cola_de_eco(monkeypatch):
     assert s._gate_echo(chunk, 0.01) == chunk
 
 
+def test_reconexion_tras_caida_mientras_habla_no_deja_el_micro_filtrado(monkeypatch):
+    # [FIX AUD-12] El WebSocket cae a mitad de una respuesta (GoAway): nunca llega su
+    # turn_complete, así que la reconexión debe dejar de considerar que el modelo habla.
+    monkeypatch.setattr(live, "LIVE_BARGE_IN_RMS", 0.05)
+    s = GeminiLiveSession(api_key="k")
+    s._running = True
+    s._handle_server_message(None, _audio_msg(b"\x01\x00" * 4), types)
+    assert s.is_model_speaking()
+
+    async def _mic_vivo():
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(s, "_mic_capture_loop", _mic_vivo)
+    with pytest.raises(ConnectionError):
+        asyncio.run(asyncio.wait_for(s._run_connected_session(_TurnSession([]), types), timeout=5))
+
+    assert s.is_model_speaking() is False
+    assert s._playback_queue.empty()                 # el audio del turno perdido se corta
+    chunk = np.full(160, 300, dtype=np.int16).tobytes()
+    assert s._gate_echo(chunk, 0.01) == chunk        # el micro de la sesión nueva no queda en silencio
+
+
+def test_turn_complete_tras_barge_in_no_reactiva_la_ventana_de_eco(monkeypatch):
+    # [FIX AUD-12] Tras 'interrupted' el servidor envía turn_complete: ese fin de turno no
+    # debe volver a tapar con silencio la voz del usuario, que está hablando.
+    monkeypatch.setattr(live, "LIVE_BARGE_IN_RMS", 0.05)
+    monkeypatch.setattr(live, "sd", _FakeSd())
+    s = GeminiLiveSession(api_key="k")
+    s._running = True
+    s._handle_server_message(None, _audio_msg(b"\x01\x00" * 4), types)
+    s._handle_server_message(
+        None, types.LiveServerMessage(server_content=types.LiveServerContent(interrupted=True)), types
+    )
+    s._handle_server_message(
+        None, types.LiveServerMessage(server_content=types.LiveServerContent(turn_complete=True)), types
+    )
+    s._playback_queue.put_nowait(None)
+    s._playback_worker(s._playback_queue)
+
+    assert s._echo_guard_until == 0.0
+    chunk = np.full(160, 300, dtype=np.int16).tobytes()
+    assert s._gate_echo(chunk, 0.01) == chunk        # la voz baja del usuario pasa
+
+
 def test_umbral_de_eco_desde_el_entorno(monkeypatch):
     monkeypatch.setenv("ZARA_LIVE_BARGE_IN_RMS", "0,08  # comentario")
     assert live._env_float("ZARA_LIVE_BARGE_IN_RMS", 0.05) == pytest.approx(0.08)

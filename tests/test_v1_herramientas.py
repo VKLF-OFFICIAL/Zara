@@ -619,3 +619,126 @@ def test_inspect_screen_wayland_usa_grim(monkeypatch):
     monkeypatch.setattr(tools.subprocess, "run", fake_run)
     res = tools.inspect_screen()
     assert res["success"] is True and res["width"] == 5
+
+
+# --- Ronda 2 -----------------------------------------------------------------------
+
+# NUEVO: borrar un enlace que ES una ruta protegida (/bin -> usr/bin)
+@pytest.mark.skipif(sys.platform == "win32", reason="crear symlinks en Windows requiere permisos")
+def test_delete_enlace_que_es_ruta_protegida_se_bloquea(tmp_path, monkeypatch):
+    real = tmp_path / "usr" / "bin"
+    real.mkdir(parents=True)
+    enlace = tmp_path / "bin"
+    enlace.symlink_to("usr/bin", target_is_directory=True)
+    monkeypatch.setattr(tools, "PROTECTED_TREES", [str(enlace)])
+
+    assert tools.needs_confirmation("file_manager", {"action": "delete", "path": str(enlace)}) is None
+    res = tools.file_manager("delete", str(enlace))
+    assert res["success"] is False and res.get("blocked") is True
+    assert enlace.is_symlink()
+
+
+@pytest.mark.skipif(not os.path.islink("/bin"), reason="/bin no es un enlace en este sistema")
+def test_delete_del_enlace_real_bin_se_bloquea():
+    assert tools._link_protected(Path("/bin"))
+    assert tools._describe_delete("/bin") is None
+
+
+# SEG-7: sin 'action', file_manager lee: leer un secreto debe pedir confirmación
+def test_leer_secreto_sin_action_pide_confirmacion(tmp_path, ask_no):
+    secreto = tmp_path / ".env"
+    secreto.write_text("API_KEY=xyz", encoding="utf-8")
+    assert tools.needs_confirmation("file_manager", {"path": str(secreto)})
+    res = tools.execute_tool("file_manager", {"path": str(secreto)})
+    assert res.get("blocked") is True and ask_no
+    assert "xyz" not in str(res)
+
+
+# MUL-3: en Windows no se cierran los pipes que tienen los hilos lectores de communicate()
+def test_windows_timeout_no_cierra_pipes_bloqueados(monkeypatch):
+    _fake_platform(monkeypatch, "win32")
+
+    class PipeBloqueado:
+        def close(self):
+            pytest.fail("close() esperaría el lock del hilo lector y colgaría el turno")
+
+    class P(_FakePopen):
+        def __init__(self, cmd, **kwargs):
+            super().__init__(cmd, **kwargs)
+            self.stdout, self.stderr = PipeBloqueado(), PipeBloqueado()
+
+        def communicate(self, timeout=None):
+            raise tools.subprocess.TimeoutExpired(self.cmd, timeout)
+
+    monkeypatch.setattr(tools.subprocess, "Popen", P)
+    monkeypatch.setattr(tools, "kill_process_tree", lambda proc: None)
+    assert tools._run_capture(["x"], timeout=1) == (124, "", "", True)
+
+
+# SEG-6: open_app en Windows no ejecuta scripts resueltos por PATH/PATHEXT
+def test_windows_open_app_no_ejecuta_script_resuelto_por_which(monkeypatch):
+    _fake_platform(monkeypatch, "win32")
+    monkeypatch.setattr(tools.shutil, "which", lambda n: r"C:\Users\vk\Documents\script.BAT" if n == "script" else None)
+    monkeypatch.setattr(tools.subprocess, "Popen", lambda *a, **k: pytest.fail("no debía lanzar nada"))
+    res = tools.os_control("open_app", target="script")
+    assert res["success"] is False and res.get("blocked") is True
+
+
+def test_windows_open_app_startfile_no_completa_a_script(tmp_path, monkeypatch):
+    _fake_platform(monkeypatch, "win32")
+    (tmp_path / "limpieza.cmd").write_text("del /q *", encoding="utf-8")
+    monkeypatch.setattr(tools.shutil, "which", lambda n: None)
+    monkeypatch.setenv("APPDATA", str(tmp_path / "nada"))
+    monkeypatch.setenv("ProgramData", str(tmp_path / "nada"))
+    monkeypatch.setenv("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+    monkeypatch.setattr(tools.os, "startfile", lambda p: pytest.fail("no debía ejecutar"), raising=False)
+    res = tools.os_control("open_app", target=str(tmp_path / "limpieza"))
+    assert res["success"] is False and res.get("blocked") is True
+
+
+# NUEVO: el respaldo por PATH de Linux no lanza herramientas de administración (sbin)
+def test_linux_open_app_no_lanza_herramientas_de_sbin(tmp_path, monkeypatch):
+    _fake_platform(monkeypatch, "linux")
+    sbin, bin_ = tmp_path / "sbin", tmp_path / "bin"
+    sbin.mkdir()
+    bin_.mkdir()
+    herramienta = sbin / "update-grub"
+    herramienta.write_text("#!/bin/sh\n", encoding="utf-8")
+    herramienta.chmod(0o755)
+    monkeypatch.setattr(tools, "_SBIN_DIRS", (str(sbin),))
+    monkeypatch.setattr(tools, "_BIN_DIRS", (str(bin_),))
+    _which_only(monkeypatch, {"gtk-launch", "update-grub"})
+    _run_returning(monkeypatch, {"gtk-launch": 1}, [])
+    monkeypatch.setattr(tools.subprocess, "Popen", lambda *a, **k: pytest.fail("no debía lanzar nada"))
+    assert tools.os_control("open_app", target="update-grub")["success"] is False
+    monkeypatch.setattr(tools.shutil, "which", lambda n: "/usr/sbin/fdisk" if n == "fdisk" else None)
+    assert tools.os_control("open_app", target="fdisk")["success"] is False
+
+
+# CER-3: junctions de Windows con Python 3.10/3.11 (sin os.path.isjunction)
+def test_junction_se_detecta_sin_isjunction(tmp_path, monkeypatch):
+    _fake_platform(monkeypatch, "win32")
+    monkeypatch.delattr(tools.os.path, "isjunction", raising=False)
+    junction = tmp_path / "public_storage"
+    junction.mkdir()
+    real_lstat = os.lstat
+
+    def fake_lstat(p, *a, **k):
+        st = real_lstat(p, *a, **k)
+        if os.fspath(p) == str(junction):
+            return SimpleNamespace(st_mode=st.st_mode, st_reparse_tag=tools._IO_REPARSE_TAG_MOUNT_POINT)
+        return st
+
+    monkeypatch.setattr(tools.os, "lstat", fake_lstat)
+    assert tools._link_path(str(junction)) == junction
+
+
+# CER-11: un fallo comprobando la confirmación no tumba el turno ni ejecuta
+def test_fallo_en_needs_confirmation_no_tumba_ni_ejecuta(monkeypatch, ask_no):
+    def falla(name, args):
+        raise ValueError("embedded null byte")
+
+    monkeypatch.setattr(tools, "needs_confirmation", falla)
+    monkeypatch.setattr(tools, "_dispatch", lambda *a: pytest.fail("no debía ejecutar"))
+    res = tools.execute_tool("file_manager", {"action": "delete", "path": "a\x00b"})
+    assert res["success"] is False
