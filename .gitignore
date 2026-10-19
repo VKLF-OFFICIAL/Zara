@@ -22,3 +22,5 @@ venv/
 *.log
 .DS_Store
 .env
+.env.*
+
