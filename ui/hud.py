@@ -86,7 +86,7 @@ QFrame#bg {{
 QLabel {{ color: #94A3B8; font-size: 12px; border: none; background: transparent; }}
 QLabel#title {{ color: #F1F5F9; font-size: 15px; font-weight: 600; }}
 QLabel#status {{ color: #94A3B8; font-size: 11px; }}
-QLabel#caption {{ color: #64748B; font-size: 10px; font-weight: 600; letter-spacing: 0.8px; }}
+QLabel#caption {{ color: #8391A7; font-size: 11px; font-weight: 600; }}
 QLabel#version {{ color: #475569; font-size: 10px; }}
 QFrame#divider {{ background: rgba(148, 163, 184, 26); border: none; max-height: 1px; min-height: 1px; }}
 QFrame#card {{
