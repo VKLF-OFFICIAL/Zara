@@ -21,6 +21,7 @@ import psutil
 from config import (
     FORBIDDEN_COMMANDS_REGEX,
     MAX_REACT_STEPS,
+    PROTECTED_PATHS,
     SHELL_TIMEOUT,
 )
 
@@ -32,6 +33,20 @@ def is_command_forbidden(cmd: str) -> Optional[str]:
     for pattern in FORBIDDEN_COMMANDS_REGEX:
         if re.search(pattern, cmd, re.IGNORECASE):
             return pattern
+    return None
+
+
+def is_path_protected(path: Path) -> Optional[str]:
+    """Devuelve la ruta protegida que contiene (o es) `path`, o None si es seguro tocarla."""
+    resolved = Path(os.path.realpath(path))
+    for prot in PROTECTED_PATHS:
+        prot_path = Path(os.path.realpath(prot))
+        if resolved == prot_path:
+            return prot
+        # Dentro de un directorio de sistema o de .ssh/.gnupg/.git; el HOME completo
+        # solo se protege como objeto (no se puede borrar), no sus contenidos.
+        if prot_path != Path.home() and prot_path != Path(prot_path.anchor) and prot_path in resolved.parents:
+            return prot
     return None
 
 
@@ -148,6 +163,16 @@ def file_manager(
     """Lectura, escritura, edición quirúrgica y listado de archivos multiplataforma."""
     target = Path(path).resolve()
     action = action.lower().strip()
+
+    if action in ("write", "append", "edit", "delete"):
+        protected = is_path_protected(target)
+        if protected:
+            log.warning("file_manager '%s' bloqueado sobre ruta protegida: %s", action, target)
+            return {
+                "success": False,
+                "blocked": True,
+                "error": f"ACCESO DENEGADO POR GUARDARRAÍL: '{target}' está dentro de la ruta protegida '{protected}'.",
+            }
 
     try:
         if action == "read":
@@ -284,353 +309,401 @@ _WIN_APP_ALIASES: Dict[str, str] = {
 }
 
 
+def _os_open_app(target: str, value: str) -> Dict[str, Any]:
+    tgt = target.strip()
+    if not tgt:
+        return {"success": False, "error": "Debes especificar la aplicación o URL a abrir."}
+
+    if tgt.startswith("http://") or tgt.startswith("https://"):
+        if sys.platform == "win32":
+            os.startfile(tgt)
+        else:
+            subprocess.Popen(["xdg-open", tgt], stdin=subprocess.DEVNULL)
+        return {"success": True, "message": f"URL '{tgt}' abierta en el navegador."}
+
+    if sys.platform == "win32":
+        # [FIX] Resolver alias en español ANTES de shutil.which, que
+        # solo conoce nombres de ejecutable en inglés.
+        candidate = _WIN_APP_ALIASES.get(tgt.lower(), tgt)
+
+        # Intentos de ejecución en Windows
+        resolved = shutil.which(candidate) or shutil.which(f"{candidate}.exe")
+        if resolved:
+            subprocess.Popen([resolved])
+            return {"success": True, "message": f"Aplicación '{tgt}' iniciada."}
+
+        # Start Menu búsqueda rápida (por nombre original Y por alias)
+        appdata = Path(os.environ.get("APPDATA", ""))
+        progdata = Path(os.environ.get("ProgramData", ""))
+        needles = {tgt.lower(), candidate.lower()}
+        for base in [appdata / "Microsoft/Windows/Start Menu/Programs", progdata / "Microsoft/Windows/Start Menu/Programs"]:
+            if base.is_dir():
+                for lnk in base.rglob("*.lnk"):
+                    stem_low = lnk.stem.lower()
+                    if any(n in stem_low for n in needles):
+                        os.startfile(str(lnk))
+                        return {"success": True, "message": f"Aplicación '{lnk.stem}' iniciada desde el menú inicio."}
+
+        # [FIX] Último recurso VERIFICABLE: os.startfile() usa el
+        # mismo mecanismo que el menú de Inicio de Windows (ShellExecute,
+        # entiende más alias que PATH) y lanza una excepción SÍNCRONA
+        # si no encuentra nada que ejecutar. El fallback anterior
+        # (Start-Process de PowerShell en un subprocess.Popen separado)
+        # reportaba éxito SIEMPRE sin comprobar si el proceso hijo
+        # realmente consiguió arrancar algo.
+        try:
+            os.startfile(candidate)
+            return {"success": True, "message": f"Aplicación '{tgt}' iniciada."}
+        except OSError as exc:
+            return {
+                "success": False,
+                "error": f"No se encontró ninguna aplicación llamada '{tgt}': {exc}",
+            }
+    else:
+        # Linux (KDE, GNOME, XFCE con xdg-open o gtk-launch)
+        if shutil.which("gtk-launch"):
+            subprocess.Popen(["gtk-launch", tgt], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            return {"success": True, "message": f"Lanzado '{tgt}' vía gtk-launch."}
+        elif shutil.which(tgt):
+            subprocess.Popen([tgt], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            return {"success": True, "message": f"Lanzado binario '{tgt}'."}
+        else:
+            subprocess.Popen(["xdg-open", tgt], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
+            return {"success": True, "message": f"Lanzado '{tgt}' vía xdg-open."}
+
+
+def _os_close_app(target: str, value: str) -> Dict[str, Any]:
+    tgt = target.lower().strip()
+    closed = []
+    for p in psutil.process_iter(["pid", "name"]):
+        try:
+            p_name = p.info["name"].lower()
+            if tgt in p_name:
+                p.terminate()
+                closed.append(f"{p_name} (PID {p.info['pid']})")
+        except (psutil.NoSuchProcess, psutil.AccessDenied):
+            pass
+    if closed:
+        return {"success": True, "message": f"Procesos terminados: {', '.join(closed)}"}
+    return {"success": False, "message": f"No se encontró ningún proceso activo llamado '{target}'."}
+
+
+def _os_list_processes(target: str, value: str) -> Dict[str, Any]:
+    procs = []
+    for p in sorted(psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent"]),
+                    key=lambda x: x.info["memory_percent"] or 0, reverse=True)[:15]:
+        procs.append({
+            "pid": p.info["pid"],
+            "name": p.info["name"],
+            "cpu_pct": p.info["cpu_percent"],
+            "mem_pct": round(p.info["memory_percent"] or 0, 1),
+        })
+    return {"success": True, "top_processes": procs}
+
+
+def _os_set_volume(target: str, value: str) -> Dict[str, Any]:
+    try:
+        pct = float(value or target)
+    except ValueError:
+        return {"success": False, "error": f"Valor de volumen inválido: '{value or target}'"}
+    if sys.platform == "win32":
+        msg = _set_windows_volume(pct)
+    else:
+        msg = _set_linux_volume(pct)
+    return {"success": True, "message": msg}
+
+
+def _os_mute(target: str, value: str) -> Dict[str, Any]:
+    if sys.platform == "win32":
+        try:
+            from pycaw.pycaw import AudioUtilities
+            speakers = AudioUtilities.GetSpeakers()
+            if hasattr(speakers, "EndpointVolume"):
+                speakers.EndpointVolume.SetMute(1, None)
+                return {"success": True, "message": "Sonido silenciado."}
+        except Exception:
+            pass
+        import ctypes
+        ctypes.windll.user32.keybd_event(0xAD, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(0xAD, 0, 2, 0)
+        return {"success": True, "message": "Silencio activado."}
+    else:
+        if shutil.which("wpctl"):
+            subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "1"], capture_output=True)
+        elif shutil.which("pactl"):
+            subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "1"], capture_output=True)
+        return {"success": True, "message": "Sonido silenciado."}
+
+
+def _os_unmute(target: str, value: str) -> Dict[str, Any]:
+    if sys.platform == "win32":
+        try:
+            from pycaw.pycaw import AudioUtilities
+            speakers = AudioUtilities.GetSpeakers()
+            if hasattr(speakers, "EndpointVolume"):
+                speakers.EndpointVolume.SetMute(0, None)
+                return {"success": True, "message": "Sonido reactivado."}
+        except Exception:
+            pass
+        import ctypes
+        ctypes.windll.user32.keybd_event(0xAD, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(0xAD, 0, 2, 0)
+        return {"success": True, "message": "Silencio desactivado."}
+    else:
+        if shutil.which("wpctl"):
+            subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "0"], capture_output=True)
+        elif shutil.which("pactl"):
+            subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"], capture_output=True)
+        return {"success": True, "message": "Sonido reactivado."}
+
+
+def _os_read_clipboard(target: str, value: str) -> Dict[str, Any]:
+    if sys.platform == "win32":
+        res = subprocess.run(["powershell.exe", "-NoProfile", "Get-Clipboard"], capture_output=True, text=True)
+        return {"success": True, "clipboard": res.stdout.strip()}
+    elif shutil.which("xclip"):
+        res = subprocess.run(["xclip", "-selection", "clipboard", "-o"], capture_output=True, text=True)
+        return {"success": True, "clipboard": res.stdout.strip()}
+    elif shutil.which("wl-paste"):
+        res = subprocess.run(["wl-paste"], capture_output=True, text=True)
+        return {"success": True, "clipboard": res.stdout.strip()}
+    return {"success": False, "error": "No hay herramienta de portapapeles disponible."}
+
+
+def _os_write_clipboard(target: str, value: str) -> Dict[str, Any]:
+    text_to_copy = value or target
+    if sys.platform == "win32":
+        subprocess.run(["powershell.exe", "-NoProfile", f"Set-Clipboard -Value '{text_to_copy}'"])
+        return {"success": True, "message": "Texto copiado al portapapeles."}
+    elif shutil.which("xclip"):
+        p = subprocess.Popen(["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE, text=True)
+        p.communicate(input=text_to_copy)
+        return {"success": True, "message": "Texto copiado al portapapeles."}
+    elif shutil.which("wl-copy"):
+        p = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE, text=True)
+        p.communicate(input=text_to_copy)
+        return {"success": True, "message": "Texto copiado al portapapeles."}
+    return {"success": False, "error": "No hay herramienta de portapapeles disponible."}
+
+
+def _os_system_stats(target: str, value: str) -> Dict[str, Any]:
+    import platform as _platform
+    import time as _time
+
+    boot = psutil.boot_time()
+    uptime_hrs = round((_time.time() - boot) / 3600, 1)
+    cpu_pct = psutil.cpu_percent(interval=0.05)
+    cpu_count = psutil.cpu_count(logical=True)
+    ram = psutil.virtual_memory()
+    disk = psutil.disk_usage("C:" if sys.platform == "win32" else "/")
+    batt = psutil.sensors_battery()
+
+    battery_info = None
+    if batt:
+        battery_info = {
+            "percent": batt.percent,
+            "plugged": batt.power_plugged,
+        }
+
+    free_gb = round(disk.free / (1024 ** 3), 1)
+    free_ram_mb = round(ram.available / (1024 ** 2))
+    batt_msg = f", Batería al {batt.percent}%" if batt else ""
+
+    return {
+        "success": True,
+        "telemetry": {
+            "os": _platform.platform(),
+            "cpu_percent": cpu_pct,
+            "cpu_cores": cpu_count,
+            "ram_percent": ram.percent,
+            "ram_used_mb": round((ram.total - ram.available) / (1024 ** 2)),
+            "ram_free_mb": free_ram_mb,
+            "disk_free_gb": free_gb,
+            "disk_percent": disk.percent,
+            "uptime_hours": uptime_hrs,
+            "battery": battery_info,
+        },
+        "message": (
+            f"Telemetría táctica: CPU al {cpu_pct}%, RAM al {ram.percent}% ({free_ram_mb} MB libres), "
+            f"Disco al {disk.percent}% ({free_gb} GB disponibles), equipo encendido hace {uptime_hrs} horas{batt_msg}."
+        ),
+    }
+
+
+def _os_network_info(target: str, value: str) -> Dict[str, Any]:
+    import socket as _socket
+    import time as _time
+
+    hostname = _socket.gethostname()
+    try:
+        s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
+        s.connect(("1.1.1.1", 80))
+        local_ip = s.getsockname()[0]
+        s.close()
+    except Exception:
+        local_ip = _socket.gethostbyname(hostname)
+
+    t0 = _time.time()
+    ping_ms = None
+    try:
+        s = _socket.create_connection(("1.1.1.1", 53), timeout=1.5)
+        s.close()
+        ping_ms = round((_time.time() - t0) * 1000, 1)
+    except Exception:
+        pass
+
+    lat_text = f"{ping_ms} milisegundos" if ping_ms is not None else "no disponible"
+    return {
+        "success": True,
+        "network": {
+            "hostname": hostname,
+            "local_ip": local_ip,
+            "latency_ms": ping_ms,
+            "internet_ok": ping_ms is not None,
+        },
+        "message": (
+            f"Diagnóstico de red: Host '{hostname}', IP local {local_ip}, "
+            f"latencia a internet {lat_text}."
+        ),
+    }
+
+
+def _os_media_play_pause(target: str, value: str) -> Dict[str, Any]:
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.user32.keybd_event(0xB3, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(0xB3, 0, 2, 0)
+        return {"success": True, "message": "Comando Play/Pause multimedia enviado."}
+    else:
+        if shutil.which("playerctl"):
+            subprocess.run(["playerctl", "play-pause"], capture_output=True)
+        elif shutil.which("xdotool"):
+            subprocess.run(["xdotool", "key", "XF86AudioPlay"], capture_output=True)
+        return {"success": True, "message": "Play/Pause multimedia activado."}
+
+
+def _os_media_next(target: str, value: str) -> Dict[str, Any]:
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.user32.keybd_event(0xB0, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(0xB0, 0, 2, 0)
+        return {"success": True, "message": "Pista siguiente multimedia enviada."}
+    else:
+        if shutil.which("playerctl"):
+            subprocess.run(["playerctl", "next"], capture_output=True)
+        elif shutil.which("xdotool"):
+            subprocess.run(["xdotool", "key", "XF86AudioNext"], capture_output=True)
+        return {"success": True, "message": "Pista siguiente enviada."}
+
+
+def _os_media_prev(target: str, value: str) -> Dict[str, Any]:
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.user32.keybd_event(0xB1, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(0xB1, 0, 2, 0)
+        return {"success": True, "message": "Pista anterior multimedia enviada."}
+    else:
+        if shutil.which("playerctl"):
+            subprocess.run(["playerctl", "previous"], capture_output=True)
+        elif shutil.which("xdotool"):
+            subprocess.run(["xdotool", "key", "XF86AudioPrev"], capture_output=True)
+        return {"success": True, "message": "Pista anterior enviada."}
+
+
+def _os_show_desktop(target: str, value: str) -> Dict[str, Any]:
+    if sys.platform == "win32":
+        import ctypes
+        # Win+D
+        ctypes.windll.user32.keybd_event(0x5B, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(0x44, 0, 0, 0)
+        ctypes.windll.user32.keybd_event(0x44, 0, 2, 0)
+        ctypes.windll.user32.keybd_event(0x5B, 0, 2, 0)
+        return {"success": True, "message": "Escritorio mostrado y ventanas minimizadas."}
+    else:
+        if shutil.which("xdotool"):
+            subprocess.run(["xdotool", "key", "super+d"], capture_output=True)
+        elif shutil.which("wmctrl"):
+            subprocess.run(["wmctrl", "-k", "on"], capture_output=True)
+        return {"success": True, "message": "Escritorio mostrado."}
+
+
+def _os_lock_screen(target: str, value: str) -> Dict[str, Any]:
+    if sys.platform == "win32":
+        import ctypes
+        ctypes.windll.user32.LockWorkStation()
+        return {"success": True, "message": "Estación de trabajo bloqueada por seguridad."}
+    else:
+        if shutil.which("loginctl"):
+            subprocess.run(["loginctl", "lock-session"], capture_output=True)
+        elif shutil.which("xdg-screensaver"):
+            subprocess.run(["xdg-screensaver", "lock"], capture_output=True)
+        return {"success": True, "message": "Sesión bloqueada."}
+
+
+def _os_notify(target: str, value: str) -> Dict[str, Any]:
+    msg_text = value or target or "Notificación táctica de Zara"
+    if sys.platform == "win32":
+        ps_script = (
+            f"[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null;"
+            f"$template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText01);"
+            f"$template.GetElementsByTagName('text')[0].AppendChild($template.CreateTextNode('{msg_text}')) > $null;"
+            f"$toast = [Windows.UI.Notifications.ToastNotification]::new($template);"
+            f"[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('ZARA Tactical AI').Show($toast);"
+        )
+        subprocess.Popen(
+            ["powershell.exe", "-NoProfile", "-Command", ps_script],
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+        )
+        return {"success": True, "message": f"Notificación en pantalla enviada: '{msg_text}'."}
+    else:
+        if shutil.which("notify-send"):
+            subprocess.Popen(["notify-send", "ZARA", msg_text], stdin=subprocess.DEVNULL)
+        return {"success": True, "message": f"Notificación en pantalla enviada: '{msg_text}'."}
+
+
+_OS_ACTIONS: Dict[str, Callable[[str, str], Dict[str, Any]]] = {
+    "open_app": _os_open_app,
+    "close_app": _os_close_app,
+    "list_processes": _os_list_processes,
+    "set_volume": _os_set_volume,
+    "mute": _os_mute,
+    "unmute": _os_unmute,
+    "read_clipboard": _os_read_clipboard,
+    "write_clipboard": _os_write_clipboard,
+    "system_stats": _os_system_stats,
+    "system_telemetry": _os_system_stats,
+    "telemetry": _os_system_stats,
+    "network_info": _os_network_info,
+    "network_check": _os_network_info,
+    "ip": _os_network_info,
+    "media_play_pause": _os_media_play_pause,
+    "play_pause": _os_media_play_pause,
+    "play": _os_media_play_pause,
+    "pause": _os_media_play_pause,
+    "media_next": _os_media_next,
+    "next_track": _os_media_next,
+    "media_prev": _os_media_prev,
+    "prev_track": _os_media_prev,
+    "show_desktop": _os_show_desktop,
+    "minimize_all": _os_show_desktop,
+    "lock_screen": _os_lock_screen,
+    "lock": _os_lock_screen,
+    "notify": _os_notify,
+}
+
+
 def os_control(action: str, target: str = "", value: str = "") -> Dict[str, Any]:
     """Control de aplicaciones, volumen, procesos y portapapeles."""
     action = action.lower().strip()
-
+    handler = _OS_ACTIONS.get(action)
+    if handler is None:
+        return {"success": False, "error": f"Acción de SO desconocida '{action}'."}
     try:
-        if action == "open_app":
-            tgt = target.strip()
-            if not tgt:
-                return {"success": False, "error": "Debes especificar la aplicación o URL a abrir."}
-
-            if tgt.startswith("http://") or tgt.startswith("https://"):
-                if sys.platform == "win32":
-                    os.startfile(tgt)
-                else:
-                    subprocess.Popen(["xdg-open", tgt], stdin=subprocess.DEVNULL)
-                return {"success": True, "message": f"URL '{tgt}' abierta en el navegador."}
-
-            if sys.platform == "win32":
-                # [FIX] Resolver alias en español ANTES de shutil.which, que
-                # solo conoce nombres de ejecutable en inglés.
-                candidate = _WIN_APP_ALIASES.get(tgt.lower(), tgt)
-
-                # Intentos de ejecución en Windows
-                resolved = shutil.which(candidate) or shutil.which(f"{candidate}.exe")
-                if resolved:
-                    subprocess.Popen([resolved])
-                    return {"success": True, "message": f"Aplicación '{tgt}' iniciada."}
-
-                # Start Menu búsqueda rápida (por nombre original Y por alias)
-                appdata = Path(os.environ.get("APPDATA", ""))
-                progdata = Path(os.environ.get("ProgramData", ""))
-                needles = {tgt.lower(), candidate.lower()}
-                for base in [appdata / "Microsoft/Windows/Start Menu/Programs", progdata / "Microsoft/Windows/Start Menu/Programs"]:
-                    if base.is_dir():
-                        for lnk in base.rglob("*.lnk"):
-                            stem_low = lnk.stem.lower()
-                            if any(n in stem_low for n in needles):
-                                os.startfile(str(lnk))
-                                return {"success": True, "message": f"Aplicación '{lnk.stem}' iniciada desde el menú inicio."}
-
-                # [FIX] Último recurso VERIFICABLE: os.startfile() usa el
-                # mismo mecanismo que el menú de Inicio de Windows (ShellExecute,
-                # entiende más alias que PATH) y lanza una excepción SÍNCRONA
-                # si no encuentra nada que ejecutar. El fallback anterior
-                # (Start-Process de PowerShell en un subprocess.Popen separado)
-                # reportaba éxito SIEMPRE sin comprobar si el proceso hijo
-                # realmente consiguió arrancar algo.
-                try:
-                    os.startfile(candidate)
-                    return {"success": True, "message": f"Aplicación '{tgt}' iniciada."}
-                except OSError as exc:
-                    return {
-                        "success": False,
-                        "error": f"No se encontró ninguna aplicación llamada '{tgt}': {exc}",
-                    }
-            else:
-                # Linux (KDE, GNOME, XFCE con xdg-open o gtk-launch)
-                if shutil.which("gtk-launch"):
-                    subprocess.Popen(["gtk-launch", tgt], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-                    return {"success": True, "message": f"Lanzado '{tgt}' vía gtk-launch."}
-                elif shutil.which(tgt):
-                    subprocess.Popen([tgt], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-                    return {"success": True, "message": f"Lanzado binario '{tgt}'."}
-                else:
-                    subprocess.Popen(["xdg-open", tgt], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)
-                    return {"success": True, "message": f"Lanzado '{tgt}' vía xdg-open."}
-
-        elif action == "close_app":
-            tgt = target.lower().strip()
-            closed = []
-            for p in psutil.process_iter(["pid", "name"]):
-                try:
-                    p_name = p.info["name"].lower()
-                    if tgt in p_name:
-                        p.terminate()
-                        closed.append(f"{p_name} (PID {p.info['pid']})")
-                except (psutil.NoSuchProcess, psutil.AccessDenied):
-                    pass
-            if closed:
-                return {"success": True, "message": f"Procesos terminados: {', '.join(closed)}"}
-            return {"success": False, "message": f"No se encontró ningún proceso activo llamado '{target}'."}
-
-        elif action == "list_processes":
-            procs = []
-            for p in sorted(psutil.process_iter(["pid", "name", "cpu_percent", "memory_percent"]),
-                            key=lambda x: x.info["memory_percent"] or 0, reverse=True)[:15]:
-                procs.append({
-                    "pid": p.info["pid"],
-                    "name": p.info["name"],
-                    "cpu_pct": p.info["cpu_percent"],
-                    "mem_pct": round(p.info["memory_percent"] or 0, 1),
-                })
-            return {"success": True, "top_processes": procs}
-
-        elif action == "set_volume":
-            try:
-                pct = float(value or target)
-            except ValueError:
-                return {"success": False, "error": f"Valor de volumen inválido: '{value or target}'"}
-            if sys.platform == "win32":
-                msg = _set_windows_volume(pct)
-            else:
-                msg = _set_linux_volume(pct)
-            return {"success": True, "message": msg}
-
-        elif action == "mute":
-            if sys.platform == "win32":
-                try:
-                    from pycaw.pycaw import AudioUtilities
-                    speakers = AudioUtilities.GetSpeakers()
-                    if hasattr(speakers, "EndpointVolume"):
-                        speakers.EndpointVolume.SetMute(1, None)
-                        return {"success": True, "message": "Sonido silenciado."}
-                except Exception:
-                    pass
-                import ctypes
-                ctypes.windll.user32.keybd_event(0xAD, 0, 0, 0)
-                ctypes.windll.user32.keybd_event(0xAD, 0, 2, 0)
-                return {"success": True, "message": "Silencio activado."}
-            else:
-                if shutil.which("wpctl"):
-                    subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "1"], capture_output=True)
-                elif shutil.which("pactl"):
-                    subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "1"], capture_output=True)
-                return {"success": True, "message": "Sonido silenciado."}
-
-        elif action == "unmute":
-            if sys.platform == "win32":
-                try:
-                    from pycaw.pycaw import AudioUtilities
-                    speakers = AudioUtilities.GetSpeakers()
-                    if hasattr(speakers, "EndpointVolume"):
-                        speakers.EndpointVolume.SetMute(0, None)
-                        return {"success": True, "message": "Sonido reactivado."}
-                except Exception:
-                    pass
-                import ctypes
-                ctypes.windll.user32.keybd_event(0xAD, 0, 0, 0)
-                ctypes.windll.user32.keybd_event(0xAD, 0, 2, 0)
-                return {"success": True, "message": "Silencio desactivado."}
-            else:
-                if shutil.which("wpctl"):
-                    subprocess.run(["wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "0"], capture_output=True)
-                elif shutil.which("pactl"):
-                    subprocess.run(["pactl", "set-sink-mute", "@DEFAULT_SINK@", "0"], capture_output=True)
-                return {"success": True, "message": "Sonido reactivado."}
-
-        elif action == "read_clipboard":
-            if sys.platform == "win32":
-                res = subprocess.run(["powershell.exe", "-NoProfile", "Get-Clipboard"], capture_output=True, text=True)
-                return {"success": True, "clipboard": res.stdout.strip()}
-            elif shutil.which("xclip"):
-                res = subprocess.run(["xclip", "-selection", "clipboard", "-o"], capture_output=True, text=True)
-                return {"success": True, "clipboard": res.stdout.strip()}
-            elif shutil.which("wl-paste"):
-                res = subprocess.run(["wl-paste"], capture_output=True, text=True)
-                return {"success": True, "clipboard": res.stdout.strip()}
-            return {"success": False, "error": "No hay herramienta de portapapeles disponible."}
-
-        elif action == "write_clipboard":
-            text_to_copy = value or target
-            if sys.platform == "win32":
-                subprocess.run(["powershell.exe", "-NoProfile", f"Set-Clipboard -Value '{text_to_copy}'"])
-                return {"success": True, "message": "Texto copiado al portapapeles."}
-            elif shutil.which("xclip"):
-                p = subprocess.Popen(["xclip", "-selection", "clipboard"], stdin=subprocess.PIPE, text=True)
-                p.communicate(input=text_to_copy)
-                return {"success": True, "message": "Texto copiado al portapapeles."}
-            elif shutil.which("wl-copy"):
-                p = subprocess.Popen(["wl-copy"], stdin=subprocess.PIPE, text=True)
-                p.communicate(input=text_to_copy)
-                return {"success": True, "message": "Texto copiado al portapapeles."}
-            return {"success": False, "error": "No hay herramienta de portapapeles disponible."}
-
-        elif action in ("system_stats", "system_telemetry", "telemetry"):
-            import platform as _platform
-            import time as _time
-
-            boot = psutil.boot_time()
-            uptime_hrs = round((_time.time() - boot) / 3600, 1)
-            cpu_pct = psutil.cpu_percent(interval=0.05)
-            cpu_count = psutil.cpu_count(logical=True)
-            ram = psutil.virtual_memory()
-            disk = psutil.disk_usage("C:" if sys.platform == "win32" else "/")
-            batt = psutil.sensors_battery()
-
-            battery_info = None
-            if batt:
-                battery_info = {
-                    "percent": batt.percent,
-                    "plugged": batt.power_plugged,
-                }
-
-            free_gb = round(disk.free / (1024 ** 3), 1)
-            free_ram_mb = round(ram.available / (1024 ** 2))
-            batt_msg = f", Batería al {batt.percent}%" if batt else ""
-
-            return {
-                "success": True,
-                "telemetry": {
-                    "os": _platform.platform(),
-                    "cpu_percent": cpu_pct,
-                    "cpu_cores": cpu_count,
-                    "ram_percent": ram.percent,
-                    "ram_used_mb": round((ram.total - ram.available) / (1024 ** 2)),
-                    "ram_free_mb": free_ram_mb,
-                    "disk_free_gb": free_gb,
-                    "disk_percent": disk.percent,
-                    "uptime_hours": uptime_hrs,
-                    "battery": battery_info,
-                },
-                "message": (
-                    f"Telemetría táctica: CPU al {cpu_pct}%, RAM al {ram.percent}% ({free_ram_mb} MB libres), "
-                    f"Disco al {disk.percent}% ({free_gb} GB disponibles), equipo encendido hace {uptime_hrs} horas{batt_msg}."
-                ),
-            }
-
-        elif action in ("network_info", "network_check", "ip"):
-            import socket as _socket
-            import time as _time
-
-            hostname = _socket.gethostname()
-            try:
-                s = _socket.socket(_socket.AF_INET, _socket.SOCK_DGRAM)
-                s.connect(("1.1.1.1", 80))
-                local_ip = s.getsockname()[0]
-                s.close()
-            except Exception:
-                local_ip = _socket.gethostbyname(hostname)
-
-            t0 = _time.time()
-            ping_ms = None
-            try:
-                s = _socket.create_connection(("1.1.1.1", 53), timeout=1.5)
-                s.close()
-                ping_ms = round((_time.time() - t0) * 1000, 1)
-            except Exception:
-                pass
-
-            lat_text = f"{ping_ms} milisegundos" if ping_ms is not None else "no disponible"
-            return {
-                "success": True,
-                "network": {
-                    "hostname": hostname,
-                    "local_ip": local_ip,
-                    "latency_ms": ping_ms,
-                    "internet_ok": ping_ms is not None,
-                },
-                "message": (
-                    f"Diagnóstico de red: Host '{hostname}', IP local {local_ip}, "
-                    f"latencia a internet {lat_text}."
-                ),
-            }
-
-        elif action in ("media_play_pause", "play_pause", "play", "pause"):
-            if sys.platform == "win32":
-                import ctypes
-                ctypes.windll.user32.keybd_event(0xB3, 0, 0, 0)
-                ctypes.windll.user32.keybd_event(0xB3, 0, 2, 0)
-                return {"success": True, "message": "Comando Play/Pause multimedia enviado."}
-            else:
-                if shutil.which("playerctl"):
-                    subprocess.run(["playerctl", "play-pause"], capture_output=True)
-                elif shutil.which("xdotool"):
-                    subprocess.run(["xdotool", "key", "XF86AudioPlay"], capture_output=True)
-                return {"success": True, "message": "Play/Pause multimedia activado."}
-
-        elif action in ("media_next", "next_track"):
-            if sys.platform == "win32":
-                import ctypes
-                ctypes.windll.user32.keybd_event(0xB0, 0, 0, 0)
-                ctypes.windll.user32.keybd_event(0xB0, 0, 2, 0)
-                return {"success": True, "message": "Pista siguiente multimedia enviada."}
-            else:
-                if shutil.which("playerctl"):
-                    subprocess.run(["playerctl", "next"], capture_output=True)
-                elif shutil.which("xdotool"):
-                    subprocess.run(["xdotool", "key", "XF86AudioNext"], capture_output=True)
-                return {"success": True, "message": "Pista siguiente enviada."}
-
-        elif action in ("media_prev", "prev_track"):
-            if sys.platform == "win32":
-                import ctypes
-                ctypes.windll.user32.keybd_event(0xB1, 0, 0, 0)
-                ctypes.windll.user32.keybd_event(0xB1, 0, 2, 0)
-                return {"success": True, "message": "Pista anterior multimedia enviada."}
-            else:
-                if shutil.which("playerctl"):
-                    subprocess.run(["playerctl", "previous"], capture_output=True)
-                elif shutil.which("xdotool"):
-                    subprocess.run(["xdotool", "key", "XF86AudioPrev"], capture_output=True)
-                return {"success": True, "message": "Pista anterior enviada."}
-
-        elif action in ("show_desktop", "minimize_all"):
-            if sys.platform == "win32":
-                import ctypes
-                # Win+D
-                ctypes.windll.user32.keybd_event(0x5B, 0, 0, 0)
-                ctypes.windll.user32.keybd_event(0x44, 0, 0, 0)
-                ctypes.windll.user32.keybd_event(0x44, 0, 2, 0)
-                ctypes.windll.user32.keybd_event(0x5B, 0, 2, 0)
-                return {"success": True, "message": "Escritorio mostrado y ventanas minimizadas."}
-            else:
-                if shutil.which("xdotool"):
-                    subprocess.run(["xdotool", "key", "super+d"], capture_output=True)
-                elif shutil.which("wmctrl"):
-                    subprocess.run(["wmctrl", "-k", "on"], capture_output=True)
-                return {"success": True, "message": "Escritorio mostrado."}
-
-        elif action in ("lock_screen", "lock"):
-            if sys.platform == "win32":
-                import ctypes
-                ctypes.windll.user32.LockWorkStation()
-                return {"success": True, "message": "Estación de trabajo bloqueada por seguridad."}
-            else:
-                if shutil.which("loginctl"):
-                    subprocess.run(["loginctl", "lock-session"], capture_output=True)
-                elif shutil.which("xdg-screensaver"):
-                    subprocess.run(["xdg-screensaver", "lock"], capture_output=True)
-                return {"success": True, "message": "Sesión bloqueada."}
-
-        elif action == "notify":
-            msg_text = value or target or "Notificación táctica de Zara"
-            if sys.platform == "win32":
-                ps_script = (
-                    f"[Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] > $null;"
-                    f"$template = [Windows.UI.Notifications.ToastNotificationManager]::GetTemplateContent([Windows.UI.Notifications.ToastTemplateType]::ToastText01);"
-                    f"$template.GetElementsByTagName('text')[0].AppendChild($template.CreateTextNode('{msg_text}')) > $null;"
-                    f"$toast = [Windows.UI.Notifications.ToastNotification]::new($template);"
-                    f"[Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('ZARA Tactical AI').Show($toast);"
-                )
-                subprocess.Popen(
-                    ["powershell.exe", "-NoProfile", "-Command", ps_script],
-                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
-                )
-                return {"success": True, "message": f"Notificación en pantalla enviada: '{msg_text}'."}
-            else:
-                if shutil.which("notify-send"):
-                    subprocess.Popen(["notify-send", "ZARA", msg_text], stdin=subprocess.DEVNULL)
-                return {"success": True, "message": f"Notificación en pantalla enviada: '{msg_text}'."}
-
-        else:
-            return {"success": False, "error": f"Acción de SO desconocida '{action}'."}
-
+        return handler(target, value)
     except Exception as exc:
         log.exception("Error en os_control: %s", exc)
         return {"success": False, "error": str(exc)}
+
 
 
 # =============================================================================

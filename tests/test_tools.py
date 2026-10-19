@@ -261,7 +261,9 @@ def test_execute_tool_dispatch():
     assert "desconocida" in res_unknown["error"]
 
 
-def test_normalize_windows_command():
+def test_normalize_windows_command(monkeypatch):
+    import core.tools as _tools
+    monkeypatch.setattr(_tools.shutil, "which", lambda name: None)
     assert _normalize_windows_command("ls -la") == "Get-ChildItem -Force"
     assert _normalize_windows_command("ls -lh /path") == "Get-ChildItem -Force /path"
     assert _normalize_windows_command("which python") == "where.exe python"
@@ -283,3 +285,25 @@ def test_format_tools_for_local_prompt():
     assert "open_app" in formatted  # Enum values represented
 
 
+
+
+@pytest.mark.parametrize("cmd", [
+    "rm -rf ~", "rm -rf $HOME/", "shutdown -h now", "reboot",
+    "echo x > /etc/fstab", "find / -name x -delete", "dd if=/dev/zero of=/dev/sda",
+])
+def test_guardrail_blocks_catastrophic(cmd):
+    assert is_command_forbidden(cmd)
+
+
+@pytest.mark.parametrize("cmd", ["ls -la", "rm -rf /tmp/x", "rm -rf ~/proyecto/build", "echo hola"])
+def test_guardrail_allows_normal(cmd):
+    assert not is_command_forbidden(cmd)
+
+
+def test_file_manager_protected_paths():
+    for action in ("write", "append", "delete"):
+        res = file_manager(action, "/etc/zara_test_protegido", content="x")
+        assert res["success"] is False and res.get("blocked") is True
+    res = file_manager("write", "/root/.ssh/zara_test", content="x")
+    assert res.get("blocked") is True
+    assert file_manager("exists", "/etc")["success"] is True

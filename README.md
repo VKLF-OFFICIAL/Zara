@@ -26,7 +26,7 @@
                  (Código/Sec)     (Visión/Web)   (Offline)
                      │
                      ▼
-             [ReAct Loop Silencioso (hasta 8 pasos)]
+             [ReAct Loop Silencioso (hasta `ZARA_MAX_REACT_STEPS` pasos, 8 por defecto)]
            run_shell | file_manager | os_control | inspect_screen
                      │
                      ▼ (Tokens en Streaming)
@@ -55,9 +55,9 @@
 - **Motor en memoria (Edge-TTS + miniaudio):** Síntesis con voz `es-ES-XimenaNeural` (`pitch=+2Hz`, `rate=+6%`) decodificada directamente en RAM en PCM float32, sin escribir archivos MP3 temporales en disco. Fallback a **Kokoro-82M ONNX** local.
 
 ### Cerebro Híbrido y ReAct Autónomo (`core/brain.py` y `core/tools.py`)
-- **ZaraRouter (< 10 ms):** Conmutación ultrarrápida entre Claude 3.7 / Claude Code, Gemini 2.5 Flash y Ollama (`qwen2.5-coder:7b`). Fallback automático ante caídas de red.
+- **ZaraRouter (< 10 ms):** Conmutación ultrarrápida entre Claude (modelo configurable con `ANTHROPIC_MODEL`) / Claude Code, Gemini 2.5 Flash y Ollama (`qwen2.5-coder:7b`). Fallback automático ante caídas de red.
 - **Filosofía YOLO Seguro:** Cero interrupciones para comandos diagnósticos, lectura/edición de ficheros, inspección de red o gestión de procesos.
-- **Guardarraíl Estricto:** Bloqueo exclusivo de operaciones catastróficas irreversibles (`rm -rf /`, `mkfs`, `Format-Volume`, `dd if=`).
+- **Guardarraíl Estricto:** Bloqueo de operaciones catastróficas irreversibles en `run_shell` (`rm -rf /`, `rm -rf ~`, `mkfs`, `Format-Volume`, `dd if=`, `shutdown`/`reboot`, escritura en `/etc/fstab`...) y, en `file_manager`, bloqueo de `write`/`append`/`edit`/`delete` sobre rutas protegidas (`/etc`, `/boot`, `/usr`, `~/.ssh`, `~/.gnupg`, `.git`, el propio HOME...). Las listas viven en `config.py` (`FORBIDDEN_COMMANDS_REGEX`, `PROTECTED_PATHS`). No es un sandbox: es una red de seguridad contra errores del modelo.
 
 ### Interfaz Holográfica (`ui/hud.py`)
 - HUD transparente frameless en **PySide6** con reactividad a 60 FPS:
@@ -179,6 +179,8 @@ ZARA_VAD_BARGE_IN_GRACE_MS=300
 
 ---
 
+> Documentación de la v1 (obsoleta) en `docs/legacy/`.
+
 ## 6. Cómo dejarlo funcionando a la perfección
 
 ### Usa auriculares, no los altavoces del equipo
@@ -198,9 +200,10 @@ Si no responde nada, arranca `ollama serve` en otra terminal antes de lanzar Zar
 
 ### Ejecuta los tests tras cualquier cambio
 ```powershell
+pip install -r requirements-dev.txt
 pytest tests/ -v
 ```
-Todos deben pasar en verde antes de dar por buena una modificación.
+El CI ejecuta solo los tests que no necesitan audio ni GPU (`test_tools`, `test_brain`, `test_config`); el resto se ejecutan en local. Todos deben pasar en verde antes de dar por buena una modificación.
 
 ### Problemas comunes
 

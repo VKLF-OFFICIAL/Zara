@@ -1,32 +1,32 @@
 # Núcleo de Audio y VAD
-sounddevice>=0.5.0
-soundfile>=0.13.0
-numpy>=1.26.0
-silero-vad>=6.0.0
-torch>=2.2.0
-faster-whisper>=1.0.0
-ctranslate2>=4.0.0
-miniaudio>=1.60.0
+sounddevice>=0.5.0,<1
+soundfile>=0.13.0,<1
+numpy>=1.26.0,<3
+silero-vad>=6.0.0,<7
+torch>=2.2.0,<3
+faster-whisper>=1.0.0,<2
+ctranslate2>=4.0.0,<5
+miniaudio>=1.60.0,<2
 
 # Síntesis de Voz (TTS)
-edge-tts>=7.0.0
-kokoro-onnx>=0.6.0
-onnxruntime>=1.20.0
+edge-tts>=7.0.0,<8
+kokoro-onnx>=0.6.0,<1
+onnxruntime>=1.20.0,<2
 
 # Cerebros LLM y Multimodal
-google-genai>=2.0.0
-anthropic>=1.0.0
-httpx>=0.28.0
-aiohttp>=3.10.0
-requests>=2.31.0
+google-genai>=2.0.0,<3
+anthropic>=1.0.0,<2
+httpx>=0.28.0,<1
+aiohttp>=3.10.0,<4
+requests>=2.31.0,<3
 
 # Herramientas del Sistema y Pantalla
-psutil>=6.0.0
-mss>=10.0.0
-pillow>=10.0.0
+psutil>=6.0.0,<7
+mss>=10.0.0,<11
+pillow>=10.0.0,<11
 pycaw>=20240206; sys_platform == 'win32'
-comtypes>=1.4.0; sys_platform == 'win32'
+comtypes>=1.4.0,<2; sys_platform == 'win32'
 
 # Interfaz Holográfica HUD
-PySide6>=6.8.0
-websockets>=14.0.0
+PySide6>=6.8.0,<7
+websockets>=14.0.0,<15

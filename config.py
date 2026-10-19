@@ -182,7 +182,23 @@ FORBIDDEN_COMMANDS_REGEX = [
     r"\bFormat-Volume\b",
     r"\bdiskpart\b.*clean",
     r":\(\)\s*\{\s*:\|:&\s*\};:",
+    r"\brm\b.*?\s-[a-zA-Z0-9-]*[rR][a-zA-Z0-9-]*\b.*?\s+(~|\$HOME|\"\$HOME\")/?(?:[*\s]|$)",
+    r"\bfind\s+/(?:\s|$).*-delete\b",
+    r"\b(shutdown|reboot|poweroff|halt)\b",
+    r"\bStop-Computer\b|\bRestart-Computer\b",
+    r"(>|\btee\b|\bmv\b|\bcp\b).*?/etc/(fstab|passwd|shadow|sudoers)\b",
+    r"(>|\bof=)\s*/dev/(sd|nvme|vd|hd)\w+",
 ]
+
+# Rutas que las herramientas de ficheros nunca pueden modificar ni borrar.
+PROTECTED_PATHS = [
+    p for p in (
+        ["/", "/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/proc", "/root",
+         "/sbin", "/sys", "/usr", "/var", "/home"]
+        if sys.platform != "win32" else
+        [os.environ.get("SystemRoot", r"C:\Windows"), r"C:\Program Files", r"C:\Program Files (x86)"]
+    )
+] + [str(Path.home()), str(Path.home() / ".ssh"), str(Path.home() / ".gnupg"), str(BASE_DIR / ".git")]
 
 # --- INTERFAZ HUD & EVENTOS ---
 WS_HOST = "127.0.0.1"
