@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # =====================================================================
-# ZARA v2.0 - Lanzador Táctico para Linux (Kali Linux, Fedora, Debian)
+# ZARA - Lanzador Táctico para Linux (Kali Linux, Fedora, Debian)
 # Protocol J.A.R.V.I.S. | Asistente para el Señor VK
 # =====================================================================
 
@@ -43,7 +43,7 @@ elif command -v python3 &> /dev/null; then
         echo "[*] Creando entorno virtual .venv..."
         python3 -m venv "$SCRIPT_DIR/.venv"
         "$SCRIPT_DIR/.venv/bin/pip" install --upgrade pip
-        echo "[*] Instalando dependencias de ZARA v2.0..."
+        echo "[*] Instalando dependencias de ZARA..."
         "$SCRIPT_DIR/.venv/bin/pip" install -r "$SCRIPT_DIR/requirements.txt"
     fi
     PYTHON_BIN="$SCRIPT_DIR/.venv/bin/python"

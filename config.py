@@ -1,4 +1,4 @@
-"""Configuración central para ZARA v2.0.
+"""Configuración central de ZARA.
 
 Carga variables de entorno, rutas multiplataforma y parámetros del sistema
 para Windows (10/11) y Linux (Kali/Fedora).
@@ -8,6 +8,15 @@ from __future__ import annotations
 import os
 import sys
 from pathlib import Path
+
+# Versión (única fuente de verdad; SemVer 0.y.z = en desarrollo, sin API estable).
+# 0.3.0-alpha: la tubería de voz → cerebro → herramientas → HUD funciona de extremo a
+# extremo, pero la latencia, la verificación de hablante, el empaquetado y los tests de
+# audio/UI en CI aún no están resueltos. Pasará a 1.0.0 cuando haya una versión estable.
+VERSION = "0.3.0"
+RELEASE_STAGE = "alpha"
+VERSION_FULL = f"{VERSION}-{RELEASE_STAGE}"
+APP_TITLE = f"ZARA v{VERSION_FULL}"
 
 # Raíz del proyecto
 BASE_DIR = Path(__file__).resolve().parent
@@ -91,7 +100,9 @@ AUDIO_CHANNELS = 1
 FRAME_SIZE = 512  # Bloques de 32 ms para VAD rápido
 
 # Silero VAD v5
-VAD_MIN_SILENCE_MS = int(os.environ.get("ZARA_VAD_MIN_SILENCE_MS", "700"))
+# Silencio que cierra una locución. Es tiempo muerto puro en CADA orden: 500 ms conserva
+# las pausas naturales y recorta 200 ms de latencia frente a los 700 ms anteriores.
+VAD_MIN_SILENCE_MS = int(os.environ.get("ZARA_VAD_MIN_SILENCE_MS", "500"))
 VAD_SPEECH_PAD_MS = int(os.environ.get("ZARA_VAD_SPEECH_PAD_MS", "350"))
 VAD_BARGE_IN_TRIGGER_MS = int(os.environ.get("ZARA_VAD_BARGE_IN_MS", "250"))
 VAD_THRESHOLD = float(os.environ.get("ZARA_VAD_THRESHOLD", "0.5"))
@@ -106,8 +117,34 @@ VAD_BARGE_IN_MIN_RMS = float(os.environ.get("ZARA_VAD_BARGE_IN_MIN_RMS", "0.02")
 VAD_BARGE_IN_GRACE_MS = int(os.environ.get("ZARA_VAD_BARGE_IN_GRACE_MS", "300"))
 
 # faster-whisper
-WHISPER_MODEL_PRIMARY = os.environ.get("ZARA_WHISPER_MODEL", "deepdml/faster-whisper-large-v3-turbo-ct2")
+# "auto" elige según el dispositivo: large-v3-turbo (~800 M parámetros) solo es rápido en
+# GPU; en CPU tarda decenas de segundos por frase, así que ahí se usa "small".
+# Se puede fijar a mano: tiny | base | small | medium | <repo HF>.
+WHISPER_MODEL_PRIMARY = os.environ.get("ZARA_WHISPER_MODEL", "auto")
+WHISPER_MODEL_GPU = "deepdml/faster-whisper-large-v3-turbo-ct2"
+WHISPER_MODEL_CPU = "small"
 WHISPER_MODEL_FALLBACK = "small"
+WHISPER_CPU_THREADS = int(os.environ.get("ZARA_WHISPER_CPU_THREADS", str(max(4, os.cpu_count() or 4))))
+
+
+# La plantilla .env.example antigua fijaba large-v3-turbo + beam 5 y setup_and_run la copiaba
+# a todos los .env: en CPU eso hace que cada orden tarde decenas de segundos. Salvo que se
+# fuerce con ZARA_WHISPER_FORCE=1, en CPU se ignora ese valor heredado y se usa el modelo ligero.
+WHISPER_FORCE = os.environ.get("ZARA_WHISPER_FORCE", "") == "1"
+
+
+def resolve_whisper_model(setting: str, device: str) -> str:
+    """Traduce ZARA_WHISPER_MODEL ("auto" o un nombre concreto) al modelo a cargar."""
+    if not setting or setting == "auto":
+        return WHISPER_MODEL_GPU if device == "cuda" else WHISPER_MODEL_CPU
+    if setting == WHISPER_MODEL_GPU and device != "cuda" and not WHISPER_FORCE:
+        return WHISPER_MODEL_CPU
+    return setting
+
+
+def resolve_beam_size(beam: int, device: str) -> int:
+    """En CPU un haz > 1 multiplica el tiempo de decodificación; se limita salvo ZARA_WHISPER_FORCE=1."""
+    return beam if (device == "cuda" or WHISPER_FORCE) else min(beam, 1)
 WHISPER_BEAM_SIZE = int(os.environ.get("ZARA_WHISPER_BEAM_SIZE", "1"))
 WHISPER_LANGUAGE = "es"
 

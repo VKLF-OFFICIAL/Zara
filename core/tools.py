@@ -1,4 +1,4 @@
-"""Subsistema de Herramientas y Agente Autónomo (ZARA v2.0).
+"""Subsistema de Herramientas y Agente Autónomo (ZARA).
 
 Política de ejecución silenciosa (YOLO Seguro), guardarraíl contra comandos
 destructivos catastróficos, soporte nativo multiplataforma (Windows y Linux)

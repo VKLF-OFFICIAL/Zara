@@ -304,7 +304,8 @@ def test_file_manager_protected_paths():
     for action in ("write", "append", "delete"):
         res = file_manager(action, "/etc/zara_test_protegido", content="x")
         assert res["success"] is False and res.get("blocked") is True
-    res = file_manager("write", "/root/.ssh/zara_test", content="x")
+    # ~/.ssh del usuario actual (no un /root fijo: en CI el HOME es /home/runner)
+    res = file_manager("write", str(Path.home() / ".ssh" / "zara_test"), content="x")
     assert res.get("blocked") is True
     assert file_manager("exists", "/etc")["success"] is True
 

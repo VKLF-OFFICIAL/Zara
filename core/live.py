@@ -1,4 +1,4 @@
-"""Motor de Voz Bidireccional en Tiempo Real (ZARA v2.0 — Gemini Live).
+"""Motor de Voz Bidireccional en Tiempo Real (ZARA — Gemini Live).
 
 Streaming de audio nativo full-duplex sobre WebSocket persistente con el modelo
 Gemini Live. Elimina completamente la cascada secuencial STT → LLM → TTS:

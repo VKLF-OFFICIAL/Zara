@@ -1,4 +1,4 @@
-"""Punto de Entrada Principal (ZARA v2.0).
+"""Punto de Entrada Principal de ZARA.
 
 Orquesta el oído neuronal continuo (Silero VAD + faster-whisper), el motor
 de voz streaming con interrupción Barge-in, el cerebro híbrido con ReAct
@@ -13,6 +13,7 @@ import queue
 import signal
 import sys
 import threading
+import time
 from typing import Optional
 
 from PySide6 import QtCore, QtGui, QtWidgets
@@ -185,7 +186,7 @@ class ZaraController(QtCore.QObject):
 
     def start(self) -> None:
         """Inicia todos los subsistemas de Zara."""
-        log.info("Iniciando subsistemas de ZARA v2.0...")
+        log.info("Iniciando subsistemas de %s...", config.APP_TITLE)
         if self._preferred_provider == "gemini_live" and self.live_session.is_available():
             log.info("Iniciando directamente en modo Gemini Live...")
             self.live_session.start()
@@ -222,7 +223,7 @@ class ZaraController(QtCore.QObject):
 
     def shutdown(self) -> None:
         """Cierre ordenado de todos los hilos y motores."""
-        log.info("Apagando ZARA v2.0...")
+        log.info("Apagando %s...", config.APP_TITLE)
         self._stop_event.set()
         self.live_session.stop()
         self.ear.stop()
@@ -392,6 +393,7 @@ class ZaraController(QtCore.QObject):
 
         with self._busy_lock:
             self._is_busy = True
+            t_start = time.monotonic()
             try:
                 token_gen = self.brain.run_react_agent(clean_text, preferred_provider=self._preferred_provider)
 
@@ -399,12 +401,15 @@ class ZaraController(QtCore.QObject):
 
                 def _tee_tokens():
                     for tok in token_gen:
+                        if not full_reply_parts:
+                            log.info("[LATENCIA] primer token del cerebro a los %.2f s", time.monotonic() - t_start)
                         full_reply_parts.append(tok)
                         yield tok
 
                 # Enviar stream de tokens a la síntesis por frases
                 self.voice.feed_token_stream(_tee_tokens())
 
+                log.info("[LATENCIA] turno completo en %.2f s", time.monotonic() - t_start)
                 reply_text = "".join(full_reply_parts).strip()
                 if reply_text:
                     self.sig_assistant_reply.emit(reply_text)
@@ -416,12 +421,14 @@ class ZaraController(QtCore.QObject):
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ZARA v2.0 - Asistente Táctico de IA Estilo J.A.R.V.I.S.")
+    parser = argparse.ArgumentParser(description=f"{config.APP_TITLE} - Asistente Táctico de IA Estilo J.A.R.V.I.S.")
+    parser.add_argument("--version", action="version", version=config.APP_TITLE)
     parser.add_argument("--cli", action="store_true", help="Ejecutar en modo terminal sin HUD gráfico.")
     args = parser.parse_args()
 
     app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
-    app.setApplicationName("ZARA v2.0")
+    app.setApplicationName("ZARA")
+    app.setApplicationVersion(config.VERSION_FULL)
     # [DISEÑO] Icono de aplicación (barra de tareas/Alt+Tab si el SO lo expone
     # pese a Qt.Tool, y para cualquier ventana futura que herede el icono).
     icon_path = config.BASE_DIR / "config" / "zara-icon.ico"

@@ -68,3 +68,37 @@ def test_forbidden_commands_regex():
     for cmd in safe_cmds:
         blocked = any(re.search(pat, cmd, re.IGNORECASE) for pat in config.FORBIDDEN_COMMANDS_REGEX)
         assert not blocked, f"El comando seguro '{cmd}' fue bloqueado erróneamente"
+
+
+def test_version_is_prerelease_and_consistent():
+    import re
+
+    assert re.fullmatch(r"0\.\d+\.\d+", config.VERSION), "ZARA aún no es 1.0: debe ser 0.y.z"
+    assert config.RELEASE_STAGE in ("alpha", "beta", "rc")
+    assert config.VERSION_FULL == f"{config.VERSION}-{config.RELEASE_STAGE}"
+    assert config.VERSION_FULL in config.APP_TITLE
+    assert "v2" not in config.APP_TITLE
+
+
+def test_resolve_whisper_model_depends_on_device():
+    assert config.resolve_whisper_model("auto", "cuda") == config.WHISPER_MODEL_GPU
+    assert config.resolve_whisper_model("auto", "cpu") == config.WHISPER_MODEL_CPU
+    # en CPU nunca debe elegirse el modelo grande por defecto (era la causa de la lentitud)
+    assert "large" not in config.resolve_whisper_model("auto", "cpu")
+    # un valor explícito del usuario se respeta siempre
+    assert config.resolve_whisper_model("base", "cuda") == "base"
+
+
+def test_legacy_env_template_model_is_ignored_on_cpu(monkeypatch):
+    """La plantilla antigua fijaba large-v3-turbo en todos los .env; en CPU no debe cargarse."""
+    assert config.resolve_whisper_model(config.WHISPER_MODEL_GPU, "cpu") == config.WHISPER_MODEL_CPU
+    assert config.resolve_whisper_model(config.WHISPER_MODEL_GPU, "cuda") == config.WHISPER_MODEL_GPU
+    monkeypatch.setattr(config, "WHISPER_FORCE", True)
+    assert config.resolve_whisper_model(config.WHISPER_MODEL_GPU, "cpu") == config.WHISPER_MODEL_GPU
+
+
+def test_beam_is_capped_on_cpu(monkeypatch):
+    assert config.resolve_beam_size(5, "cpu") == 1
+    assert config.resolve_beam_size(5, "cuda") == 5
+    monkeypatch.setattr(config, "WHISPER_FORCE", True)
+    assert config.resolve_beam_size(5, "cpu") == 5

@@ -15,6 +15,16 @@ log = logging.getLogger("zara.gemini_models")
 
 AUTO = "auto"
 
+# IDs retirados por Google: un .env antiguo (o la elección persistida desde el HUD) puede
+# seguir apuntando a ellos. Se tratan como "auto" para que Zara no falle al conectar.
+RETIRED_MODELS = {
+    "gemini-2.5-flash-preview-native-audio-dialog",
+    "gemini-2.0-flash-live-001",
+    "gemini-live-2.5-flash-preview",
+    "gemini-2.0-flash-exp",
+    "gemini-2.0-flash",
+}
+
 # Variantes que no sirven como cerebro de chat general.
 _EXCLUDE_CHAT = ("lite", "image", "tts", "embedding", "live", "audio", "robotics", "computer-use", "translate")
 _EXCLUDE_LIVE = ("lite", "image", "tts", "embedding", "translate")
@@ -81,6 +91,9 @@ def list_gemini_models(api_key: str) -> Dict[str, List[str]]:
 
 def resolve_gemini_model(api_key: str, preferred: str, live: bool, fallback: str) -> str:
     """Resuelve `preferred` (posiblemente ``auto``) a un ID real; nunca lanza."""
+    if preferred in RETIRED_MODELS:
+        log.warning("El modelo Gemini '%s' fue retirado; se elegirá uno vigente.", preferred)
+        preferred = AUTO
     if preferred and preferred != AUTO:
         return preferred  # el usuario fijó un modelo concreto: no tocar ni gastar red
     available = list_gemini_models(api_key) if api_key else {}
