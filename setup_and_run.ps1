@@ -1,5 +1,5 @@
 # =====================================================================
-# ZARA v2.0 - Lanzador Táctico para Windows (PowerShell)
+# ZARA - Lanzador Táctico para Windows (PowerShell)
 # Protocol J.A.R.V.I.S. | Asistente para el Señor VK
 # =====================================================================
 
@@ -40,7 +40,7 @@ if (Test-Path "$ScriptDir\app\.venv\Scripts\python.exe") {
 
 if (-not $PythonExe) {
     Write-Host "[!] Error: No se localizó Python 3.10+ en el sistema ni en un entorno virtual." -ForegroundColor Red
-    Write-Host "    Instale Python o uv para desplegar ZARA v2.0."
+    Write-Host "    Instale Python o uv para desplegar ZARA."
     exit 1
 }
 
@@ -51,6 +51,6 @@ if ($Cli) { $RunArgs += "--cli" }
 if ($Install) { $RunArgs += "--install" }
 if ($RemainingArgs) { $RunArgs += $RemainingArgs }
 
-Write-Host "[*] Iniciando ZARA v2.0 vía PowerShell..." -ForegroundColor Cyan
+Write-Host "[*] Iniciando ZARA vía PowerShell..." -ForegroundColor Cyan
 & $PythonExe $RunArgs
 exit $LASTEXITCODE

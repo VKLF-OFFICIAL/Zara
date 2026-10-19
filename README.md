@@ -1,10 +1,12 @@
-# ZARA v2.0 — Asistente Táctico de IA Estilo J.A.R.V.I.S.
+# ZARA — Asistente Táctico de IA Estilo J.A.R.V.I.S.
 ### Protocolo J.A.R.V.I.S. | Asistente de Alta Autonomía para el **Señor VK**
+
+> **Versión 0.3.0-alpha — pre-lanzamiento.** Funciona de extremo a extremo, pero aún es software en desarrollo: sin API estable, sin empaquetado y con partes sin validar en hardware real. Ver [CHANGELOG.md](CHANGELOG.md).
 
 ---
 
 ## 1. Visión General de la Arquitectura
-**ZARA v2.0** es un asistente táctico autónomo diseñado con latencia ultrabaja, streaming por frases, tolerancia fonética al acento del sur de España (Granada/Andalucía) y ejecución silenciosa tipo *YOLO Seguro* sin confirmaciones constantes innecesarias.
+**ZARA** es un asistente táctico autónomo diseñado con latencia ultrabaja, streaming por frases, tolerancia fonética al acento del sur de España (Granada/Andalucía) y ejecución silenciosa tipo *YOLO Seguro* sin confirmaciones constantes innecesarias.
 
 ```
                    ┌──────────────────────────────────┐
@@ -12,7 +14,7 @@
                    └─────────────────┬────────────────┘
                                      │
                              [Silero VAD v5]
-                     (700ms silencio, 350ms pad)
+                     (500ms silencio, 350ms pad)
                                      │
                                      ▼
                         [faster-whisper GPU/CPU]
@@ -46,9 +48,9 @@
 
 ### Oído Neuronal y Captura (`core/ear.py`)
 - **Captura continua:** `sounddevice.InputStream` a 16.000 Hz, mono, float32 con cola thread-safe.
-- **VAD Neuronal:** **Silero VAD v5** con `min_silence_duration_ms=700` y `speech_pad_ms=350` para evitar cortes en pausas naturales.
+- **VAD Neuronal:** **Silero VAD v5** con `min_silence_duration_ms=500` y `speech_pad_ms=350` para evitar cortes en pausas naturales.
 - **Detección de Interrupción (Barge-in):** Si el Señor VK habla durante $>250\text{ ms}$ mientras Zara responde, se detiene la reproducción instantáneamente y pasa a escucha.
-- **Transcripción sin sesgo de acento:** `faster-whisper` con `beam_size=5`, filtrado VAD e inyección de contexto fonético y jerga de hacking/sistemas (`initial_prompt`).
+- **Transcripción sin sesgo de acento:** `faster-whisper` (modelo `auto`: `large-v3-turbo` en GPU, `small` en CPU), `beam_size=1`, filtrado VAD e inyección de contexto fonético y jerga de hacking/sistemas (`initial_prompt`).
 
 ### Voz Dulce y Fluida (`core/voice.py`)
 - **Streaming por frases (`SentenceChunker`):** Los tokens generados se agrupan hasta encontrar puntuación (`.`, `,`, `:`, `?`, `!`, `\n`) con al menos 35 caracteres y se envían de inmediato a la síntesis sin esperar la respuesta completa.
@@ -110,7 +112,7 @@ No necesitas tocar `OLLAMA_MODEL` en `.env`: si lo dejas vacío (por defecto), Z
 
 ### Paso 3 — Claves de API (opcionales)
 Edita `.env`:
-- `GEMINI_API_KEY`: para visión de pantalla (`inspect_screen`) y búsqueda web con Gemini 2.5 Flash.
+- `GEMINI_API_KEY`: clave de la API (gratis en [Google AI Studio](https://aistudio.google.com/apikey), con límites; **no** va incluida en la suscripción Google AI Pro). Sirve para visión de pantalla (`inspect_screen`) y búsqueda web con Gemini 2.5 Flash.
 - `GEMINI_MODEL` / `ZARA_GEMINI_LIVE_MODEL`: por defecto `auto` (Zara consulta la API y elige el Flash estable más reciente; evita que se rompa cuando Google retira modelos). Puedes fijar un ID concreto.
 - `ANTHROPIC_API_KEY`: para tareas de código/seguridad con Claude. Sin esta clave, si tienes el CLI `claude` instalado y en el `PATH`, Zara lo usa automáticamente como alternativa.
 
@@ -131,7 +133,7 @@ Esto comprueba la versión de Python, las dependencias, los dispositivos de audi
 # 1. Diagnóstico completo de subsistemas (Audio, VAD, Shell, HUD)
 .\setup_and_run.ps1 -Check
 
-# 2. Iniciar ZARA v2.0 completa con HUD holográfico
+# 2. Iniciar ZARA completa con HUD holográfico
 .\setup_and_run.ps1
 # O simplemente haciendo doble clic en zara.cmd
 
@@ -148,7 +150,7 @@ chmod +x setup_and_run.sh
 # 2. Diagnóstico de subsistemas
 ./setup_and_run.sh --check
 
-# 3. Iniciar ZARA v2.0
+# 3. Iniciar ZARA
 ./setup_and_run.sh
 
 # 4. Modo CLI
@@ -193,6 +195,11 @@ No todos los modelos locales manejan igual el "function calling". Zara es robust
 
 ### Di los nombres de las apps como las conoces, en español
 Para abrir aplicaciones ("abre el bloc de notas", "abre la calculadora", "abre el navegador"), Zara ya traduce los nombres comunes en español al ejecutable real de Windows. Si una app no abre, prueba a decir su nombre tal cual aparece en el menú Inicio, o el nombre técnico del ejecutable.
+
+### Si Zara tarda en responder
+Mira el log: cada orden imprime líneas `[LATENCIA]` con el tiempo de transcripción (`x1.00` = tiempo real), el del primer token del cerebro y el total.
+- **STT lento (`x` > 1):** estás en CPU con un modelo demasiado grande. Usa `ZARA_WHISPER_MODEL="base"` (o `tiny`) y borra de tu `.env` las líneas antiguas `ZARA_WHISPER_MODEL=...large-v3-turbo...` y `ZARA_WHISPER_BEAM_SIZE=5` (Zara ya las ignora en CPU salvo `ZARA_WHISPER_FORCE=1`).
+- **Primer token lento:** un modelo local grande sin GPU es lo más lento de la cadena; prueba con Gemini (`GEMINI_API_KEY`) o un modelo Ollama más pequeño.
 
 ### Comprueba que Ollama responde ANTES de arrancar Zara
 ```bash

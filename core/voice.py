@@ -1,4 +1,4 @@
-"""Subsistema de Voz y Síntesis (ZARA v2.0).
+"""Subsistema de Voz y Síntesis (ZARA).
 
 Streaming por frases (Sentence Chunking), TTS dual (Kokoro-ONNX local + EdgeTTS en RAM),
 cero escritura en disco para latencia mínima y capacidad de interrupción inmediata (Barge-in).
@@ -59,6 +59,9 @@ def clean_text_for_speech(text: str) -> str:
     return t
 
 
+FIRST_SENTENCE_MIN_CHARS = 18  # "Claro, Señor." ya es una primera frase válida
+
+
 class SentenceChunker:
     """Acumulador de streaming de tokens que emite frases en cuanto alcanzan
 
@@ -67,8 +70,12 @@ class SentenceChunker:
 
     DELIMITERS = re.compile(r"([.!?:;\n]+)")
 
-    def __init__(self, min_length: int = 35):
+    def __init__(self, min_length: int = 35, first_min_length: Optional[int] = None):
         self.min_length = min_length
+        # La PRIMERA frase de cada respuesta puede ser más corta: es la que marca cuánto
+        # tarda en empezar a sonar Zara; las siguientes se sintetizan mientras habla.
+        self.first_min_length = first_min_length if first_min_length is not None else min_length
+        self._emitted_any = False
         self._buffer = ""
 
     def push(self, token: str) -> List[str]:
@@ -86,10 +93,12 @@ class SentenceChunker:
             end_idx = match.end()
             candidate = self._buffer[:end_idx].strip()
 
-            if len(candidate) >= self.min_length:
+            threshold = self.min_length if self._emitted_any else self.first_min_length
+            if len(candidate) >= threshold:
                 cleaned = clean_text_for_speech(candidate)
                 if cleaned:
                     ready.append(cleaned)
+                    self._emitted_any = True
                 self._buffer = self._buffer[end_idx:].lstrip()
             else:
                 # Si es muy corto (ej: "Sra."), buscar el siguiente delimitador
@@ -100,6 +109,7 @@ class SentenceChunker:
                     cleaned = clean_text_for_speech(cand2)
                     if cleaned:
                         ready.append(cleaned)
+                        self._emitted_any = True
                     self._buffer = self._buffer[new_end:].lstrip()
                 else:
                     break
@@ -300,7 +310,7 @@ class VoiceSynthesizer:
 
     def feed_token_stream(self, token_generator: Generator[str, None, None]) -> None:
         """Procesa un generador síncrono de tokens del LLM usando SentenceChunker."""
-        chunker = SentenceChunker(min_length=35)
+        chunker = SentenceChunker(min_length=35, first_min_length=FIRST_SENTENCE_MIN_CHARS)
         for token in token_generator:
             if self._stop_event.is_set():
                 break
@@ -312,7 +322,7 @@ class VoiceSynthesizer:
 
     async def feed_async_token_stream(self, async_generator: AsyncGenerator[str, None]) -> None:
         """Procesa un generador asíncrono de tokens del LLM usando SentenceChunker."""
-        chunker = SentenceChunker(min_length=35)
+        chunker = SentenceChunker(min_length=35, first_min_length=FIRST_SENTENCE_MIN_CHARS)
         async for token in async_generator:
             if self._stop_event.is_set():
                 break

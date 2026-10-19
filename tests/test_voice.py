@@ -245,3 +245,16 @@ def test_sentence_chunker_short_abbreviation_not_cut():
 def test_sentence_chunker_flush_empty():
     chunker = SentenceChunker(min_length=20)
     assert chunker.flush() == []
+
+
+def test_first_sentence_can_be_shorter_than_the_rest():
+    chunker = SentenceChunker(min_length=35, first_min_length=10)
+    first = chunker.push("Claro, Señor. Estoy ejecutando la tarea que me ha pedido ahora mismo.")
+    assert first[0] == "Claro, Señor."
+    # a partir de la primera, vuelve a regir el mínimo normal
+    assert len(first) == 2 and len(first[1]) >= 35
+
+
+def test_chunker_default_behaviour_unchanged():
+    chunker = SentenceChunker(min_length=35)
+    assert chunker.push("Claro, Señor. ") == []

@@ -1,4 +1,4 @@
-"""Interfaz Holográfica HUD Táctica (ZARA v2.0).
+"""Interfaz Holográfica HUD Táctica (ZARA).
 
 Esfera flotante sin bordes (FramelessWindowHint), translúcida, siempre encima,
 con el avatar de Zara recortado en círculo y reactividad por estado (IDLE,
@@ -15,6 +15,11 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable, Optional
 from PySide6 import QtCore, QtGui, QtWidgets
+
+from config import VERSION_FULL
+from ui.geometry import orb_layout
+
+SEGMENT_DOT_GAP = 12  # separación del punto "panel abierto" respecto al anillo segmentado
 
 
 class HUDState(Enum):
@@ -54,7 +59,7 @@ _STATE_TEXT = {
 # Rutas candidatas para el retrato de Zara (relativas a la raíz del proyecto).
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 AVATAR_CANDIDATES = [
-    str(_PROJECT_ROOT / "config" / "avatar.jpg"),
+    str(_PROJECT_ROOT / "config" / "avatar.png"),
     str(_PROJECT_ROOT / "config" / "zara-icon.png"),
 ]
 APP_ICON_CANDIDATES = [
@@ -412,7 +417,7 @@ class ZaraPanel(QtWidgets.QWidget):
 
         # 1. Cabecera (Título y botón cerrar)
         header = QtWidgets.QHBoxLayout()
-        title = QtWidgets.QLabel("ZARA // PANEL TÁCTICO")
+        title = QtWidgets.QLabel(f"ZARA // PANEL TÁCTICO  ·  v{VERSION_FULL}")
         title.setObjectName("title")
         header.addWidget(title)
         header.addStretch()
@@ -723,12 +728,15 @@ class ZaraHUD(QtWidgets.QWidget):
         self._timer.start(28)  # ~36 fps
 
     def _init_window(self) -> None:
-        self.setWindowTitle("ZARA")
+        self.setWindowTitle(f"ZARA v{VERSION_FULL}")
         for candidate in APP_ICON_CANDIDATES:
             if Path(candidate).is_file():
                 self.setWindowIcon(QtGui.QIcon(candidate))
                 break
-        self.setFixedSize(self._d, self._d)
+        # La ventana es MAYOR que el núcleo: el halo y el anillo segmentado se pintan
+        # fuera de él y, con ventana = diámetro, se recortaban por los cuatro lados.
+        self._side, self._r_core, self._r_segments = orb_layout(self._d)
+        self.setFixedSize(self._side, self._side)
         self.setWindowFlags(
             QtCore.Qt.FramelessWindowHint
             | QtCore.Qt.WindowStaysOnTopHint
@@ -740,7 +748,7 @@ class ZaraHUD(QtWidgets.QWidget):
         screen = QtGui.QGuiApplication.primaryScreen()
         if screen:
             geom = screen.availableGeometry()
-            self.move(geom.right() - self._d - 24, geom.top() + 24)
+            self.move(geom.right() - self._side - 24, geom.top() + 24)
 
     def _init_panel(self) -> None:
         self.panel = ZaraPanel()
@@ -870,7 +878,7 @@ class ZaraHUD(QtWidgets.QWidget):
         w = self.width()
         cx, cy = w / 2.0, w / 2.0
         c = self._ring_color()
-        r_core = w * 0.30
+        r_core = self._r_core
 
         # 1) Halo exterior difuso (varias capas)
         pulse = 1.0 + 0.16 * self._level
@@ -886,7 +894,7 @@ class ZaraHUD(QtWidgets.QWidget):
         p.save()
         p.translate(cx, cy)
         p.rotate((self._phase * 18) % 360)
-        seg_r = r_core * 1.55
+        seg_r = self._r_segments
         seg = QtGui.QColor(c)
         seg.setAlpha(150)
         p.setPen(QtGui.QPen(seg, 2))
@@ -953,7 +961,7 @@ class ZaraHUD(QtWidgets.QWidget):
         if self.panel.isVisible():
             p.setPen(QtCore.Qt.NoPen)
             p.setBrush(QtGui.QColor(c))
-            p.drawEllipse(QtCore.QPointF(cx, w - 6), 3.0, 3.0)
+            p.drawEllipse(QtCore.QPointF(cx, cy + self._r_segments + SEGMENT_DOT_GAP), 3.0, 3.0)
 
     # --- arrastre, clic y panel ---
     def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:  # noqa: N802

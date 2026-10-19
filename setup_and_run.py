@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Script de Inicialización, Diagnóstico y Despliegue de ZARA v2.0.
+"""Script de Inicialización, Diagnóstico y Despliegue de ZARA.
 
 Automatiza la comprobación de entorno, dependencias de audio/IA, configuración
 de plataforma (Windows 10/11 y Linux Kali/Fedora) y el lanzamiento del asistente.
@@ -7,6 +7,7 @@ de plataforma (Windows 10/11 y Linux Kali/Fedora) y el lanzamiento del asistente
 
 from __future__ import annotations
 import argparse
+import re
 import importlib
 import os
 from pathlib import Path
@@ -31,10 +32,22 @@ if sys.stdout and hasattr(sys.stdout, "reconfigure"):
         pass
 
 
+def read_version() -> str:
+    """Lee VERSION/RELEASE_STAGE de config.py sin importarlo (puede correr antes de instalar deps)."""
+    try:
+        text = (PROJECT_DIR / "config.py").read_text(encoding="utf-8")
+        version = re.search(r'^VERSION\s*=\s*"([^"]+)"', text, re.M).group(1)
+        stage = re.search(r'^RELEASE_STAGE\s*=\s*"([^"]+)"', text, re.M).group(1)
+        return f"{version}-{stage}"
+    except Exception:
+        return "desconocida"
+
+
 def print_banner() -> None:
-    banner = """
+    banner = f"""
  ============================================================
-    Z A R A   v 2 . 0  --  T A C T I C A L   A I   C O R E
+    Z A R A  --  T A C T I C A L   A I   C O R E
+    Versión {read_version()} (pre-lanzamiento)
     Protocol J.A.R.V.I.S. | Autonomous Assistant for Señor VK
  ============================================================
 """
@@ -45,7 +58,7 @@ def print_banner() -> None:
 def check_python_version() -> bool:
     print(f"[*] Comprobando versión de Python: {sys.version.split()[0]}... ", end="")
     if sys.version_info < (3, 10):
-        print("ERROR: ZARA v2.0 requiere Python 3.10 o superior.")
+        print("ERROR: ZARA requiere Python 3.10 o superior.")
         return False
     print("OK")
     return True
@@ -162,7 +175,7 @@ def check_ollama_service() -> None:
 def run_diagnostics() -> bool:
     """Ejecuta una batería rápida de pruebas sobre los subsistemas."""
     print("\n" + "=" * 60)
-    print("EJECUTANDO DIAGNÓSTICO INTEGRAL DE SUBSISTEMAS ZARA v2.0")
+    print("EJECUTANDO DIAGNÓSTICO INTEGRAL DE SUBSISTEMAS ZARA")
     print("=" * 60)
 
     # 1. Enrutador Cerebral
@@ -202,7 +215,7 @@ def run_diagnostics() -> bool:
     # 4. Motor de Audio / Miniaudio
     print("[4/5] Probando Decodificación en Memoria (miniaudio)... ", end="")
     try:
-        import miniaudio
+        import miniaudio  # noqa: F401  (el import ES la prueba)
         print("OK (miniaudio listo para streaming en RAM sin disco)")
     except Exception as exc:
         print(f"FALLO: {exc}")
@@ -228,7 +241,7 @@ def run_diagnostics() -> bool:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="ZARA v2.0 Setup and Runner")
+    parser = argparse.ArgumentParser(description="ZARA Setup and Runner")
     parser.add_argument("--check", action="store_true", help="Ejecutar diagnóstico completo sin iniciar el bucle continuo.")
     parser.add_argument("--install", action="store_true", help="Instalar dependencias faltantes automáticamente vía pip.")
     parser.add_argument("--cli", action="store_true", help="Iniciar ZARA en modo terminal (sin HUD de PySide6).")
@@ -254,8 +267,8 @@ def main() -> None:
         success = run_diagnostics()
         sys.exit(0 if success else 1)
 
-    # Iniciar ZARA v2.0
-    print("\n[*] Iniciando ZARA v2.0...")
+    # Iniciar ZARA
+    print("\n[*] Iniciando ZARA...")
     main_py = PROJECT_DIR / "main.py"
     cmd = [sys.executable, str(main_py)]
     if args.cli:

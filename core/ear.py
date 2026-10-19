@@ -1,4 +1,4 @@
-"""Subsistema de Audio y Oído (ZARA v2.0).
+"""Subsistema de Audio y Oído (ZARA).
 
 Captura continua a 16 kHz mono con sounddevice, detección neuronal de voz
 con Silero VAD v5 (cero cortes en pausas de hasta 700 ms), barge-in a los 250 ms
@@ -39,10 +39,13 @@ from config import (
     VAD_SPEECH_PAD_MS,
     VAD_THRESHOLD,
     WHISPER_BEAM_SIZE,
+    WHISPER_CPU_THREADS,
     WHISPER_INITIAL_PROMPT,
     WHISPER_LANGUAGE,
     WHISPER_MODEL_FALLBACK,
     WHISPER_MODEL_PRIMARY,
+    resolve_beam_size,
+    resolve_whisper_model,
 )
 
 log = logging.getLogger("zara.ear")
@@ -218,7 +221,17 @@ class ContinuousEar:
             compute_type = "float16"
 
         log.info("Inicializando STT faster-whisper en dispositivo: %s (%s)", device, compute_type)
-        model_candidates = [WHISPER_MODEL_PRIMARY, WHISPER_MODEL_FALLBACK]
+        self._device = device
+        chosen = resolve_whisper_model(WHISPER_MODEL_PRIMARY, device)
+        if WHISPER_MODEL_PRIMARY not in ("auto", chosen):
+            log.warning(
+                "ZARA_WHISPER_MODEL=%s es demasiado pesado para %s: usando '%s'. "
+                "Para forzarlo, define ZARA_WHISPER_FORCE=1.", WHISPER_MODEL_PRIMARY, device.upper(), chosen,
+            )
+        model_candidates = [chosen] + ([WHISPER_MODEL_FALLBACK] if chosen != WHISPER_MODEL_FALLBACK else [])
+        # Hilos de CPU: faster-whisper usa 4 por defecto; aprovechar todos los núcleos
+        # reduce la transcripción de forma casi lineal.
+        extra = {"cpu_threads": WHISPER_CPU_THREADS} if device == "cpu" else {}
 
         for cand in model_candidates:
             try:
@@ -228,8 +241,10 @@ class ContinuousEar:
                     device=device,
                     compute_type=compute_type,
                     download_root=str(MODELS_DIR / "whisper"),
+                    **extra,
                 )
                 log.info("Modelo Whisper cargado exitosamente: %s", cand)
+                self._warm_up_whisper()
                 return
             except Exception as exc:
                 log.warning("No se pudo cargar %s en %s (%s): %s", cand, device, compute_type, exc)
@@ -240,8 +255,23 @@ class ContinuousEar:
             "small",
             device="cpu",
             compute_type="int8",
+            cpu_threads=WHISPER_CPU_THREADS,
             download_root=str(MODELS_DIR / "whisper"),
         )
+        self._warm_up_whisper()
+
+    def _warm_up_whisper(self) -> None:
+        """Una transcripción de prueba al arrancar: la primera llamada real carga kernels
+        y reserva memoria, y sin esto se pagaba en la primera orden del Señor VK."""
+        try:
+            t0 = time.monotonic()
+            noise = (np.random.default_rng(0).standard_normal(SAMPLE_RATE) * 0.01).astype(np.float32)
+            list(self._whisper_model.transcribe(
+                noise, language=WHISPER_LANGUAGE, beam_size=1, without_timestamps=True, vad_filter=False,
+            )[0])
+            log.info("Whisper precalentado en %.2f s.", time.monotonic() - t0)
+        except Exception as exc:
+            log.debug("Precalentamiento de Whisper omitido: %s", exc)
 
     def start(self) -> None:
         """Inicia los hilos continuos de captura y detección de voz."""
@@ -470,12 +500,14 @@ class ContinuousEar:
             return ""
 
         norm_audio = normalize_audio(audio)
+        t0 = time.monotonic()
+        beam = resolve_beam_size(WHISPER_BEAM_SIZE, getattr(self, "_device", "cpu"))
         try:
             segments, _info = self._whisper_model.transcribe(
                 norm_audio,
                 language=WHISPER_LANGUAGE,
-                beam_size=WHISPER_BEAM_SIZE,
-                best_of=WHISPER_BEAM_SIZE,
+                beam_size=beam,
+                best_of=beam,
                 temperature=0.0,
                 vad_filter=False,  # Silero VAD ya segmentó con precisión milimétrica
                 no_speech_threshold=0.6,
@@ -487,6 +519,10 @@ class ContinuousEar:
         except Exception as exc:
             log.warning("Fallo en la transcripción Whisper: %s", exc)
             return ""
+        elapsed = time.monotonic() - t0
+        audio_s = audio.size / SAMPLE_RATE
+        # Diagnóstico de latencia: si x_tiempo_real > 1, el modelo es demasiado grande para este equipo.
+        log.info("[LATENCIA] STT %.2f s para %.1f s de audio (x%.2f tiempo real)", elapsed, audio_s, elapsed / max(audio_s, 0.01))
 
         return clean_transcript(raw_text)
 

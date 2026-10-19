@@ -1,4 +1,4 @@
-"""Cerebro Híbrido y Enrutador Inteligente (ZARA v2.0).
+"""Cerebro Híbrido y Enrutador Inteligente (ZARA).
 
 Enrutador ultrarrápido (< 10 ms), streaming de tokens en tiempo real,
 soporte nativo de Tool Calling (Ollama + Gemini + Claude) y bucle ReAct
@@ -424,6 +424,9 @@ class OllamaProvider:
                 "model": self.model,
                 "messages": _build_messages(),
                 "stream": True,
+                # Mantener el modelo en memoria: por defecto Ollama lo descarga a los 5 min y
+                # la siguiente orden paga una carga en frío de varios segundos.
+                "keep_alive": "30m",
                 "options": {"temperature": 0.15},
             }
             if tools and native_tools_flag:
@@ -587,10 +590,16 @@ class GeminiProvider:
                 ]
                 gemini_tools = [types.Tool(function_declarations=function_declarations)]
 
+            cfg_kwargs: Dict[str, Any] = {}
+            if self.model.startswith("gemini-2.5-flash"):
+                # 2.5 Flash "piensa" por defecto y añade segundos antes del primer token;
+                # para conversación por voz es mejor responder ya (presupuesto 0 = sin pensar).
+                cfg_kwargs["thinking_config"] = types.ThinkingConfig(thinking_budget=0)
             cfg = types.GenerateContentConfig(
                 system_instruction=effective_prompt,
                 temperature=0.3,
                 tools=gemini_tools,
+                **cfg_kwargs,
             )
 
             response = self._client.models.generate_content_stream(

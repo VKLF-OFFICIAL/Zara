@@ -1,1 +1,1 @@
-"""ZARA v2.0 - Core Engine Package."""
+"""ZARA - Core Engine Package."""
