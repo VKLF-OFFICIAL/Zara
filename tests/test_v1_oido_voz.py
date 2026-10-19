@@ -3,7 +3,7 @@
 Cubren: detección de GPU para Whisper (MUL-1), arranque sin red ni modelo (V1_-5),
 importación sin PortAudio (MUL-2), reintentos y remuestreo del micrófono (AUD-7/V1_-9),
 start()/stop() repetibles del oído, barge-in corto (AUD-14), cola de audio llena
-(AUD-6) y el trozo de frase a medias tras un barge-in (AUD-8).
+(AUD-6) y los flujos de tokens tras un barge-in o una confirmación (AUD-8).
 
 Todo el hardware (sounddevice, Whisper, CUDA) se sustituye por dobles de prueba, así
 que las ramas de Windows se ejercitan simulando la plataforma con monkeypatch.
@@ -16,6 +16,7 @@ import importlib.util
 import sys
 import threading
 import time
+import types
 from pathlib import Path
 
 import numpy as np
@@ -111,7 +112,7 @@ def test_detect_device_falls_back_to_cpu_without_cuda_libraries(monkeypatch):
 def test_cuda_library_names_per_platform_and_version(monkeypatch):
     import ctranslate2
 
-    monkeypatch.setattr(ctranslate2, "__version__", "4.8.3")
+    monkeypatch.setattr(ctranslate2, "__version__", "4.6.2")  # 4.5 a 4.6.2: cuDNN 9 obligatorio
     monkeypatch.setattr(sys, "platform", "win32")
     win = ear_module._cuda_runtime_libraries()
     assert "cublas64_12.dll" in win and "cudnn64_9.dll" in win
@@ -123,6 +124,24 @@ def test_cuda_library_names_per_platform_and_version(monkeypatch):
 
     monkeypatch.setattr(ctranslate2, "__version__", "4.4.0")  # ctranslate2 < 4.5 usa cuDNN 8
     assert "libcudnn.so.8" in ear_module._cuda_runtime_libraries()
+
+
+@pytest.mark.parametrize("version", ["4.6.3", "4.7.0", "4.8.3", "5.0.0.dev1"])
+def test_cudnn_not_required_since_ctranslate2_4_6_3(monkeypatch, version):
+    """[MUL-1, ronda 2] Desde ctranslate2 4.6.3 cuDNN es opcional (Conv1d CUDA pura):
+    exigirlo mandaba a CPU a quien solo tiene cuBLAS. Windows simulado y Linux."""
+    import ctranslate2
+
+    monkeypatch.setattr(ctranslate2, "__version__", version)
+    monkeypatch.setattr(sys, "platform", "win32")
+    assert ear_module._cuda_runtime_libraries() == ["cublas64_12.dll"]
+    monkeypatch.setattr(sys, "platform", "linux")
+    assert ear_module._cuda_runtime_libraries() == ["libcublas.so.12"]
+
+    # Con cuBLAS pero sin cuDNN se usa la GPU.
+    monkeypatch.setattr(ctranslate2, "get_cuda_device_count", lambda: 1)
+    monkeypatch.setattr(ear_module, "_can_load_library", lambda name: "cudnn" not in name)
+    assert ear_module._detect_whisper_device() == ("cuda", "float16")
 
 
 def test_can_load_library_searches_windows_path(monkeypatch):
@@ -476,6 +495,43 @@ def test_capture_uses_native_rate_when_16k_is_not_supported(monkeypatch, fast_mi
         worker.join(timeout=2.0)
 
 
+def test_portaudio_reinit_is_rate_limited_without_microphone(monkeypatch):
+    """[AUD-7, ronda 2, regresión] Sin micrófono por defecto (Windows sin dispositivo de
+    grabación), PortAudio se reinicializaba en cada reintento, cada 10 s para siempre.
+    Ahora como mucho una vez cada _PA_REFRESH_INTERVAL_S, y nunca con Zara hablando."""
+    calls = {"terminate": 0, "initialize": 0}
+
+    class _NoMicSD(_FakeSoundDevice):
+        def query_devices(self, kind=None):
+            raise self.PortAudioError("Error querying device -1")
+
+        def _terminate(self):
+            calls["terminate"] += 1
+
+        def _initialize(self):
+            calls["initialize"] += 1
+
+    monkeypatch.setattr(sys, "platform", "win32")
+    clock = {"now": 1000.0}
+    monkeypatch.setattr(ear_module, "time", types.SimpleNamespace(monotonic=lambda: clock["now"]))
+    speaking = {"value": True}
+    ear = _bare_ear(monkeypatch, is_speaking_fn=lambda: speaking["value"])
+    sd = _NoMicSD()
+
+    ear._refresh_audio_devices(sd)  # Zara hablando: no se toca PortAudio
+    assert calls["terminate"] == 0
+    speaking["value"] = False
+    ear._refresh_audio_devices(sd)
+    assert calls == {"terminate": 1, "initialize": 1}
+    for _ in range(5):  # reintentos cada 10 s
+        clock["now"] += 10.0
+        ear._refresh_audio_devices(sd)
+    assert calls["terminate"] == 1, "PortAudio se reinicializó en cada reintento"
+    clock["now"] += ear_module._PA_REFRESH_INTERVAL_S
+    ear._refresh_audio_devices(sd)
+    assert calls["terminate"] == 2
+
+
 @pytest.mark.parametrize("src_rate", [48000, 44100, 22050])
 def test_stream_resampler_keeps_duration_and_pitch(src_rate):
     """[V1_-9] El remuestreo en streaming conserva duración y frecuencia de la voz."""
@@ -618,6 +674,40 @@ def test_short_bargein_closes_utterance_after_silence(monkeypatch):
     assert ear._is_speech_active is False
 
 
+def test_iterator_reset_when_zara_speaks_again_before_bargein_end(monkeypatch):
+    """[AUD-14, ronda 2, regresión] Tras confirmar el barge-in el VADIterator queda con
+    triggered=True. Si Zara vuelve a hablar antes del 'end', la locución se descarta pero
+    el iterador seguía «dentro» de una locución: no emitía 'start' y la siguiente orden
+    del Señor VK se perdía."""
+    speaking = {"value": True}
+
+    def _on_barge_in():
+        speaking["value"] = False
+
+    ear = _ear_with_fake_vad(monkeypatch, barge_in_callback=_on_barge_in, is_speaking_fn=lambda: speaking["value"])
+    monkeypatch.setattr(ear_module, "VAD_BARGE_IN_GRACE_MS", 0)
+    monkeypatch.setattr(ear_module, "VAD_BARGE_IN_MIN_RMS", 0.02)
+
+    loud = np.full(FRAME_SIZE, 0.3, dtype=np.float32)
+    ear._vad_model_bargein.prob = 0.95
+    ear._process_frame(loud)
+    ear._process_frame(loud)
+    assert ear._is_speech_active and ear._vad_iterator.triggered
+
+    # Zara vuelve a hablar (p. ej. «Sin confirmación...») antes del 'end'.
+    speaking["value"] = True
+    ear._vad_model_bargein.prob = 0.0
+    ear._process_frame(np.zeros(FRAME_SIZE, dtype=np.float32))
+    assert ear._is_speech_active is False
+    assert ear._vad_iterator.triggered is False, "el VADIterator quedó dentro de una locución"
+
+    # Zara calla y el Señor VK da una orden: debe empezar una locución nueva.
+    speaking["value"] = False
+    ear._vad_model.prob = 0.95
+    ear._process_frame(loud)
+    assert ear._is_speech_active, "no se detectó el inicio de la orden siguiente"
+
+
 # =============================================================================
 # Voz: AUD-6 (cola llena) y AUD-8 (frase a medias tras barge-in)
 # =============================================================================
@@ -699,10 +789,11 @@ def test_bargein_does_not_flush_the_half_sentence(monkeypatch):
         voice.shutdown()
 
 
-def test_bargein_skips_rest_of_cut_sentence_but_speaks_new_ones(monkeypatch):
-    """[AUD-8] Si tras el stop() aún llegan tokens del resto de la frase cortada, no
-    suenan; si el turno sigue de verdad (respuesta a una confirmación dicha encima del
-    aviso), las frases nuevas siguientes sí se dicen."""
+def test_bargein_cancels_stream_even_if_tokens_arrive_before_brain_cancel(monkeypatch):
+    """[AUD-8, ronda 2, regresión] main llama a voice.stop() antes que a
+    brain.cancel_current_turn(): los tokens que llegan entre ambos (fin de la frase
+    cortada y frases nuevas enteras) sonaban porque la heurística solo saltaba hasta el
+    primer punto. Con stop() (cancel_streams=True) el flujo queda cancelado del todo."""
     played: list = []
     _install_fake_playback(monkeypatch, play_duration=0.01, played=played)
     texts = _record_synthesis(monkeypatch)
@@ -711,15 +802,43 @@ def test_bargein_skips_rest_of_cut_sentence_but_speaks_new_ones(monkeypatch):
     def tokens():
         yield "Primera frase completa de la respuesta de Zara. "
         yield "Segunda frase que se queda a med"
-        voice.stop()
+        voice.stop()  # barge-in; el cerebro aún no ha cancelado el turno
         yield "ias y que no debe sonar nunca. "
-        yield "Tercera frase nueva tras la confirmación del Señor VK."
+        yield "Tercera frase entera que tampoco debe sonar tras el barge-in. "
+        yield "Y un final sin punto"
 
     try:
         voice.feed_token_stream(tokens())
-        assert _wait_until(lambda: any("Tercera" in t for t in texts))
-        time.sleep(0.1)
-        assert not any("Segunda" in t or "no debe sonar" in t for t in texts), texts
+        time.sleep(0.3)
+        assert not any(w in t for t in texts for w in ("Segunda", "no debe sonar", "Tercera", "final")), texts
+        with voice._lock:
+            assert voice._pending_count == 0
+            assert voice._feeds == set()  # el flujo terminado ya no se sigue
+    finally:
+        voice.shutdown()
+
+
+def test_stop_keeping_streams_speaks_rest_of_turn_after_confirmation(monkeypatch):
+    """[AUD-8, ronda 2, regresión] El Señor VK contesta encima del aviso de confirmación:
+    solo se corta el audio (stop(cancel_streams=False)) y el turno sigue. Antes la
+    heuristica se comía la primera frase nueva si lo pendiente no acababa en punto."""
+    played: list = []
+    _install_fake_playback(monkeypatch, play_duration=0.01, played=played)
+    texts = _record_synthesis(monkeypatch)
+    voice = VoiceSynthesizer()
+
+    def tokens():
+        yield "Voy a borrar el archivo que me ha indicado, Señor VK"
+        voice.say("Señor VK, necesito su confirmación para borrar el archivo.")
+        voice.stop(cancel_streams=False)  # la respuesta se dijo encima del aviso
+        yield ". Hecho, el archivo se ha borrado correctamente. "
+        yield "Quedan tres archivos más en la carpeta de descargas."
+
+    try:
+        voice.feed_token_stream(tokens())
+        assert _wait_until(lambda: any("Quedan tres" in t for t in texts))
+        assert any("Hecho" in t for t in texts), texts
+        assert any("Voy a borrar" in t for t in texts), texts  # no se había dicho aún
     finally:
         voice.shutdown()
 

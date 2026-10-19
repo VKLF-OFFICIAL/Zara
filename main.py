@@ -476,9 +476,11 @@ class ZaraController(QtCore.QObject):
         """Interrupción inmediata: el Señor VK ha hablado sobre Zara (o pulsó 'Parar')."""
         if self.live_session.is_running():
             self.live_session.interrupt()
-        self.voice.stop()
-        if self._confirm_queue is not None:
-            # Hablar mientras Zara pide confirmación es contestarle, no cancelar el turno.
+        confirming = self._confirm_queue is not None
+        # [FIX AUD-8] Hablar mientras Zara pide confirmación es contestarle: solo se corta el
+        # audio y el resto del turno sigue sonando; si no, se cancela también el flujo de tokens.
+        self.voice.stop(cancel_streams=not confirming)
+        if confirming:
             return
         # [FIX AUDITORÍA] Detener AUDIO y cancelar el turno del cerebro
         self._next_turn_id()  # [FIX AUD-10] los turnos que esperaban el lock ya no se ejecutan

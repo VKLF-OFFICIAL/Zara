@@ -46,7 +46,7 @@ class FakeEar:
         self.start_calls += 1
         self._stop = threading.Event()
 
-    def stop(self):
+    def stop(self, cancel_streams=True):
         self.stop_calls += 1
         self._stop.set()
 
@@ -90,7 +90,7 @@ class FakeLive:
         self.start_calls += 1
         self.running = True
 
-    def stop(self):
+    def stop(self, cancel_streams=True):
         self.stop_calls += 1
         self.running = False
 
@@ -112,11 +112,13 @@ class FakeVoice:
         self.said: list[str] = []
         self.speaking = False
         self.shutdown_calls = 0
+        self.stops: list[bool] = []
 
     def say(self, text):
         self.said.append(text)
 
-    def stop(self):
+    def stop(self, cancel_streams=True):
+        self.stops.append(cancel_streams)
         self.speaking = False
 
     def is_speaking(self):
@@ -311,6 +313,17 @@ def test_confirmacion_por_voz_mientras_zara_habla_se_descarta(make_controller):
     ctrl.voice.speaking = False
     ctrl._handle_utterance("Sí, adelante")
     assert answers.get_nowait() is True
+
+
+def test_barge_in_durante_confirmacion_no_cancela_el_resto_del_turno(make_controller):
+    """[AUD-8] Contestar a la confirmación corta el audio, pero el turno debe seguir sonando."""
+    ctrl = make_controller()
+    ctrl._confirm_queue = queue.Queue(maxsize=1)
+    ctrl._on_barge_in()
+    assert ctrl.voice.stops == [False]
+    ctrl._confirm_queue = None
+    ctrl._on_barge_in()
+    assert ctrl.voice.stops == [False, True]
 
 
 def test_confirmacion_escrita_no_depende_de_la_voz(make_controller):

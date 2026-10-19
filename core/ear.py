@@ -64,6 +64,8 @@ log = logging.getLogger("zara.ear")
 _MIC_RETRY_MIN_S = 1.0
 _MIC_RETRY_MAX_S = 10.0
 _MIC_STALL_S = 4.0
+# [FIX AUD-7] Mínimo entre reinicializaciones de PortAudio buscando un micrófono nuevo.
+_PA_REFRESH_INTERVAL_S = 60.0
 
 
 class _AudioBackendError(RuntimeError):
@@ -182,13 +184,19 @@ def _cuda_runtime_libraries() -> list[str]:
     """Librerías de CUDA que ctranslate2 carga al transcribir en GPU, según su versión.
 
     ctranslate2 4.x usa CUDA 12; desde la 4.5, cuDNN 9 (antes, cuDNN 8).
+    [FIX MUL-1] Desde la 4.6.3 la Conv1d de Whisper es CUDA pura y cuDNN es opcional
+    (CHANGELOG de ctranslate2 v4.6.3): exigirlo dejaba en CPU, sin motivo, a quien solo
+    tiene cuBLAS (p. ej. pip install nvidia-cublas-cu12 sin nvidia-cudnn-cu12).
     """
     try:
         import ctranslate2
-        major, minor = (int(p) for p in ctranslate2.__version__.split(".")[:2])
+        parts = [int(re.match(r"\d*", p).group() or 0) for p in ctranslate2.__version__.split(".")[:3]]
+        major, minor, patch = (parts + [0, 0, 0])[:3]
     except Exception:
-        major, minor = 4, 5
+        major, minor, patch = 4, 5, 0
     cuda = "12" if major >= 4 else "11"
+    if (major, minor, patch) >= (4, 6, 3):
+        return [f"cublas64_{cuda}.dll"] if sys.platform == "win32" else [f"libcublas.so.{cuda}"]
     if (major, minor) >= (4, 5):
         if sys.platform == "win32":
             return [f"cublas64_{cuda}.dll", "cudnn64_9.dll", "cudnn_ops64_9.dll", "cudnn_cnn64_9.dll"]
@@ -339,6 +347,7 @@ class ContinuousEar:
         self.mic_error = ""  # último problema del micrófono ("" si funciona)
         self.stt_error = ""  # motivo por el que no hay reconocimiento de voz ("" si lo hay)
         self._mic_opened = False
+        self._last_pa_refresh: Optional[float] = None  # [FIX AUD-7] ver _refresh_audio_devices
         self._device = "cpu"
 
         self._muted = threading.Event()
@@ -667,15 +676,25 @@ class ContinuousEar:
         """PortAudio solo enumera los dispositivos al inicializarse: si Zara arrancó sin
         micrófono, uno conectado después no aparece (sobre todo en Windows) hasta
         reinicializarlo. Solo se hace si no hay ningún micrófono visible y Zara no está
-        hablando, porque reinicializar PortAudio corta cualquier reproducción en curso."""
+        hablando, porque reinicializar PortAudio corta cualquier reproducción en curso.
+
+        [FIX AUD-7] Como mucho una vez cada _PA_REFRESH_INTERVAL_S: antes se hacía en cada
+        reintento (cada 10 s, indefinidamente, en un PC sin dispositivo de grabación), y
+        cada reinicialización vuelve a enumerar todos los dispositivos (lento en Windows) y
+        puede cortar una voz que empiece justo entonces."""
         try:
             sd.query_devices(kind="input")
             return  # hay micrófono por defecto: no hace falta
         except Exception:
             pass
+        now = time.monotonic()
+        last = self._last_pa_refresh
+        if last is not None and now - last < _PA_REFRESH_INTERVAL_S:
+            return
         try:
             if self.is_speaking_fn():
                 return
+            self._last_pa_refresh = now
             sd.stop()  # cierra el stream de sd.play() antes de terminar PortAudio
             try:
                 sd._terminate()
@@ -862,6 +881,11 @@ class ContinuousEar:
                 self._speech_frames.clear()
                 self._pre_roll_buffer.clear()
                 self._is_speech_active = False
+                # [FIX AUD-14] Si el VADIterator quedó dentro de una locución (barge-in
+                # confirmado y Zara vuelve a hablar antes del "end"), hay que reiniciarlo:
+                # con triggered=True no emite "start" y la siguiente orden se perdería.
+                if getattr(self._vad_iterator, "triggered", False):
+                    self._vad_iterator.reset_states()
             return
         else:
             self._was_speaking = False

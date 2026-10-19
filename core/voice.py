@@ -162,48 +162,47 @@ class _TokenFeed:
     Antes, tras un stop() a mitad de respuesta, el bucle de tokens terminaba con
     normalidad (el cerebro cancela el turno) y `chunker.flush()` encolaba el trozo de
     frase pendiente con la generación NUEVA: Zara soltaba otra media frase justo después
-    de que el Señor VK la mandara callar. Ahora:
-      - si hubo stop(), lo que quedaba en el chunker pertenece a lo interrumpido y se
-        descarta; si era una frase a medias, los tokens siguientes se saltan hasta su
-        final (el «resto» de esa frase tampoco suena);
-      - el flush final solo se hace si no ha habido stop() desde el último token;
-      - si el turno sigue de verdad (p. ej. la respuesta a una confirmación se dijo encima
-        del aviso de Zara y la herramienta continúa), las frases NUEVAS sí se dicen.
+    de que el Señor VK la mandara callar.
+
+    [FIX AUD-8, ronda 2] Ya no se adivina por heurística si el turno se canceló o sigue
+    (fallaba en los dos sentidos: los tokens que llegaban entre voice.stop() y
+    brain.cancel_current_turn() sonaban, y tras una confirmación se comía la primera
+    frase nueva). Quien llama lo dice explícitamente en stop():
+      - stop() / stop(cancel_streams=True): el flujo queda CANCELADO; todo lo que llegue
+        después (y lo pendiente en el chunker) se descarta, sin flush final;
+      - stop(cancel_streams=False): solo se corta el audio; el flujo sigue vigente con
+        la generación nueva y conserva lo pendiente (aún no se había dicho).
     No se deja de consumir el generador: el cerebro termina o cancela su turno él mismo.
     """
 
     def __init__(self, synth: "VoiceSynthesizer"):
         self._synth = synth
         self._chunker = _new_chunker()
-        self._gen = synth._current_generation()
-        self._skipping = False
-
-    def _sync_generation(self) -> None:
-        current = self._synth._current_generation()
-        if current == self._gen:
-            return
-        pending = self._chunker.pending().rstrip()
-        cut_mid_sentence = bool(pending) and pending[-1] not in ".!?:;"
-        self._chunker = _new_chunker()
-        self._gen = current
-        self._skipping = self._skipping or cut_mid_sentence
+        # `gen` y `cancelled` solo se modifican bajo synth._lock (en stop()).
+        self.cancelled = False
+        with synth._lock:
+            self.gen = synth._generation
+            synth._feeds.add(self)
 
     def push(self, token: str) -> None:
-        self._sync_generation()
-        if self._skipping:
-            match = SentenceChunker.DELIMITERS.search(token)
-            if not match:
-                return
-            token = token[match.end():]
-            self._skipping = False
+        if self.cancelled:
+            return
         for sentence in self._chunker.push(token):
-            self._synth._enqueue_sentence(sentence, self._gen)
+            self._synth._enqueue_from_feed(self, sentence)
 
     def finish(self) -> None:
-        if self._skipping or self._synth._current_generation() != self._gen:
-            return  # stop() después del último token: lo pendiente era de lo interrumpido
-        for sentence in self._chunker.flush():
-            self._synth._enqueue_sentence(sentence, self._gen)
+        try:
+            if self.cancelled:
+                return  # lo pendiente pertenecía a lo interrumpido
+            for sentence in self._chunker.flush():
+                self._synth._enqueue_from_feed(self, sentence)
+        finally:
+            self.close()
+
+    def close(self) -> None:
+        """Deja de seguir este flujo (stop() ya no lo toca)."""
+        with self._synth._lock:
+            self._synth._feeds.discard(self)
 
 
 class KokoroEngine:
@@ -332,6 +331,8 @@ class VoiceSynthesizer:
         # hilo de síntesis descarta cualquier audio "en vuelo" de la tanda
         # anterior en vez de dejarlo resucitar en la cola de reproducción.
         self._generation = 0
+        # [FIX AUD-8] Flujos de tokens activos (feed_token_stream): stop() los cancela.
+        self._feeds: set = set()
 
         self._synthesis_thread = threading.Thread(target=self._synthesis_worker, daemon=True)
         self._playback_thread = threading.Thread(target=self._playback_worker, daemon=True)
@@ -350,8 +351,15 @@ class VoiceSynthesizer:
         with self._lock:
             return self._generation
 
-    def stop(self) -> None:
+    def stop(self, cancel_streams: bool = True) -> None:
         """Interrupción inmediata (Barge-in): detiene el audio y vacía las colas.
+
+        [FIX AUD-8] `cancel_streams` dice explícitamente qué pasa con los flujos de
+        tokens en curso (feed_token_stream): True (por defecto) los cancela, porque el
+        turno se interrumpe; False solo corta el audio y deja que el turno siga hablando
+        (p. ej. el Señor VK contesta encima del aviso de confirmación y la herramienta
+        continúa). Se decide bajo el mismo lock que el cambio de generación, así que
+        ningún token que llegue después puede colarse con la generación nueva.
 
         [BUG-7 FIX] Actualizar _is_speaking=False ANTES de llamar sd.stop() y
         vaciar las colas, para que el worker no emita on_state_change(False)
@@ -372,6 +380,11 @@ class VoiceSynthesizer:
                         pass
             self._pending_count = 0
             self._generation += 1
+            for feed in self._feeds:
+                if cancel_streams:
+                    feed.cancelled = True
+                else:
+                    feed.gen = self._generation
             # Vaciar colas de frases y audio pendientes
             for q in (self._tts_queue, self._audio_queue):
                 while True:
@@ -398,20 +411,36 @@ class VoiceSynthesizer:
     def feed_token_stream(self, token_generator: Generator[str, None, None]) -> None:
         """Procesa un generador síncrono de tokens del LLM usando SentenceChunker."""
         feed = _TokenFeed(self)
-        for token in token_generator:
-            if self._stop_event.is_set():
-                break
-            feed.push(token)
+        try:
+            for token in token_generator:
+                if self._stop_event.is_set():
+                    break
+                feed.push(token)
+        except BaseException:
+            feed.close()  # el turno falló: no se dice el trozo pendiente
+            raise
         feed.finish()
 
     async def feed_async_token_stream(self, async_generator: AsyncGenerator[str, None]) -> None:
         """Procesa un generador asíncrono de tokens del LLM usando SentenceChunker."""
         feed = _TokenFeed(self)
-        async for token in async_generator:
-            if self._stop_event.is_set():
-                break
-            feed.push(token)
+        try:
+            async for token in async_generator:
+                if self._stop_event.is_set():
+                    break
+                feed.push(token)
+        except BaseException:
+            feed.close()  # el turno falló: no se dice el trozo pendiente
+            raise
         feed.finish()
+
+    def _enqueue_from_feed(self, feed: _TokenFeed, sentence: str) -> bool:
+        """[FIX AUD-8] Encola una frase de un flujo de tokens si no se ha cancelado.
+        Se lee el estado del flujo bajo el lock de stop(): no hay ventana de carrera."""
+        with self._lock:
+            if feed.cancelled:
+                return False
+            return self._enqueue_sentence(sentence, feed.gen)
 
     def _enqueue_sentence(self, sentence: str, gen: Optional[int] = None) -> bool:
         """Encola una frase etiquetada con su generación (por defecto, la actual).
