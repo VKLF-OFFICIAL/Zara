@@ -1,0 +1,19 @@
+name: CI
+on:
+  push:
+  pull_request:
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Dependencias ligeras (sin audio/GPU)
+        run: pip install pytest ruff psutil httpx ddgs numpy pillow
+      - name: Lint (errores graves)
+        run: ruff check --select E9,F63,F7,F82,F401 core ui main.py config.py
+      - name: Tests
+        run: python -m pytest tests/test_tools.py tests/test_brain.py tests/test_config.py tests/test_gemini_models.py -q -k "not live"

@@ -261,7 +261,9 @@ def test_execute_tool_dispatch():
     assert "desconocida" in res_unknown["error"]
 
 
-def test_normalize_windows_command():
+def test_normalize_windows_command(monkeypatch):
+    import core.tools as _tools
+    monkeypatch.setattr(_tools.shutil, "which", lambda name: None)
     assert _normalize_windows_command("ls -la") == "Get-ChildItem -Force"
     assert _normalize_windows_command("ls -lh /path") == "Get-ChildItem -Force /path"
     assert _normalize_windows_command("which python") == "where.exe python"
@@ -283,3 +285,61 @@ def test_format_tools_for_local_prompt():
     assert "open_app" in formatted  # Enum values represented
 
 
+
+
+@pytest.mark.parametrize("cmd", [
+    "rm -rf ~", "rm -rf $HOME/", "shutdown -h now", "reboot",
+    "echo x > /etc/fstab", "find / -name x -delete", "dd if=/dev/zero of=/dev/sda",
+])
+def test_guardrail_blocks_catastrophic(cmd):
+    assert is_command_forbidden(cmd)
+
+
+@pytest.mark.parametrize("cmd", ["ls -la", "rm -rf /tmp/x", "rm -rf ~/proyecto/build", "echo hola"])
+def test_guardrail_allows_normal(cmd):
+    assert not is_command_forbidden(cmd)
+
+
+def test_file_manager_protected_paths():
+    for action in ("write", "append", "delete"):
+        res = file_manager(action, "/etc/zara_test_protegido", content="x")
+        assert res["success"] is False and res.get("blocked") is True
+    res = file_manager("write", "/root/.ssh/zara_test", content="x")
+    assert res.get("blocked") is True
+    assert file_manager("exists", "/etc")["success"] is True
+
+
+def test_file_manager_allows_work_inside_home(tmp_path, monkeypatch):
+    """El agente debe poder escribir dentro del HOME; solo el HOME en sí está protegido."""
+    import core.tools as tools_mod
+    home = tmp_path / "home" / "vk"
+    home.mkdir(parents=True)
+    monkeypatch.setattr(tools_mod, "PROTECTED_EXACT", [str(tmp_path / "home"), str(home)])
+    monkeypatch.setattr(tools_mod, "PROTECTED_TREES", [str(home / ".ssh")])
+    assert file_manager("write", str(home / "notas.txt"), content="ok")["success"] is True
+    assert file_manager("delete", str(home))["blocked"] is True
+    assert file_manager("write", str(home / ".ssh" / "id_x"), content="x")["blocked"] is True
+
+
+def test_confirmation_flow(monkeypatch):
+    import core.tools as tools_mod
+    from core.confirm import parse_confirmation
+
+    assert parse_confirmation("Sí, adelante") is True
+    assert parse_confirmation("no, cancela") is False
+    assert parse_confirmation("sí... no") is False  # ante la duda, no se ejecuta
+    assert parse_confirmation("qué tiempo hace") is None
+
+    asked = []
+    tools_mod.set_confirmation_handler(lambda d: asked.append(d) or False)
+    try:
+        res = tools_mod.execute_tool("run_shell", {"command": "sudo apt install nmap"})
+        assert res["blocked"] is True and asked
+        tools_mod.set_confirmation_handler(lambda d: True)
+        assert tools_mod.execute_tool("run_shell", {"command": "echo hola"})["success"] is True
+        asked.clear()
+        tools_mod.set_confirmation_handler(lambda d: asked.append(d) or True)
+        tools_mod.execute_tool("run_shell", {"command": "echo hola"})
+        assert not asked  # un comando inocuo no pide confirmación
+    finally:
+        tools_mod.set_confirmation_handler(None)

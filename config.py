@@ -41,7 +41,11 @@ def get_system_prompt() -> str:
     except Exception:
         tz = None
     now = datetime.datetime.now(tz=tz)
-    fecha = now.strftime("%A, %d de %B de %Y")  # ej. "jueves, 16 de octubre de 2026"
+    dias = ["lunes", "martes", "miércoles", "jueves", "viernes", "sábado", "domingo"]
+    meses = ["enero", "febrero", "marzo", "abril", "mayo", "junio", "julio",
+             "agosto", "septiembre", "octubre", "noviembre", "diciembre"]
+    # Manual: strftime("%A/%B") depende del locale del SO y salía en inglés en muchos equipos.
+    fecha = f"{dias[now.weekday()]}, {now.day:02d} de {meses[now.month - 1]} de {now.year}"
     hora = now.strftime("%H:%M")                 # ej. "04:07"
 
     return f"""Eres ZARA, el sistema operativo de inteligencia táctica y asistente personal del Señor VK, concebida con el espíritu, la agudeza, el intelecto y la serenidad de J.A.R.V.I.S.
@@ -129,13 +133,17 @@ OLLAMA_MODEL = os.environ.get("OLLAMA_MODEL", "")
 
 # Gemini API & Live
 GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash")
-GEMINI_LIVE_MODEL = os.environ.get("ZARA_GEMINI_LIVE_MODEL", "gemini-2.5-flash-preview-native-audio-dialog")
+# "auto" = descubrir con models.list() el Flash estable más reciente (core/gemini_models.py).
+# Los *_FALLBACK se usan solo si la API no responde al listar.
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "auto")
+GEMINI_MODEL_FALLBACK = "gemini-2.5-flash"
+GEMINI_LIVE_MODEL = os.environ.get("ZARA_GEMINI_LIVE_MODEL", "auto")
+GEMINI_LIVE_MODEL_FALLBACK = "gemini-2.5-flash-native-audio-preview-12-2025"
 GEMINI_LIVE_VOICE = os.environ.get("ZARA_GEMINI_LIVE_VOICE", "Aoede")
 
 # Anthropic API
 ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-3-7-sonnet-latest")
+ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "claude-sonnet-5-5")
 # Alias de modelo para el CLI 'claude' (ej. "sonnet", "opus", "haiku", "fable"); vacío = por defecto.
 CLAUDE_MODEL_OVERRIDE = os.environ.get("ZARA_CLAUDE_MODEL", "")
 
@@ -146,6 +154,8 @@ def persist_env_var(key: str, value: str) -> None:
     Usado para recordar la elección de modelo/cerebro del Señor VK entre
     reinicios de ZARA (panel táctico del HUD).
     """
+    if not key.isidentifier() or any(c in value for c in "\r\n\"\0"):
+        raise ValueError(f"Valor no válido para persistir en .env: {key!r}")
     env_path = BASE_DIR / ".env"
     lines: list[str] = []
     if env_path.is_file():
@@ -164,8 +174,10 @@ def persist_env_var(key: str, value: str) -> None:
             lines[-1] += "\n"
         lines.append(f'{key}="{value}"\n')
 
-    with open(env_path, "w", encoding="utf-8") as f:
+    tmp_path = env_path.with_suffix(".env.tmp")
+    with open(tmp_path, "w", encoding="utf-8") as f:
         f.writelines(lines)
+    os.replace(tmp_path, env_path)  # escritura atómica: nunca deja un .env a medias
 
     os.environ[key] = value
 
@@ -182,9 +194,32 @@ FORBIDDEN_COMMANDS_REGEX = [
     r"\bFormat-Volume\b",
     r"\bdiskpart\b.*clean",
     r":\(\)\s*\{\s*:\|:&\s*\};:",
+    r"\brm\b.*?\s-[a-zA-Z0-9-]*[rR][a-zA-Z0-9-]*\b.*?\s+(~|\$HOME|\"\$HOME\")/?(?:[*\s]|$)",
+    r"\bfind\s+/(?:\s|$).*-delete\b",
+    r"\b(shutdown|reboot|poweroff|halt)\b",
+    r"\bStop-Computer\b|\bRestart-Computer\b",
+    r"(>|\btee\b|\bmv\b|\bcp\b).*?/etc/(fstab|passwd|shadow|sudoers)\b",
+    r"(>|\bof=)\s*/dev/(sd|nvme|vd|hd)\w+",
 ]
 
-# --- INTERFAZ HUD & EVENTOS ---
-WS_HOST = "127.0.0.1"
-WS_PORT = int(os.environ.get("ZARA_WS_PORT", "8765"))
-GLOBAL_HOTKEY = os.environ.get("ZARA_HOTKEY", "<ctrl>+<shift>+space")
+# Comandos que NO se bloquean pero piden confirmación hablada (si hay manejador registrado).
+CONFIRM_COMMANDS_REGEX = [
+    r"\bsudo\b", r"(^|[;&|]\s*)su\b", r"\brm\b", r"\brmdir\b", r"\bRemove-Item\b", r"\bdel\s",
+    r"\bkill(all)?\b", r"\bpkill\b", r"\bStop-Process\b", r"\btaskkill\b",
+    r"\b(pip3?|npm|apt|apt-get|dnf|yum|pacman|winget|choco)\s+(install|remove|uninstall|upgrade)\b",
+    r"\bsystemctl\b", r"\bchmod\b\s+-R", r"\bchown\b", r"\bgit\s+(push|reset\s+--hard|clean)\b",
+    r"\b(curl|wget)\b.*(\|\s*(ba)?sh|-o\b|-O\b)", r"\bInvoke-Expression\b|\biex\b",
+    r"\bSet-ExecutionPolicy\b", r"\breg\s+(add|delete)\b", r"\bpasswd\b", r"\.ssh/|id_rsa|id_ed25519",
+]
+
+# Rutas que las herramientas de ficheros nunca pueden modificar ni borrar.
+# PROTECTED_TREES: el directorio y todo lo que cuelga de él.
+# PROTECTED_EXACT: solo el directorio en sí (no se puede borrar/sobrescribir, pero sí
+# trabajar dentro: el agente debe poder escribir en el HOME del usuario).
+if sys.platform == "win32":
+    PROTECTED_TREES = [os.environ.get("SystemRoot", r"C:\Windows"), r"C:\Program Files", r"C:\Program Files (x86)"]
+    PROTECTED_EXACT = [str(Path.home()), "C:\\"]
+else:
+    PROTECTED_TREES = ["/bin", "/boot", "/dev", "/etc", "/lib", "/lib64", "/proc", "/sbin", "/sys", "/usr"]
+    PROTECTED_EXACT = ["/", "/home", "/root", "/var", str(Path.home())]
+PROTECTED_TREES += [str(Path.home() / ".ssh"), str(Path.home() / ".gnupg"), str(BASE_DIR / ".git")]
