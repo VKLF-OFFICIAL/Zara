@@ -138,6 +138,11 @@ def resolve_user_path(path: str, base: Optional[Path] = None) -> Path:
         return (base or workspace_dir()).resolve()
     expanded = os.path.expanduser(os.path.expandvars(raw))
     candidate = Path(expanded)
+    if candidate.root and not candidate.is_absolute():
+        # Windows: «/etc» o «\\Windows» (raíz sin unidad) son de la unidad actual, como en
+        # cmd.exe; tomarlas por relativas las mandaba a la carpeta de trabajo y se saltaban
+        # las rutas protegidas.
+        return Path(os.path.abspath(expanded)).resolve()
     if not candidate.is_absolute():
         parts = Path(expanded).parts
         if parts:
